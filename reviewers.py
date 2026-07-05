@@ -28,6 +28,7 @@ class Reviewer:
     tertiary: str
     keywords: str
     tier: str  # 'full' | 'light'
+    override_cap: int | None  # overrides the tier-based default paper cap, if set
 
     @property
     def name(self) -> str:
@@ -91,6 +92,7 @@ def load_reviewers(csv_path: str) -> list[Reviewer]:
             continue
         tier = "light" if "light" in membership.lower() else "full"
         dblp_url = field(row, "DBLP")
+        override_raw = field(row, "Override paper assignment number")
         reviewers.append(
             Reviewer(
                 email=field(row, "email address").lower(),
@@ -103,6 +105,7 @@ def load_reviewers(csv_path: str) -> list[Reviewer]:
                 tertiary=field(row, "tertiary area"),
                 keywords=field(row, "keywords"),
                 tier=tier,
+                override_cap=int(override_raw) if override_raw else None,
             )
         )
     return reviewers

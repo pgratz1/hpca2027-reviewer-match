@@ -124,6 +124,13 @@ def count_blocking_pairs(
     return blocking
 
 
+def reviewer_paper_cap(r, light_cap: int, full_cap: int) -> int:
+    """Per-reviewer paper cap: the CSV's override, if set, else the tier default."""
+    if r.override_cap is not None:
+        return r.override_cap
+    return light_cap if r.tier == "light" else full_cap
+
+
 def build_canonical_area_map(reviewers_by_email: dict) -> dict[str, str]:
     """Lowercase area name -> canonical (reviewer CSV) spelling.
 
@@ -154,7 +161,7 @@ def area_pool_stats(
     stats: dict[str, dict] = {}
     for email in candidate_emails:
         r = reviewers_by_email[email]
-        cap = light_cap if r.tier == "light" else full_cap
+        cap = reviewer_paper_cap(r, light_cap, full_cap)
         for area in {r.primary, r.secondary} - {""}:
             s = stats.setdefault(area, {"reviewers": 0, "light": 0, "full": 0, "capacity": 0})
             s["reviewers"] += 1
@@ -265,7 +272,7 @@ def main() -> int:
         eligible_by_pid[pid] = pairs
         for email, score in pairs:
             score_lookup[(email, pid)] = score
-            reviewer_cap[email] = args.light_cap if reviewers_by_email[email].tier == "light" else args.full_cap
+            reviewer_cap[email] = reviewer_paper_cap(reviewers_by_email[email], args.light_cap, args.full_cap)
 
     pids = [p["pid"] for p in papers]
     paper_target = {pid: args.reviewers_per_paper for pid in pids}
@@ -291,10 +298,14 @@ def main() -> int:
 
     total_pairs = sum(len(v) for v in paper_held.values())
     light_over = sum(
-        1 for e, n in reviewer_load.items() if reviewers_by_email[e].tier == "light" and n > args.light_cap
+        1
+        for e, n in reviewer_load.items()
+        if reviewers_by_email[e].tier == "light" and n > reviewer_paper_cap(reviewers_by_email[e], args.light_cap, args.full_cap)
     )
     full_over = sum(
-        1 for e, n in reviewer_load.items() if reviewers_by_email[e].tier == "full" and n > args.full_cap
+        1
+        for e, n in reviewer_load.items()
+        if reviewers_by_email[e].tier == "full" and n > reviewer_paper_cap(reviewers_by_email[e], args.light_cap, args.full_cap)
     )
     blocking = count_blocking_pairs(eligible_by_pid, paper_held, reviewer_cap, paper_target, score_lookup)
 
