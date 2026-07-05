@@ -31,6 +31,11 @@ import requests
 # pulls the PID out of Google-redirect wrappers (...url=.../pid/285/5783&ved=...).
 _PID_RE = re.compile(r"/pid/(\w+/[\w-]+)", re.IGNORECASE)
 
+# A bare PID with no /pid/ wrapper at all, e.g. a reviewer pasting "241/3024"
+# directly. Anchored to the whole (stripped) string so it doesn't misfire on
+# a URL path fragment that merely contains something PID-shaped.
+_BARE_PID_RE = re.compile(r"^(\w+/[\w-]+?)(\.html)?$", re.IGNORECASE)
+
 _USER_AGENT = (
     "HPCA2027-reviewer-match/0.1 (PC reviewer-paper matching; contact PC chairs)"
 )
@@ -44,15 +49,62 @@ def parse_pid(url: str) -> str | None:
     """Extract a canonical DBLP PID from a reviewer's link.
 
     Returns None for missing links ("", "none"), personal homepages, and DBLP
-    *search* URLs — anything that is not a direct /pid/ record.
+    *search* URLs — anything that is not a direct /pid/ record. Tolerates two
+    reviewer typos seen in the acceptance form: a bare PID pasted with no URL
+    wrapper ("241/3024"), and "/pod/" in place of "/pid/" — both verified live
+    against dblp.org (dblp.org/pid/241/3024.xml and .../170/0138.xml both
+    resolve).
     """
     if not url:
         return None
     url = url.strip()
-    if url.lower() == "none" or "/pid/" not in url.lower():
+    if url.lower() == "none":
         return None
+    if "/pid/" not in url.lower():
+        if "/pod/" in url.lower():
+            url = re.sub(r"/pod/", "/pid/", url, flags=re.IGNORECASE)
+        else:
+            bare = _BARE_PID_RE.match(url)
+            return bare.group(1) if bare else None
     match = _PID_RE.search(url)
     return match.group(1) if match else None
+
+
+def resolve_legacy_url(url: str, session: requests.Session) -> str | None:
+    """Resolve a legacy dblp.uni-trier.de/pers/hd/... personal-page URL to a PID.
+
+    DBLP's old name-keyed person pages 301-redirect to the canonical
+    /pid/NNN/MMMM(.html) URL (verified live, e.g. .../pers/hd/t/Tripathy:Devashree
+    -> .../pid/153/3342.html). Returns None if the resolved URL doesn't contain
+    a PID. Raises requests.RequestException on a request failure (timeout,
+    connection error, exhausted 429 retries) rather than swallowing it —
+    callers must distinguish "genuinely doesn't resolve" from "the request
+    failed" (see identity_recovery.resolve).
+    """
+    resp = get_with_retry(session, url, headers={"User-Agent": _USER_AGENT})
+    return parse_pid(resp.url)
+
+
+def resolve_via_author_search(query: str, session: requests.Session) -> str | None:
+    """Resolve a free-text name query to a PID via DBLP's author search API.
+
+    Only returns a PID when the search yields exactly one hit — an ambiguous
+    (0 or >1 hit) search returns None rather than guessing, deferring to
+    manual review. Raises requests.RequestException on a request failure
+    (including a non-JSON response, since requests>=2.27's JSONDecodeError
+    subclasses RequestException) — see resolve_legacy_url's docstring.
+    """
+    resp = get_with_retry(
+        session, f"https://dblp.org/search/author/api?q={query}&format=json",
+        headers={"User-Agent": _USER_AGENT},
+    )
+    hits = resp.json().get("result", {}).get("hits", {})
+    if hits.get("@total") != "1":
+        return None
+    hit = hits["hit"]
+    if isinstance(hit, list):
+        hit = hit[0]
+    return parse_pid(hit.get("info", {}).get("url", ""))
 
 
 # ---------------------------------------------------------------------------
@@ -149,23 +201,80 @@ def filter_by_years(
     return [(int(y), t) for y, t in pubs if int(y) >= cutoff]
 
 
+def windowed_with_fallback(
+    items_desc: list,
+    year_of: Callable[[object], int],
+    years: int,
+    current_year: int | None = None,
+    min_count: int = 10,
+    fallback_count: int = 10,
+) -> list:
+    """Items whose `year_of(item)` falls in the last `years` calendar years,
+    falling back to the `fallback_count` most-recent items overall when that
+    window has fewer than `min_count`. `items_desc` must already be sorted
+    year-descending.
+
+    A reviewer who's gone quiet recently but has a real publication history
+    (e.g. moved to industry after a PhD) otherwise gets an almost-empty
+    profile; this gives them a usable one instead. Shared by this module's
+    `select_recent` (titles) and openalex.py's `fetch_recent_works` (work
+    dicts) — same policy, two item shapes.
+    """
+    if current_year is None:
+        current_year = datetime.date.today().year
+    cutoff = current_year - years + 1
+    windowed = [it for it in items_desc if year_of(it) >= cutoff]
+    if len(windowed) < min_count:
+        return items_desc[:fallback_count]
+    return windowed
+
+
+def select_recent(
+    deduped_desc: list[tuple[int, str]],
+    years: int,
+    current_year: int | None = None,
+    min_count: int = 10,
+    fallback_count: int = 10,
+) -> list[tuple[int, str]]:
+    """Titles from the last `years` years, falling back to the `fallback_count`
+    most recent titles overall when that window has fewer than `min_count`.
+    See `windowed_with_fallback`. `deduped_desc` must already be deduplicated
+    (dedup_titles's output shape).
+    """
+    return windowed_with_fallback(
+        deduped_desc, lambda yt: int(yt[0]), years, current_year, min_count, fallback_count
+    )
+
+
 # ---------------------------------------------------------------------------
 # Network fetch
 # ---------------------------------------------------------------------------
 
-def _get_with_retry(
-    session: requests.Session, url: str, *, max_retries: int = 5, timeout: int = 30
+def get_with_retry(
+    session: requests.Session,
+    url: str,
+    params: dict | None = None,
+    *,
+    headers: dict | None = None,
+    max_retries: int = 5,
+    timeout: int = 30,
+    backoff_floor: float = 15,
 ) -> requests.Response:
-    """GET `url`, honoring DBLP's 429 rate-limit responses with aggressive backoff.
+    """GET `url`, retrying on a 429 with exponential backoff.
 
-    DBLP will block an IP temporarily if hit too fast. On 429 we wait at least
-    15 s (or whatever Retry-After says), doubling each attempt.
+    Waits at least `backoff_floor` seconds (or whatever Retry-After says),
+    doubling each attempt. Shared with openalex.py: DBLP needs an aggressive
+    floor or it'll block the IP temporarily; OpenAlex tolerates a much
+    shorter one (passed via `backoff_floor` at the call site).
     """
     for attempt in range(max_retries):
-        resp = session.get(url, timeout=timeout, headers={"User-Agent": _USER_AGENT})
+        resp = session.get(url, params=params, timeout=timeout, headers=headers)
         if resp.status_code == 429:
             retry_after = resp.headers.get("Retry-After")
-            wait = int(retry_after) if retry_after and retry_after.isdigit() else max(15, 15 * (2 ** attempt))
+            wait = (
+                int(retry_after) if retry_after and retry_after.isdigit()
+                else max(backoff_floor, backoff_floor * (2 ** attempt))
+            )
             time.sleep(wait)
             continue
         resp.raise_for_status()
@@ -187,7 +296,7 @@ def _fetch_all_from_dblp(
     pid: str, session: requests.Session
 ) -> list[tuple[int, str]]:
     """Fetch ALL (year, title) pairs for a PID directly from DBLP XML."""
-    resp = _get_with_retry(session, f"https://dblp.org/pid/{pid}.xml")
+    resp = get_with_retry(session, f"https://dblp.org/pid/{pid}.xml", headers={"User-Agent": _USER_AGENT})
     root = ET.fromstring(resp.content)
 
     pubs: list[tuple[int, str]] = []
@@ -219,6 +328,7 @@ def fetch_titles(
     session: requests.Session | None = None,
     write_cache: dict | None = None,
     readonly_cache: dict | None = None,
+    fallback_when_thin: bool = False,
 ) -> tuple[list[tuple[int, str]], str]:
     """Return (year, title) pairs for publications within the last `years` years.
 
@@ -227,25 +337,38 @@ def fetch_titles(
       2. write_cache (our incrementally built cache) — may be 10-capped for old entries
       3. Live DBLP fetch — stores ALL publications into write_cache (uncapped)
 
-    Returns (filtered_pubs, source) where source is 'colleague', 'cache', or 'live'.
-    Titles are deduplicated before year-filtering.
+    Returns (selected_pubs, source) where source is 'colleague', 'cache', or
+    'live'. Titles are deduplicated before year-filtering.
+
+    By default (fallback_when_thin=False) this is a strict year-window filter
+    — a reviewer with nothing published in the window gets an empty list.
+    build_fingerprints.py relies on that to detect when a reviewer needs its
+    own area-profile-only fallback (see its module docstring), so this default
+    must not change. Pass fallback_when_thin=True to instead backfill with the
+    10 most recent titles overall when the window has fewer than 10 (see
+    select_recent) — for a caller like lookup_no_dblp_reviewers.py that has no
+    such downstream fallback of its own, a thin-but-present profile is more
+    useful than an empty one.
     """
     # 1. Colleague's read-only cache
     if readonly_cache is not None and pid in readonly_cache:
         all_pubs = [(int(y), t) for y, t in readonly_cache[pid]]
-        return filter_by_years(dedup_titles(all_pubs), years), "colleague"
-
+        source = "colleague"
     # 2. Our write cache
-    if write_cache is not None and pid in write_cache:
+    elif write_cache is not None and pid in write_cache:
         all_pubs = [(int(y), t) for y, t in write_cache[pid]]
-        return filter_by_years(dedup_titles(all_pubs), years), "cache"
-
+        source = "cache"
     # 3. Live fetch
-    session = session or requests.Session()
-    all_pubs = _fetch_all_from_dblp(pid, session)
-    if write_cache is not None:
-        write_cache[pid] = all_pubs  # store uncapped
-    return filter_by_years(dedup_titles(all_pubs), years), "live"
+    else:
+        session = session or requests.Session()
+        all_pubs = _fetch_all_from_dblp(pid, session)
+        if write_cache is not None:
+            write_cache[pid] = all_pubs  # store uncapped
+        source = "live"
+
+    deduped = dedup_titles(all_pubs)
+    selected = select_recent(deduped, years) if fallback_when_thin else filter_by_years(deduped, years)
+    return selected, source
 
 
 def fetch_titles_for_pids(
@@ -257,6 +380,7 @@ def fetch_titles_for_pids(
     readonly_cache: dict | None = None,
     cache_path: str | None = None,
     delay: float = 3.0,
+    fallback_when_thin: bool = False,
     on_result: Callable[[str, list[tuple[int, str]], str], None] | None = None,
     on_error: Callable[[str, Exception], None] | None = None,
 ) -> dict[str, tuple[list[tuple[int, str]], str]]:
@@ -265,6 +389,8 @@ def fetch_titles_for_pids(
     Jitters `delay` seconds between consecutive *live* DBLP fetches (no delay
     when a fetch was served from cache) and persists `write_cache` to
     `cache_path` after every live fetch, so progress survives an interruption.
+    `fallback_when_thin` is passed straight through to `fetch_titles` (see its
+    docstring) — defaults to False so existing callers' behavior is unchanged.
 
     `on_result(pid, titles, source)` and `on_error(pid, exc)` are optional
     hooks for the caller's own progress reporting — this function has no
@@ -287,6 +413,7 @@ def fetch_titles_for_pids(
                 session=session,
                 write_cache=write_cache,
                 readonly_cache=readonly_cache,
+                fallback_when_thin=fallback_when_thin,
             )
         except Exception as exc:  # noqa: BLE001
             last_was_live = False

@@ -5,6 +5,9 @@ paper_fingerprints.json
 dblp_cache.json
 dblp_cache2.json
 dblp_pubs_cache.json
+openalex_cache.json
+no_dblp_lookup_report.csv
+manual_review_report*.csv
 
 # Test fixture with a placeholder author email, not core project data
 hpca2027-data.json

@@ -23,6 +23,7 @@ class Reviewer:
     last: str
     dblp_url: str
     pid: str | None
+    affiliation: str
     primary: str
     secondary: str
     tertiary: str
@@ -47,6 +48,25 @@ def field(row: dict[str, str], needle: str) -> str:
         if header and needle.lower() in header.lower():
             return (value or "").strip()
     raise KeyError(f"no column header contains {needle!r}")
+
+
+def _parse_override_cap(email: str, override_raw: str) -> int | None:
+    """Parse the free-text 'Override paper assignment number' cell.
+
+    Blank means no override. A non-blank, non-integer value (the column has
+    no numeric validation on the form side) fails loudly with the offending
+    reviewer's email rather than a bare ValueError, since load_reviewers is
+    called by every script in the pipeline — one bad cell shouldn't take all
+    of them down with an unhelpful traceback.
+    """
+    if not override_raw:
+        return None
+    try:
+        return int(override_raw)
+    except ValueError:
+        raise ValueError(
+            f"{email}: 'Override paper assignment number' must be a whole number, got {override_raw!r}"
+        ) from None
 
 
 def _latest_rows_by_email(rows: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -92,20 +112,21 @@ def load_reviewers(csv_path: str) -> list[Reviewer]:
             continue
         tier = "light" if "light" in membership.lower() else "full"
         dblp_url = field(row, "DBLP")
-        override_raw = field(row, "Override paper assignment number")
+        email = field(row, "email address").lower()
         reviewers.append(
             Reviewer(
-                email=field(row, "email address").lower(),
+                email=email,
                 first=field(row, "First Name"),
                 last=field(row, "Last Name"),
                 dblp_url=dblp_url,
                 pid=parse_pid(dblp_url),
+                affiliation=field(row, "institutional affiliation"),
                 primary=field(row, "primary area"),
                 secondary=field(row, "secondary area"),
                 tertiary=field(row, "tertiary area"),
                 keywords=field(row, "keywords"),
                 tier=tier,
-                override_cap=int(override_raw) if override_raw else None,
+                override_cap=_parse_override_cap(email, field(row, "Override paper assignment number")),
             )
         )
     return reviewers
