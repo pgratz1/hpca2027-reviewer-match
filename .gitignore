@@ -8,6 +8,7 @@ dblp_pubs_cache.json
 openalex_cache.json
 no_dblp_lookup_report.csv
 manual_review_report*.csv
+final_identity_resolution.csv
 
 # Test fixture with a placeholder author email, not core project data
 hpca2027-data.json

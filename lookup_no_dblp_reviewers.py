@@ -54,7 +54,7 @@ REPORT_FIELDS = [
     "email", "name", "tier", "affiliation",
     "primary", "secondary", "tertiary",
     "resolution_path", "identity_confidence",
-    "openalex_author_id", "matched_institution",
+    "dblp_pid", "openalex_author_id", "matched_institution",
     "n_recent_works", "area_validation", "matched_terms",
     "sample_titles", "candidates_considered", "note",
 ]
@@ -154,6 +154,7 @@ def process_reviewer(
         "tertiary": r.tertiary,
         "resolution_path": res.path,
         "identity_confidence": res.confidence or "",
+        "dblp_pid": res.dblp_pid or "",
         "openalex_author_id": author_id,
         "matched_institution": institution,
         "n_recent_works": len(works),
