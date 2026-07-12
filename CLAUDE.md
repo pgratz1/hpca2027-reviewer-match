@@ -4,51 +4,81 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-This is the **HPCA 2027 reviewer–paper matching pipeline** — a data project to automate reviewer-to-paper assignment for the HPCA 2027 conference PC. It is currently **pre-implementation**: the only contents are the input data and the design brief. There is no source code, no git repo, no build/test tooling yet. The first substantive work is building the pipeline described below.
+The **HPCA 2027 reviewer–paper matching pipeline** — fully implemented and in
+active use by the PC chair during the submission window (paper registration
+deadline: July 25, 2026, so `hpca2027-data.json` is a moving snapshot).
+It classifies PC members by seniority from DBLP history and assigns reviewers
+to papers by SPECTER2 embedding similarity under COI, area, load, and
+seniority constraints.
 
-Read `hpca2027-matching-brief.md` in full before starting implementation work — it is the authoritative spec and records design decisions and still-open questions.
+**Read `README.md` first** — it documents every script, the start-to-finish
+workflow, and the data files. `hpca2027-matching-brief.md` is the original
+design brief, kept for history; where they disagree, the README and code win.
+`/home/pgratz/reviewer_match` is a symlink to this directory (the real path
+contains spaces and parentheses — always quote it in shell commands).
 
-## Files
+## Running things
 
-- `hpca2027-matching-brief.md` — project brief / spec. The source of truth for goals and design.
-- `HPCA'27 PC Member Acceptance Form (Responses) - Form Responses 1.csv` — Google Forms export of PC-member responses (**691 records**). Filename contains an apostrophe and spaces; quote it in shell commands. Parse with a real CSV reader (Python `csv`), not `awk`/`cut`/`wc -l` — fields contain embedded commas, quoted `""` escapes, **and embedded newlines** (the file is 767 physical lines but only 691 logical records).
+- Python env: `~/envs/hpca-matching/bin/python3` (torch+CUDA, transformers,
+  adapters, numpy). `make` defaults to it; `requirements.txt` is
+  documentation, not a reproducible installer.
+- `make` runs the whole pipeline (classify → fingerprints → `assignment.txt`)
+  and rebuilds only what's stale. Prefer it over invoking scripts by hand.
+- Library modules (imported, never run): `reviewers.py`, `dblp.py`,
+  `paper_matching.py`, `fingerprint.py`, `specter2_model.py`. Runnable
+  scripts: `classify_reviewers.py`, `build_fingerprints.py`,
+  `assign_reviewers.py`, `score_papers.py`, `nearest_neighbors.py`, `main.py`.
 
-### CSV shape
+## Architecture (filter-then-rank, then constrained assignment)
 
-One row per invited PC member. The key column is **`PC membership`**, which has three values:
-- `No, I am unable to accept` — 241 declines; all other fields blank. Filter these out.
-- `Yes, I accept as a full PC member` — 237.
-- `Yes, I accept as a light PC member` — 213.
+1. **Identity**: `dblp_overrides.csv` (email-keyed, hand-maintained) is the
+   single identity layer; a filled `dblp` cell wins over the form's DBLP
+   column. `classify_reviewers.py` auto-appends blank stub rows for reviewers
+   it can't resolve — the file doubles as the to-do list.
+2. **Seniority**: `classify_reviewers.py` → `reviewer_seniority.csv`
+   (senior ≥0.8 papers/yr over 15y in ISCA/MICRO/HPCA/ASPLOS; junior <7
+   career; typical otherwise — all flag-tunable).
+3. **Affinity**: SPECTER2 fingerprints for reviewers (recent DBLP titles +
+   declared areas) and papers (title+abstract+topics); cosine similarity.
+   Area gate (reviewer primary/secondary ∩ paper topics) and COI are hard
+   filters, never blended into the score.
+4. **Assignment**: `assign_reviewers.py` — phased paper-proposing deferred
+   acceptance aiming for ≥1 senior and ≤1 junior per paper, degrading via
+   almost-senior / almost-not-junior fallbacks; prints a criteria report and
+   self-checks (over-cap, blocking pairs, junior policy) that must all be 0.
 
-So **450 accepted** members with area data, split into two load tiers: **light PC members should get a smaller paper load** than full members — carry this distinction through to the optimizer's per-reviewer load constraints.
+**Policy:** every paper-side tool ignores incomplete papers (no abstract or a
+title under 3 words) — enforced centrally in `paper_matching.load_papers`.
 
-Relevant columns for the pipeline: HotCRP email, DBLP link (or literal `none`), affiliation, and **primary / secondary / tertiary area** plus free-text primary-area keywords. Note: **48 of the 450 accepted members have no DBLP link** (blank or `none`) — the pipeline needs a fallback for building their reviewer profile (e.g., area gate only, or match by keywords/affiliation).
+## Data, caches, and PII
 
-### Area taxonomy (13 areas)
+- The acceptance CSV filename contains an apostrophe and spaces — quote it.
+  Parse it (and any CSV here) with Python's `csv` module, never
+  `awk`/`cut`/line counting: fields contain embedded commas, quoted `""`
+  escapes, and embedded newlines. `reviewers.load_reviewers` collapses
+  duplicate form submissions to the latest per email and applies overrides.
+- **Never commit data.** Everything derived from real PC members (the CSV,
+  all caches, `dblp_overrides.csv`, `reviewer_seniority.csv`,
+  `assignment.txt`, retired report CSVs) is gitignored; only code and docs go
+  to the GitHub remote. Check `git status` before committing.
+- Caches are incremental **and content-aware**: paper fingerprints re-encode
+  when title/abstract/topics change (`doc_key`); reviewer fingerprints
+  re-encode when a PID appears for a previously PID-less reviewer. The DBLP
+  caches (`dblp_cache.json`, `dblp_venue_cache.json`, read-only
+  `dblp_pubs_cache.json`) are expensive to refill — live DBLP fetches are
+  rate-limited (~3s jittered delay, 429 backoff ≥15s). Never delete them;
+  `make clean-fingerprints` deliberately spares them.
 
-Reviewers and papers both select from this fixed HPCA taxonomy; area overlap is the hard eligibility gate:
+## Conventions
 
-Compilers and programming models · Datacenters/parallel architectures/systems · Domain-Specific Accelerators / Reconfigurable Computing · GPUs · Interconnection networks · ML architectures · Memory systems · Microarchitecture · Near data processing · Quantum Computing · Reliability/fault tolerance/emerging technologies · Security · Tools and Analysis
-
-## Intended architecture (from the brief)
-
-The scoring pipeline is a **filter-then-rank** design, not a blended score:
-
-1. **Area gate (hard constraint).** A reviewer is eligible for a paper only if `{reviewer primary, secondary} ∩ {paper primary, secondary} ≠ ∅`. Area is *not* mixed into the numeric score — only used to gate the candidate set.
-2. **DBLP fetch.** For each reviewer, pull the last 10 publication titles from `https://dblp.org/pid/{PID}.xml`, year-descending. PIDs come from the CSV's DBLP link column; no author disambiguation needed. Reuse this fetch for a COI cross-check (coauthor lists vs. HotCRP's self-declared COIs).
-3. **Embedding.** SPECTER2 (`allenai/specter2`), purpose-built for scientific-paper similarity; fall back to `all-mpnet-base-v2` if SPECTER2 setup is troublesome.
-4. **Score.** Within each area-eligible pair, cosine similarity between the reviewer's embedded titles and the paper's embedded abstract+keywords.
-5. **Output.** A reviewer × paper affinity table over eligible pairs only, fed to the assignment step (ideally HotCRP's native min-cost-max-flow autoassigner via bulk import; a standalone `networkx`/`pulp` optimizer only if HotCRP can't ingest the scores).
-
-**Non-goal:** no LLM-as-judge for the core affinity score — it's an embeddings + filtering problem. A local LLM is reserved for auxiliary tasks only (edge-case triage, human-readable rationale, parsing irregular DBLP entries).
-
-## Suggested stack (per brief)
-
-Python 3.11+, `requests` (DBLP XML), `sentence-transformers` / HF `transformers` (SPECTER2), `numpy`/`scipy` (cosine at scale), `networkx`/`pulp` (optimizer if needed). Runs locally on an RTX 4090 — the full PC-scale job is a few hundred reviewers × few hundred papers, seconds of GPU time, no cloud API.
-
-## Open questions to resolve during implementation
-
-These are unresolved in the brief; confirm before committing to an approach:
-- Is the 13-area taxonomy already implemented as HotCRP "Topics"? If so, the area gate and final assignment may already live in HotCRP and this project only injects the cosine score.
-- Title-only reviewer embeddings (DBLP has no abstracts) vs. enriching via Semantic Scholar by DOI/title.
-- Whether primary vs. secondary area gets any soft weighting downstream (e.g., optimizer tie-breaks).
+- Simple, literal scripts — stdlib `csv`, no pandas/openpyxl, no speculative
+  features or extra output formats.
+- Each script: module docstring with usage examples, reused as the argparse
+  description (`RawDescriptionHelpFormatter`); tunables as module-level
+  `DEFAULT_*` constants exposed as flags.
+- stdout is for results; progress, warnings, and summaries go to stderr.
+- Cache writes are atomic (tmp + replace); reruns must be idempotent —
+  verify with `cmp` after changes.
+- When experimenting, work on scratch copies (`--out`, `--fingerprint-cache`,
+  `--data`, `--paper-cache` flags exist for this); never mutate the real
+  caches or `dblp_overrides.csv` in a test.
