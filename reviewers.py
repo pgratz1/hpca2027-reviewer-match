@@ -9,11 +9,16 @@ from __future__ import annotations
 
 import csv
 import datetime
+import sys
 from dataclasses import dataclass
 
 from dblp import parse_pid
 
 TIMESTAMP_FORMAT = "%m/%d/%Y %H:%M:%S"
+
+# Hand-maintained DBLP identity overrides, keyed by email so they survive
+# re-exports of the acceptance CSV. Auto-loaded by load_reviewers if present.
+DEFAULT_OVERRIDES = "dblp_overrides.csv"
 
 
 @dataclass
@@ -30,6 +35,7 @@ class Reviewer:
     keywords: str
     tier: str  # 'full' | 'light'
     override_cap: int | None  # overrides the tier-based default paper cap, if set
+    pid_from_override: bool = False  # pid came from dblp_overrides.csv, not the form
 
     @property
     def name(self) -> str:
@@ -69,6 +75,38 @@ def _parse_override_cap(email: str, override_raw: str) -> int | None:
         ) from None
 
 
+def load_dblp_overrides(path: str = DEFAULT_OVERRIDES) -> dict[str, str]:
+    """Load the hand-maintained DBLP override file: email -> DBLP PID.
+
+    Format: a CSV with columns `email`, `dblp`, `note` (note is free text and
+    ignored here). The dblp cell may be any link shape parse_pid accepts —
+    full URL, bare PID, or Google-redirect wrapper. Rows with a blank email
+    or dblp cell are skipped; a non-blank dblp value that doesn't parse to a
+    PID fails loudly with the offending email, since a silent skip would make
+    the override mysteriously not take effect.
+
+    Returns {} if the file doesn't exist.
+    """
+    try:
+        f = open(path, newline="", encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    overrides: dict[str, str] = {}
+    with f:
+        for row in csv.DictReader(f):
+            email = (row.get("email") or "").strip().lower()
+            raw = (row.get("dblp") or "").strip()
+            if not email or not raw:
+                continue
+            pid = parse_pid(raw)
+            if pid is None:
+                raise ValueError(
+                    f"{path}: override for {email} has an unparseable DBLP value {raw!r}"
+                )
+            overrides[email] = pid
+    return overrides
+
+
 def _latest_rows_by_email(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     """Collapse repeat form submissions to each person's most recent row.
 
@@ -93,7 +131,7 @@ def _latest_rows_by_email(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     return list(latest.values())
 
 
-def load_reviewers(csv_path: str) -> list[Reviewer]:
+def load_reviewers(csv_path: str, overrides_path: str = DEFAULT_OVERRIDES) -> list[Reviewer]:
     """Load accepted PC members from the acceptance CSV.
 
     Rows are first collapsed to one per email via `_latest_rows_by_email` so
@@ -101,9 +139,16 @@ def load_reviewers(csv_path: str) -> list[Reviewer]:
     accept, or vice versa) wins. Declines (rows whose 'PC membership' says
     the member is unable to accept) are then skipped; everyone else is
     returned, including those without a DBLP link.
+
+    If a DBLP override file exists (see load_dblp_overrides), its PID wins
+    over whatever the form's DBLP column says — filling in reviewers who left
+    it blank and correcting wrong links (e.g. a namesake's page). Overrides
+    whose email matches no accepted reviewer are reported to stderr so a
+    typo'd email doesn't silently do nothing.
     """
     with open(csv_path, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
+    overrides = load_dblp_overrides(overrides_path)
 
     reviewers: list[Reviewer] = []
     for row in _latest_rows_by_email(rows):
@@ -119,7 +164,7 @@ def load_reviewers(csv_path: str) -> list[Reviewer]:
                 first=field(row, "First Name"),
                 last=field(row, "Last Name"),
                 dblp_url=dblp_url,
-                pid=parse_pid(dblp_url),
+                pid=overrides.get(email) or parse_pid(dblp_url),
                 affiliation=field(row, "institutional affiliation"),
                 primary=field(row, "primary area"),
                 secondary=field(row, "secondary area"),
@@ -127,6 +172,15 @@ def load_reviewers(csv_path: str) -> list[Reviewer]:
                 keywords=field(row, "keywords"),
                 tier=tier,
                 override_cap=_parse_override_cap(email, field(row, "Override paper assignment number")),
+                pid_from_override=email in overrides,
             )
+        )
+
+    unmatched = set(overrides) - {r.email for r in reviewers}
+    for email in sorted(unmatched):
+        print(
+            f"Warning: DBLP override for {email} matches no accepted reviewer "
+            f"(typo, or they declined?)",
+            file=sys.stderr,
         )
     return reviewers

@@ -70,43 +70,6 @@ def parse_pid(url: str) -> str | None:
     return match.group(1) if match else None
 
 
-def resolve_legacy_url(url: str, session: requests.Session) -> str | None:
-    """Resolve a legacy dblp.uni-trier.de/pers/hd/... personal-page URL to a PID.
-
-    DBLP's old name-keyed person pages 301-redirect to the canonical
-    /pid/NNN/MMMM(.html) URL (verified live, e.g. .../pers/hd/t/Tripathy:Devashree
-    -> .../pid/153/3342.html). Returns None if the resolved URL doesn't contain
-    a PID. Raises requests.RequestException on a request failure (timeout,
-    connection error, exhausted 429 retries) rather than swallowing it —
-    callers must distinguish "genuinely doesn't resolve" from "the request
-    failed" (see identity_recovery.resolve).
-    """
-    resp = get_with_retry(session, url, headers={"User-Agent": _USER_AGENT})
-    return parse_pid(resp.url)
-
-
-def resolve_via_author_search(query: str, session: requests.Session) -> str | None:
-    """Resolve a free-text name query to a PID via DBLP's author search API.
-
-    Only returns a PID when the search yields exactly one hit — an ambiguous
-    (0 or >1 hit) search returns None rather than guessing, deferring to
-    manual review. Raises requests.RequestException on a request failure
-    (including a non-JSON response, since requests>=2.27's JSONDecodeError
-    subclasses RequestException) — see resolve_legacy_url's docstring.
-    """
-    resp = get_with_retry(
-        session, f"https://dblp.org/search/author/api?q={query}&format=json",
-        headers={"User-Agent": _USER_AGENT},
-    )
-    hits = resp.json().get("result", {}).get("hits", {})
-    if hits.get("@total") != "1":
-        return None
-    hit = hits["hit"]
-    if isinstance(hit, list):
-        hit = hit[0]
-    return parse_pid(hit.get("info", {}).get("url", ""))
-
-
 # ---------------------------------------------------------------------------
 # Cache I/O
 # ---------------------------------------------------------------------------
@@ -163,6 +126,21 @@ def load_colleague_cache(path: str) -> dict:
     return normalised
 
 
+def load_rich_cache(path: str) -> dict:
+    """Load a rich publication cache verbatim (returns {} if not found).
+
+    Format: {pid: [{title, year, venue, type}, ...], ...} — both the
+    colleague's read-only cache and our writable venue cache use it. No
+    normalisation happens here: some colleague-cache entries are
+    person-shaped or lack fields, so callers must read records with .get().
+    """
+    p = Path(path)
+    if p.exists():
+        with p.open(encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
 # ---------------------------------------------------------------------------
 # Title utilities
 # ---------------------------------------------------------------------------
@@ -216,9 +194,8 @@ def windowed_with_fallback(
 
     A reviewer who's gone quiet recently but has a real publication history
     (e.g. moved to industry after a PhD) otherwise gets an almost-empty
-    profile; this gives them a usable one instead. Shared by this module's
-    `select_recent` (titles) and openalex.py's `fetch_recent_works` (work
-    dicts) — same policy, two item shapes.
+    profile; this gives them a usable one instead. `year_of` keeps the policy
+    reusable across item shapes (see `select_recent` for the title tuples).
     """
     if current_year is None:
         current_year = datetime.date.today().year
@@ -263,9 +240,9 @@ def get_with_retry(
     """GET `url`, retrying on a 429 with exponential backoff.
 
     Waits at least `backoff_floor` seconds (or whatever Retry-After says),
-    doubling each attempt. Shared with openalex.py: DBLP needs an aggressive
-    floor or it'll block the IP temporarily; OpenAlex tolerates a much
-    shorter one (passed via `backoff_floor` at the call site).
+    doubling each attempt. DBLP needs an aggressive floor or it'll block the
+    IP temporarily; `backoff_floor` exists so a gentler API can pass a much
+    shorter one at the call site.
     """
     for attempt in range(max_retries):
         resp = session.get(url, params=params, timeout=timeout, headers=headers)
@@ -318,6 +295,48 @@ def _fetch_all_from_dblp(
     return pubs
 
 
+def _fetch_all_records_from_dblp(
+    pid: str, session: requests.Session
+) -> list[dict]:
+    """Fetch ALL publication records for a PID, keeping venue and record type.
+
+    Rich analogue of _fetch_all_from_dblp for callers that need to know
+    *where* something was published (e.g. seniority classification). Each
+    record is {"title", "year": int, "venue", "type"} — matching the
+    colleague-cache format — where type is the DBLP XML element tag
+    (inproceedings/article/proceedings/...) and venue is the <booktitle> for
+    inproceedings, the <journal> for articles, and "" otherwise. Same skip
+    rules as _fetch_all_from_dblp (www records, missing title/year).
+    Sorted year-descending.
+    """
+    resp = get_with_retry(session, f"https://dblp.org/pid/{pid}.xml", headers={"User-Agent": _USER_AGENT})
+    root = ET.fromstring(resp.content)
+
+    records: list[dict] = []
+    for record in root.findall("r"):
+        for pub in record:
+            if pub.tag == "www":
+                continue
+            title = _title_text(pub)
+            year_el = pub.find("year")
+            if title is None or year_el is None or not (year_el.text or "").strip():
+                continue
+            try:
+                year = int(year_el.text.strip())
+            except ValueError:
+                continue
+            venue_el = pub.find("booktitle")
+            if venue_el is None:
+                venue_el = pub.find("journal")
+            venue = (venue_el.text or "").strip() if venue_el is not None else ""
+            records.append(
+                {"title": title, "year": year, "venue": venue, "type": pub.tag}
+            )
+
+    records.sort(key=lambda r: r["year"], reverse=True)
+    return records
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -346,9 +365,8 @@ def fetch_titles(
     own area-profile-only fallback (see its module docstring), so this default
     must not change. Pass fallback_when_thin=True to instead backfill with the
     10 most recent titles overall when the window has fewer than 10 (see
-    select_recent) — for a caller like lookup_no_dblp_reviewers.py that has no
-    such downstream fallback of its own, a thin-but-present profile is more
-    useful than an empty one.
+    select_recent) — for a caller with no downstream fallback of its own, a
+    thin-but-present profile is more useful than an empty one.
     """
     # 1. Colleague's read-only cache
     if readonly_cache is not None and pid in readonly_cache:
@@ -428,5 +446,86 @@ def fetch_titles_for_pids(
         results[pid] = (titles, source)
         if on_result is not None:
             on_result(pid, titles, source)
+
+    return results
+
+
+def fetch_records(
+    pid: str,
+    session: requests.Session | None = None,
+    write_cache: dict | None = None,
+    readonly_cache: dict | None = None,
+) -> tuple[list[dict], str]:
+    """Return all rich publication records for a PID (see load_rich_cache).
+
+    Rich analogue of fetch_titles with the same cache order:
+      1. readonly_cache (colleague's pre-built rich cache)
+      2. write_cache (our incrementally built venue cache)
+      3. Live DBLP fetch — stores ALL records into write_cache (uncapped)
+
+    Returns (records, source) where source is 'colleague', 'cache', or
+    'live'. No windowing or dedup here — callers count what they need.
+    """
+    if readonly_cache is not None and pid in readonly_cache:
+        return readonly_cache[pid], "colleague"
+    if write_cache is not None and pid in write_cache:
+        return write_cache[pid], "cache"
+    session = session or requests.Session()
+    records = _fetch_all_records_from_dblp(pid, session)
+    if write_cache is not None:
+        write_cache[pid] = records
+    return records, "live"
+
+
+def fetch_records_for_pids(
+    pids: list[str],
+    *,
+    session: requests.Session | None = None,
+    write_cache: dict | None = None,
+    readonly_cache: dict | None = None,
+    cache_path: str | None = None,
+    delay: float = 3.0,
+    on_result: Callable[[str, list[dict], str], None] | None = None,
+    on_error: Callable[[str, Exception], None] | None = None,
+) -> dict[str, tuple[list[dict], str]]:
+    """Fetch rich records for each PID in turn, applying fetch_records's cache order.
+
+    Mirror of fetch_titles_for_pids: jitters `delay` seconds between
+    consecutive *live* DBLP fetches (no delay when served from cache) and
+    persists `write_cache` to `cache_path` after every live fetch, so
+    progress survives an interruption. `on_result(pid, records, source)` and
+    `on_error(pid, exc)` are optional progress hooks. Returns
+    {pid: (records, source)} for the PIDs that succeeded; failed PIDs are
+    omitted.
+    """
+    session = session or requests.Session()
+    results: dict[str, tuple[list[dict], str]] = {}
+    last_was_live = False
+
+    for pid in pids:
+        if last_was_live and delay:
+            jitter = random.uniform(-0.5, 0.5) * delay
+            time.sleep(max(0.5, delay + jitter))
+
+        try:
+            records, source = fetch_records(
+                pid,
+                session=session,
+                write_cache=write_cache,
+                readonly_cache=readonly_cache,
+            )
+        except Exception as exc:  # noqa: BLE001
+            last_was_live = False
+            if on_error is not None:
+                on_error(pid, exc)
+            continue
+
+        last_was_live = source == "live"
+        if last_was_live and write_cache is not None and cache_path is not None:
+            save_cache(write_cache, cache_path)
+
+        results[pid] = (records, source)
+        if on_result is not None:
+            on_result(pid, records, source)
 
     return results

@@ -16,9 +16,27 @@ import fingerprint as fp
 import specter2_model
 
 
+def _is_complete(paper: dict) -> bool:
+    """A paper counts as complete once it has an abstract and a title of at
+    least 3 words — until the registration deadline, entries missing either
+    are tentative placeholders and must be ignored by every tool (policy)."""
+    return bool((paper.get("abstract") or "").strip()) and len(
+        (paper.get("title") or "").split()
+    ) >= 3
+
+
 def load_papers(path: str) -> list[dict]:
     with open(path, encoding="utf-8") as f:
-        return json.load(f)
+        papers = json.load(f)
+    complete = [p for p in papers if _is_complete(p)]
+    skipped = len(papers) - len(complete)
+    if skipped:
+        print(
+            f"Skipping {skipped} incomplete papers (no abstract or <3-word title); "
+            f"{len(complete)} of {len(papers)} remain",
+            file=sys.stderr,
+        )
+    return complete
 
 
 def build_paper_fingerprints(
