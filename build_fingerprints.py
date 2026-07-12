@@ -12,8 +12,11 @@ an area-profile-only fingerprint.
 
 Fingerprints are cached in fingerprints.json (keyed by email, so every
 accepted reviewer has a stable key even without a DBLP PID) — a reviewer
-already in the cache is not re-fetched or re-encoded on a later run. DBLP
-titles reuse the same caches as main.py (dblp_cache.json / dblp_pubs_cache.json).
+already in the cache is not re-fetched or re-encoded on a later run, with
+one exception: an entry built without a PID (area-only) is recomputed once
+the reviewer has one, so filling in dblp_overrides.csv and rerunning is
+enough to upgrade their fingerprint with real titles. DBLP titles reuse the
+same caches as main.py (dblp_cache.json / dblp_pubs_cache.json).
 
 No paper data exists yet, so this only builds the reviewer side. As a sanity
 check, it prints each spot-check reviewer's top-5 nearest neighbors by
@@ -85,7 +88,18 @@ def main() -> int:
         reviewers = reviewers[: args.limit]
 
     fp_cache = fp.load_fingerprint_cache(args.fingerprint_cache)
-    pending = [r for r in reviewers if r.email not in fp_cache]
+
+    def needs_fingerprint(r) -> bool:
+        entry = fp_cache.get(r.email)
+        if entry is None:
+            return True
+        # An area-only fingerprint built when the reviewer had no PID is
+        # rebuilt once they have one (a dblp_overrides.csv fill-in after the
+        # original run). has_pid=True with n_titles=0 stays cached — that's
+        # the legitimate nothing-in-the-window fallback.
+        return bool(r.pid) and not entry.get("has_pid")
+
+    pending = [r for r in reviewers if needs_fingerprint(r)]
 
     print(
         f"Loaded {len(reviewers)} accepted reviewers; {len(pending)} need fingerprints "

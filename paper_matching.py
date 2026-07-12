@@ -7,6 +7,7 @@ the paper fingerprinting, COI exclusion, and area gate aren't duplicated.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 
@@ -39,6 +40,17 @@ def load_papers(path: str) -> list[dict]:
     return complete
 
 
+def _doc_key(paper: dict) -> str:
+    """Hash of the paper fields that feed its SPECTER2 documents.
+
+    Papers keep being edited until the registration deadline, so cache
+    entries are keyed by content, not just pid — a changed title, abstract,
+    or topic list re-encodes that paper on the next run.
+    """
+    parts = [paper.get("title") or "", paper.get("abstract") or ""] + list(paper.get("topics", []))
+    return hashlib.sha1("\x00".join(parts).encode("utf-8")).hexdigest()
+
+
 def build_paper_fingerprints(
     papers: list[dict],
     paper_cache: dict,
@@ -47,14 +59,18 @@ def build_paper_fingerprints(
     area_weight: float = 1.0,
     device: str = "cuda",
 ) -> None:
-    """Fingerprint any of `papers` not already in `paper_cache`, in place.
+    """Fingerprint any of `papers` missing or stale in `paper_cache`, in place.
 
     Each paper pools two SPECTER2 documents (fingerprint.pool): title+abstract
-    (weight 1.0) and its declared topics (weight `area_weight`). Saves
-    `paper_cache` to `cache_path` if anything was added; a no-op (no model
-    load) if every paper is already cached.
+    (weight 1.0) and its declared topics (weight `area_weight`). A cached
+    entry is stale when its stored `doc_key` no longer matches the paper's
+    current content (see `_doc_key`). Saves `paper_cache` to `cache_path` if
+    anything was (re)computed; a no-op (no model load) otherwise.
     """
-    pending = [p for p in papers if str(p["pid"]) not in paper_cache]
+    pending = [
+        p for p in papers
+        if paper_cache.get(str(p["pid"]), {}).get("doc_key") != _doc_key(p)
+    ]
     if not pending:
         return
 
@@ -88,6 +104,7 @@ def build_paper_fingerprints(
         paper_cache[str(p["pid"])] = {
             "vector": fingerprint_vec.tolist(),
             "n_topics": len(p.get("topics", [])),
+            "doc_key": _doc_key(p),
         }
 
     fp.save_fingerprint_cache(paper_cache, cache_path)

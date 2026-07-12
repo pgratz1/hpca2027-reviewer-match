@@ -16,8 +16,10 @@ from elsewhere). Run everything as:
 ~/envs/hpca-matching/bin/python3 <script>.py [args]
 ```
 
-Scripts that don't touch SPECTER2 (`main.py`, `classify_reviewers.py`) also
-run under plain `python3` — they only need `requests`.
+or just use `make` (see the workflow below), which defaults to that
+interpreter. Scripts that don't touch SPECTER2 (`main.py`,
+`classify_reviewers.py`) also run under plain `python3` — they only need
+`requests`.
 
 ## Pipeline
 
@@ -35,6 +37,36 @@ paper JSON ──▶ paper_matching.py ──▶ paper_fingerprints.json ──�
 `hpca2027-data.json` with no abstract or a title under 3 words is a
 placeholder. `paper_matching.load_papers` drops them, so every paper-side
 tool sees only complete papers (skip count reported to stderr).
+
+## Start-to-finish workflow
+
+1. **Drop the inputs in place**: the latest acceptance-form CSV export (keep
+   the exact filename) and a fresh `hpca2027-data.json` from HotCRP.
+2. **`make`** — rebuilds whatever is stale, in order: reviewer seniority
+   classification, reviewer fingerprints, then the assignment. The final
+   output lands in **`assignment.txt`**: per-paper reviewer slates, the
+   per-area shortage report, and the seniority criteria report.
+3. **If classify reported unknown reviewers**, it appended blank stub rows
+   for them to `dblp_overrides.csv` — fill in their `dblp` cells and `make`
+   again. Repeat until no unknowns remain.
+4. **Ad-hoc follow-ups**: `score_papers.py --pid N` for one paper's full
+   ranking, `nearest_neighbors.py --email X` to eyeball a reviewer's profile.
+
+The equivalent manual commands, in dependency order:
+
+```bash
+~/envs/hpca-matching/bin/python3 classify_reviewers.py
+~/envs/hpca-matching/bin/python3 build_fingerprints.py
+~/envs/hpca-matching/bin/python3 assign_reviewers.py > assignment.txt
+```
+
+Make notes: `make PYTHON=python3` overrides the interpreter (the default is
+the venv above); `make clean-fingerprints` forces a full re-embed after an
+embedding-policy change (`--years`, `--area-weight`) — it never touches the
+rate-limited DBLP caches, so it costs GPU seconds, not network time. The
+caches are content-aware, so a rerun after edits re-embeds only what
+actually changed (papers whose title/abstract/topics changed; reviewers who
+gained a DBLP PID since their fingerprint was built).
 
 ## Scripts
 
@@ -144,7 +176,7 @@ emails, treat as sensitive), `hpca2027-data.json` (HotCRP paper export),
 
 **Generated** (safe to delete; rebuilt incrementally): `dblp_cache.json`,
 `dblp_venue_cache.json`, `fingerprints.json`, `paper_fingerprints.json`,
-`reviewer_seniority.csv`.
+`reviewer_seniority.csv`, `assignment.txt`.
 
 **Retired** (left over from the removed lookup chain; kept only as
 historical reference, nothing reads them): `no_dblp_lookup_report.csv`,

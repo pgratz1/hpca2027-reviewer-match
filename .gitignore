@@ -12,6 +12,7 @@ final_identity_resolution.csv
 dblp_venue_cache.json
 reviewer_seniority.csv
 dblp_overrides.csv
+assignment.txt
 
 # Test fixture with a placeholder author email, not core project data
 hpca2027-data.json
