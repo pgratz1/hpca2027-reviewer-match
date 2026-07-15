@@ -1,5 +1,6 @@
 # PII / PII-derived — real PC member data
 HPCA'27 PC Member Acceptance Form (Responses) - Form Responses 1.csv
+PCDB_with_emails.csv
 fingerprints.json
 paper_fingerprints.json
 dblp_cache.json
@@ -17,8 +18,17 @@ assignment.txt
 # Test fixture with a placeholder author email, not core project data
 hpca2027-data.json
 
+# Unrelated personal / local working files — never project code
+china_faculty.csv
+china_faculty.xlsx
+nonchina_faculty.csv
+nonchina_faculty.xlsx
+newresume.txt
+resume_codex.txt
+
 # Local tooling / session artifacts
 restart.txt
 .claude/
 __pycache__/
 *.pyc
+\#*\#

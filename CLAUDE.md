@@ -36,19 +36,30 @@ contains spaces and parentheses — always quote it in shell commands).
    column. `classify_reviewers.py` auto-appends blank stub rows for reviewers
    it can't resolve — the file doubles as the to-do list.
 2. **Seniority**: `classify_reviewers.py` → `reviewer_seniority.csv`
-   (senior ≥0.8 papers/yr over 15y in ISCA/MICRO/HPCA/ASPLOS; junior <7
-   career; typical otherwise — all flag-tunable).
+   (senior ≥0.8 papers/yr over 15y in ISCA/MICRO/HPCA/ASPLOS; junior <20
+   pubs overall; out-of-area ≥20 pubs but <5 target-venue career; typical
+   otherwise — all flag-tunable, checked in that order). PC-service
+   overrides from `PCDB_with_emails.csv` (email-matched, promote-only)
+   then make chairs, TopPicks PC/ERC members, and PC/ERC score ≥6
+   senior, and juniors with score ≥2 typical.
 3. **Affinity**: SPECTER2 fingerprints for reviewers (recent DBLP titles +
    declared areas) and papers (title+abstract+topics); cosine similarity.
-   Area gate (reviewer primary/secondary ∩ paper topics) and COI are hard
-   filters, never blended into the score.
+   COI is a hard filter and the area gate (reviewer primary/secondary ∩
+   paper topics) governs the normal phases — neither is ever blended into
+   the score, but the gate is released per-paper by the relaxation ladder.
 4. **Assignment**: `assign_reviewers.py` — phased paper-proposing deferred
-   acceptance aiming for ≥1 senior and ≤1 junior per paper, degrading via
-   almost-senior / almost-not-junior fallbacks; prints a criteria report and
-   self-checks (over-cap, blocking pairs, junior policy) that must all be 0.
+   acceptance aiming for a full slate plus ≥1 senior, ≤1 junior, and ≤1
+   out-of-area per paper. Papers that can't fill release constraints in
+   order: area gate → junior/out-of-area caps (almost-nots only) → senior
+   requirement (almost-senior), every pool still ranked by fingerprint
+   similarity. Prints a criteria report, per-paper match goodness (mean
+   assigned-reviewer similarity, worst-first summary), a relaxation &
+   exclusion report, and self-checks (over-cap, blocking pairs,
+   junior/out-of-area policy) that must all be 0.
 
-**Policy:** every paper-side tool ignores incomplete papers (no abstract or a
-title under 3 words) — enforced centrally in `paper_matching.load_papers`.
+**Policy:** every paper-side tool ignores incomplete or withdrawn papers
+(title under 3 words; missing abstract, topics, or authors; withdrawn flag) —
+enforced centrally in `paper_matching.load_papers` / `completeness_gaps`.
 
 ## Data, caches, and PII
 
@@ -61,9 +72,10 @@ title under 3 words) — enforced centrally in `paper_matching.load_papers`.
   all caches, `dblp_overrides.csv`, `reviewer_seniority.csv`,
   `assignment.txt`, retired report CSVs) is gitignored; only code and docs go
   to the GitHub remote. Check `git status` before committing.
-- Caches are incremental **and content-aware**: paper fingerprints re-encode
-  when title/abstract/topics change (`doc_key`); reviewer fingerprints
-  re-encode when a PID appears for a previously PID-less reviewer. The DBLP
+- Caches are incremental, versioned, and **content/policy-aware**: paper
+  fingerprints include title/abstract/topics, model, and area weight;
+  reviewer fingerprints include metadata, PID, selected titles, model, and
+  embedding flags. Transient DBLP failures remain retryable. The DBLP
   caches (`dblp_cache.json`, `dblp_venue_cache.json`, read-only
   `dblp_pubs_cache.json`) are expensive to refill — live DBLP fetches are
   rate-limited (~3s jittered delay, 429 backoff ≥15s). Never delete them;

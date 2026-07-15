@@ -21,19 +21,21 @@ EMBED_LIBS = fingerprint.py specter2_model.py
 .DELETE_ON_ERROR:
 .PHONY: all clean clean-fingerprints
 
-all: assignment.txt
+all: reviewer_seniority.csv fingerprints.json
+	$(PYTHON) build_fingerprints.py --csv "$(CSV)" --fingerprint-cache fingerprints.json
+	$(MAKE) assignment.txt
 
 # classify_reviewers.py may append stub rows for unknown reviewers to
 # dblp_overrides.csv, leaving it newer than this target; the next make run
 # reruns classify once (stub population is idempotent) and converges.
-reviewer_seniority.csv: classify_reviewers.py $(REVIEWER_LIBS) $(CSV_DEP) dblp_overrides.csv
+reviewer_seniority.csv: classify_reviewers.py $(REVIEWER_LIBS) $(CSV_DEP) dblp_overrides.csv PCDB_with_emails.csv
 	$(PYTHON) classify_reviewers.py --csv "$(CSV)" --out $@
 
-# build_fingerprints.py only rewrites the cache when something was computed,
-# so touch records the freshness check even on a 0-computed run.
-fingerprints.json: build_fingerprints.py $(REVIEWER_LIBS) $(EMBED_LIBS) $(CSV_DEP) dblp_overrides.csv
+# build_fingerprints.py rewrites the cache only when content/policy changed or
+# a DBLP retry state changed. The all recipe also runs its cheap freshness
+# check so cache content, rather than timestamps alone, decides what is stale.
+fingerprints.json: build_fingerprints.py $(REVIEWER_LIBS) $(EMBED_LIBS) $(CSV_DEP) dblp_overrides.csv dblp_pubs_cache.json
 	$(PYTHON) build_fingerprints.py --csv "$(CSV)" --fingerprint-cache $@
-	touch $@
 
 # Stale paper fingerprints (edited titles/abstracts/topics) are detected and
 # re-encoded inside this run, so paper_fingerprints.json needs no target.

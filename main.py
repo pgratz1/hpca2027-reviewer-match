@@ -1,7 +1,7 @@
 """Reviewer DBLP title fetcher — prints each reviewer's recent paper titles.
 
     python main.py --limit 5         # validate on a handful first
-    python main.py                   # full run (~385 reviewers)
+    python main.py                   # full run
     python main.py --years 2         # narrower window
 
 Titles are drawn from (in order): colleague's pre-built cache, our own cache,
@@ -45,6 +45,11 @@ def main() -> int:
         help="include publications from the most recent N calendar years (default: 4)"
     )
     args = parser.parse_args()
+
+    if args.years <= 0:
+        parser.error("--years must be greater than 0")
+    if args.delay < 0:
+        parser.error("--delay must be non-negative")
 
     current_year = datetime.date.today().year
     year_window = f"{current_year - args.years + 1}–{current_year}"

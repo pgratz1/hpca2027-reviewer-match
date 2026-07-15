@@ -34,9 +34,12 @@ paper JSON ──▶ paper_matching.py ──▶ paper_fingerprints.json ──�
 ```
 
 **Paper-completeness policy:** until the registration deadline, any paper in
-`hpca2027-data.json` with no abstract or a title under 3 words is a
-placeholder. `paper_matching.load_papers` drops them, so every paper-side
-tool sees only complete papers (skip count reported to stderr).
+`hpca2027-data.json` with a title under 3 words or missing its abstract,
+topics, or authors is a placeholder; withdrawn papers need no reviewers.
+`paper_matching.load_papers` (via `completeness_gaps`) drops them all, so
+every paper-side tool sees only assignable papers (skip count reported to
+stderr; `assign_reviewers.py` itemizes them in its relaxation & exclusion
+report).
 
 ## Start-to-finish workflow
 
@@ -46,9 +49,10 @@ tool sees only complete papers (skip count reported to stderr).
    classification, reviewer fingerprints, then the assignment. The final
    output lands in **`assignment.txt`**: per-paper reviewer slates, the
    per-area shortage report, and the seniority criteria report.
-3. **If classify reported unknown reviewers**, it appended blank stub rows
-   for them to `dblp_overrides.csv` — fill in their `dblp` cells and `make`
-   again. Repeat until no unknowns remain.
+3. **If classify reported reviewers with missing DBLP identities**, it
+   appended blank stub rows for them to `dblp_overrides.csv` — fill in their
+   `dblp` cells and `make` again. Unknowns caused by transient DBLP fetch
+   failures are retried and do not create identity stubs.
 4. **Ad-hoc follow-ups**: `score_papers.py --pid N` for one paper's full
    ranking, `nearest_neighbors.py --email X` to eyeball a reviewer's profile.
 
@@ -61,12 +65,14 @@ The equivalent manual commands, in dependency order:
 ```
 
 Make notes: `make PYTHON=python3` overrides the interpreter (the default is
-the venv above); `make clean-fingerprints` forces a full re-embed after an
-embedding-policy change (`--years`, `--area-weight`) — it never touches the
-rate-limited DBLP caches, so it costs GPU seconds, not network time. The
-caches are content-aware, so a rerun after edits re-embeds only what
-actually changed (papers whose title/abstract/topics changed; reviewers who
-gained a DBLP PID since their fingerprint was built).
+the venv above); `make clean-fingerprints` forces a full re-embed but never
+touches the rate-limited DBLP caches, so it costs GPU seconds, not network
+time. Fingerprint caches are content- and policy-aware: paper content or
+`--area-weight` changes and reviewer metadata, PID, selected-title, model, or
+embedding-policy changes rebuild only affected entries. Legacy cache entries
+without provenance metadata are rebuilt once. A transient DBLP error remains
+marked for retry rather than permanently turning a PID-backed reviewer into
+an area-only profile.
 
 ## Scripts
 
@@ -78,15 +84,28 @@ python3 main.py --limit 5 --years 2
 
 ### `classify_reviewers.py` — seniority classification
 Classifies every accepted reviewer from DBLP publication counts in ISCA,
-MICRO, HPCA, and ASPLOS:
-- **senior** — ≥ `--senior-rate` (0.8) papers/year over the last `--window`
-  (15) years, i.e. 12+ in-window papers at the defaults;
-- **junior** — career total < `--junior-total` (7);
-- **typical** — neither (senior checked first).
+MICRO, HPCA, and ASPLOS (the target venues) and overall:
+- **senior** — ≥ `--senior-rate` (0.8) target-venue papers/year over the last
+  `--window` (15) years, i.e. 12+ in-window papers at the defaults;
+- **junior** — < `--junior-pubs` (20) publications overall (any venue);
+- **out-of-area** — ≥ `--junior-pubs` publications overall but
+  < `--out-of-area-career` (5) career target-venue papers;
+- **typical** — none of the above (checked in that order, senior first).
+
+Then applies PC-service overrides from `PCDB_with_emails.csv` (`--pcdb`;
+`--no-pcdb` skips) to reviewers whose email matches a PCDB row. With
+score = `#PC` + 0.5 × `#ERC`, and only ever promoting:
+- **senior** — past PC chair (`#Chair` > 0), any TopPicks PC/ERC membership,
+  or score ≥ `--pcdb-senior-score` (6);
+- **typical** — a junior with score ≥ `--pcdb-typical-score` (2).
+
+A fired override is recorded in the `pcdb_override` column; duplicate PCDB
+rows for one email (name variants) merge by summing the counts.
 
 Writes `reviewer_seniority.csv`: one row per reviewer with per-venue career
 and window counts backing the classification (enough for the assignment step
-to spot "almost senior" / "almost not junior" reviewers later). PIDs come
+to spot "almost senior" / "almost not junior" / "almost not out-of-area"
+reviewers later). PIDs come
 from `dblp_overrides.csv` (wins) or the acceptance CSV; anyone left is class
 **unknown** with a reason, and gets a stub row appended to
 `dblp_overrides.csv` (see below). Uncached PIDs are fetched live once into
@@ -100,7 +119,8 @@ python3 classify_reviewers.py --window 10 --senior-rate 1.0
 Embeds each reviewer (recent DBLP titles + declared areas/keywords) into a
 768-dim vector, cached in `fingerprints.json` by email. Incremental: cached
 reviewers aren't recomputed. Reviewers with no PID get an area-only
-fingerprint.
+fingerprint. Cached entries are automatically refreshed when their reviewer
+metadata, PID, selected publications, model, or embedding flags change.
 ```bash
 ~/envs/hpca-matching/bin/python3 build_fingerprints.py --limit 10   # validate first
 ~/envs/hpca-matching/bin/python3 build_fingerprints.py
@@ -128,19 +148,36 @@ One assignment across all papers at once, respecting COI, the area gate,
 per-reviewer caps (`--light-cap` / `--full-cap`, or the CSV's per-reviewer
 override column) and `--reviewers-per-paper`. Solved by paper-proposing
 deferred acceptance (Hospital/Residents stable matching), run in phases that
-enforce **seniority constraints** from `reviewer_seniority.csv`: each paper
-should get ≥ `--min-seniors` (1) senior reviewers and ≤ `--max-juniors` (1)
-juniors. Degradation when the pool can't satisfy that: a paper with no
-eligible senior takes an *almost-senior* (typical with ≥
-`--almost-senior-window` (10) window papers); a paper still under-filled at
-the junior cap may take extra *almost-not-junior* juniors (≥
-`--almost-junior-career` (5) career papers). Within the cap, juniors compete
-on match score like everyone else. A **criteria report** prints which papers
-are OK, degraded, or breaking the rules; under-filled papers are also flagged
-and a per-area shortage report prints. `--no-seniority` skips all of it
-(plain single-pass assignment).
+enforce **seniority constraints** from `reviewer_seniority.csv` — each paper
+should get ≥ `--min-seniors` (1) senior reviewers, ≤ `--max-juniors` (1)
+juniors, and ≤ `--max-out-of-area` (1) out-of-area reviewers — and a **full
+slate**. When the normal constraints can't fill a paper's slate or senior
+slot, they are released per-paper in a fixed order, each relaxed pool still
+ranked by fingerprint similarity so match goodness holds up:
+
+1. **area gate** — take the closest-fingerprint reviewers from any area
+   (COI and reviewer capacity are never released);
+2. **junior / out-of-area caps** — exceeded only by *almost-not-junior*
+   juniors (≥ `--almost-junior-pubs` (15) pubs overall) and
+   *almost-not-out-of-area* reviewers (≥ `--almost-out-of-area-career` (5)
+   career target-venue papers);
+3. **senior requirement** — filled by an *almost-senior* (typical with ≥
+   `--almost-senior-window` (10) window papers) only when no true senior is
+   available even from other areas.
+
+Within their caps, juniors and out-of-area reviewers compete on match score
+like everyone else. A **criteria report** prints which papers are OK,
+degraded, or breaking the rules; a per-area **shortage report** covers slots
+that stay unfilled even after relaxation (papers without topics appear under
+`Unspecified/no matching topic`); the **match goodness** section ranks all
+papers worst-first by the mean similarity of their assigned reviewers; and a
+**relaxation & exclusion report** itemizes every skipped paper (what's
+missing, or withdrawn) and every relaxed paper, reviewer by reviewer with
+the released constraint and score. `--no-seniority` skips the seniority
+constraints and criteria report (single-pass assignment; the area release
+for under-filled papers still applies).
 ```bash
-~/envs/hpca-matching/bin/python3 assign_reviewers.py --light-cap 1 --full-cap 2 --reviewers-per-paper 6
+~/envs/hpca-matching/bin/python3 assign_reviewers.py --light-cap 7 --full-cap 15 --reviewers-per-paper 6
 ```
 
 ## The DBLP override file
@@ -170,7 +207,8 @@ override application) · `dblp.py` (DBLP fetch, caching, rate limiting) ·
 
 **Inputs:** the acceptance-form CSV (Google Forms export — real names and
 emails, treat as sensitive), `hpca2027-data.json` (HotCRP paper export),
-`dblp_pubs_cache.json` (colleague's read-only rich DBLP cache).
+`dblp_pubs_cache.json` (colleague's read-only rich DBLP cache),
+`PCDB_with_emails.csv` (PC-service history with emails — also sensitive).
 
 **Hand-maintained:** `dblp_overrides.csv`.
 
@@ -182,6 +220,11 @@ emails, treat as sensitive), `hpca2027-data.json` (HotCRP paper export),
 historical reference, nothing reads them): `no_dblp_lookup_report.csv`,
 `manual_review_report*.csv`, `final_identity_resolution.csv`,
 `openalex_cache.json`.
+
+Unsafe numeric inputs (negative capacities or targets, nonpositive embedding
+weights/windows) fail before network or model work. Executable but
+contradictory policy combinations print a warning and continue so the
+criteria report can show their consequences.
 
 All PII-bearing files above are gitignored; only code and docs are
 committed.

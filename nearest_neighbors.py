@@ -35,6 +35,11 @@ def main() -> int:
     parser.add_argument("--email", default=None, help="only print neighbors for this one reviewer (default: all)")
     args = parser.parse_args()
 
+    if args.top < 0:
+        parser.error("--top must be non-negative")
+    if args.email is not None:
+        args.email = args.email.strip().lower()
+
     fp_cache = fp.load_fingerprint_cache(args.fingerprint_cache)
     if not fp_cache:
         print(f"No fingerprints found in {args.fingerprint_cache}", file=sys.stderr)

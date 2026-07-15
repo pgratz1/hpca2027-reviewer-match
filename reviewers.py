@@ -68,11 +68,16 @@ def _parse_override_cap(email: str, override_raw: str) -> int | None:
     if not override_raw:
         return None
     try:
-        return int(override_raw)
+        value = int(override_raw)
     except ValueError:
         raise ValueError(
             f"{email}: 'Override paper assignment number' must be a whole number, got {override_raw!r}"
         ) from None
+    if value < 0:
+        raise ValueError(
+            f"{email}: 'Override paper assignment number' must be non-negative, got {value}"
+        )
+    return value
 
 
 def load_dblp_overrides(path: str = DEFAULT_OVERRIDES) -> dict[str, str]:

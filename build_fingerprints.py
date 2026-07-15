@@ -1,7 +1,7 @@
 """Build a SPECTER2 fingerprint (768-dim vector) for each accepted reviewer.
 
     python build_fingerprints.py --limit 10   # validate on a handful first
-    python build_fingerprints.py              # full run (~450 reviewers)
+    python build_fingerprints.py              # full run
 
 Each reviewer's fingerprint pools SPECTER2 embeddings of: one document per
 DBLP title from the most recent --years calendar years (default: 4, no count
@@ -10,22 +10,22 @@ areas + keywords (weighted --area-weight relative to a single title).
 Reviewers with no DBLP PID, or no titles in the --years window, fall back to
 an area-profile-only fingerprint.
 
-Fingerprints are cached in fingerprints.json (keyed by email, so every
-accepted reviewer has a stable key even without a DBLP PID) — a reviewer
-already in the cache is not re-fetched or re-encoded on a later run, with
-one exception: an entry built without a PID (area-only) is recomputed once
-the reviewer has one, so filling in dblp_overrides.csv and rerunning is
-enough to upgrade their fingerprint with real titles. DBLP titles reuse the
-same caches as main.py (dblp_cache.json / dblp_pubs_cache.json).
+Fingerprints are cached in fingerprints.json (keyed by email). A versioned
+content key covers the reviewer metadata, selected titles, model, and policy
+flags, so unchanged entries avoid model work while changes rebuild
+automatically. A transient DBLP failure creates or retains an area-only
+fallback marked for retry; it cannot become permanently "complete". DBLP
+titles reuse the same caches as main.py (dblp_cache.json / dblp_pubs_cache.json).
 
-No paper data exists yet, so this only builds the reviewer side. As a sanity
-check, it prints each spot-check reviewer's top-5 nearest neighbors by
-fingerprint cosine similarity.
+As a sanity check, the script prints each spot-check reviewer's top-5 nearest
+neighbors by fingerprint cosine similarity.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import sys
 
 import numpy as np
@@ -41,10 +41,32 @@ DEFAULT_CSV = "HPCA'27 PC Member Acceptance Form (Responses) - Form Responses 1.
 DEFAULT_CACHE = "dblp_cache.json"
 DEFAULT_COLLEAGUE_CACHE = "dblp_pubs_cache.json"
 DEFAULT_FINGERPRINT_CACHE = "fingerprints.json"
+FINGERPRINT_SCHEMA_VERSION = 2
 
 # Always spot-checked if present in the current run; falls back to the first
 # few reviewers processed when empty.
 SPOT_CHECK_EMAILS: list[str] = []
+
+
+def fingerprint_key(r, titles, *, years, max_titles, area_weight) -> str:
+    """Content and policy key for a reviewer fingerprint."""
+    payload = {
+        "schema_version": FINGERPRINT_SCHEMA_VERSION,
+        "model": specter2_model.BASE_MODEL,
+        "adapter": specter2_model.PROXIMITY_ADAPTER,
+        "email": r.email,
+        "pid": r.pid,
+        "primary": r.primary,
+        "secondary": r.secondary,
+        "tertiary": r.tertiary,
+        "keywords": r.keywords,
+        "years": years,
+        "max_titles": max_titles,
+        "area_weight": area_weight,
+        "titles": titles,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def main() -> int:
@@ -79,6 +101,15 @@ def main() -> int:
     parser.add_argument("--device", default="cuda", help="torch device for SPECTER2 (default: cuda)")
     args = parser.parse_args()
 
+    if args.years <= 0:
+        parser.error("--years must be greater than 0")
+    if args.max_titles is not None and args.max_titles < 0:
+        parser.error("--max-titles must be 0 or greater")
+    if args.area_weight <= 0:
+        parser.error("--area-weight must be greater than 0")
+    if args.delay < 0:
+        parser.error("--delay must be non-negative")
+
     if args.device == "cuda" and not torch.cuda.is_available():
         print("WARN: cuda requested but not available, falling back to cpu", file=sys.stderr)
         args.device = "cpu"
@@ -89,43 +120,29 @@ def main() -> int:
 
     fp_cache = fp.load_fingerprint_cache(args.fingerprint_cache)
 
-    def needs_fingerprint(r) -> bool:
-        entry = fp_cache.get(r.email)
-        if entry is None:
-            return True
-        # An area-only fingerprint built when the reviewer had no PID is
-        # rebuilt once they have one (a dblp_overrides.csv fill-in after the
-        # original run). has_pid=True with n_titles=0 stays cached — that's
-        # the legitimate nothing-in-the-window fallback.
-        return bool(r.pid) and not entry.get("has_pid")
-
-    pending = [r for r in reviewers if needs_fingerprint(r)]
-
-    print(
-        f"Loaded {len(reviewers)} accepted reviewers; {len(pending)} need fingerprints "
-        f"({len(reviewers) - len(pending)} already cached).",
-        file=sys.stderr,
-    )
-
-    # --- 1. DBLP titles for pending reviewers with a PID ---------------------
+    # Resolve titles for every PID-backed reviewer. Cache hits are cheap, and
+    # doing this before the fingerprint freshness check lets DBLP cache edits
+    # participate in the content key.
     write_cache = load_cache(args.cache)
     readonly_cache = load_colleague_cache(args.colleague_cache)
     titles_by_pid: dict[str, list[tuple[int, str]]] = {}
+    failed_pids: set[str] = set()
     fetch_errors = 0
 
-    pending_with_pid = [r for r in pending if r.pid]
-    if pending_with_pid:
+    with_pid = [r for r in reviewers if r.pid]
+    if with_pid:
         def on_result(pid: str, titles: list[tuple[int, str]], source: str) -> None:
             titles_by_pid[pid] = titles
 
         def on_error(pid: str, exc: Exception) -> None:
             nonlocal fetch_errors
             fetch_errors += 1
+            failed_pids.add(pid)
             print(f"  WARN: DBLP fetch failed for pid={pid}: {exc}", file=sys.stderr)
 
         session = requests.Session()
         fetch_titles_for_pids(
-            [r.pid for r in pending_with_pid],
+            list(dict.fromkeys(r.pid for r in with_pid)),
             years=args.years,
             session=session,
             write_cache=write_cache,
@@ -135,6 +152,34 @@ def main() -> int:
             on_result=on_result,
             on_error=on_error,
         )
+
+    selected_by_email = {
+        r.email: fp.select_titles(titles_by_pid.get(r.pid, []), args.max_titles)
+        for r in reviewers
+    }
+    keys = {
+        r.email: fingerprint_key(
+            r, selected_by_email[r.email], years=args.years,
+            max_titles=args.max_titles, area_weight=args.area_weight,
+        )
+        for r in reviewers
+    }
+
+    pending = []
+    for r in reviewers:
+        entry = fp_cache.get(r.email)
+        fetch_failed = bool(r.pid and r.pid in failed_pids)
+        if fetch_failed and entry is not None:
+            entry["dblp_fetch_complete"] = False
+            continue
+        if entry is None or entry.get("fingerprint_key") != keys[r.email] or not entry.get("dblp_fetch_complete", True):
+            pending.append(r)
+
+    print(
+        f"Loaded {len(reviewers)} accepted reviewers; {len(pending)} need fingerprints "
+        f"({len(reviewers) - len(pending)} already cached).",
+        file=sys.stderr,
+    )
 
     # --- 2. Load SPECTER2 once, build every pending reviewer's input docs,
     #        encode in one batched pass, then pool per reviewer ---------------
@@ -149,8 +194,7 @@ def main() -> int:
         n_titles_used = [0] * len(pending)
 
         for i, r in enumerate(pending):
-            titles = titles_by_pid.get(r.pid, []) if r.pid else []
-            selected = fp.select_titles(titles, args.max_titles)
+            selected = selected_by_email[r.email]
             n_titles_used[i] = len(selected)
 
             for _, title in selected:
@@ -181,8 +225,14 @@ def main() -> int:
                 "vector": fingerprint_vec.tolist(),
                 "n_titles": n_titles_used[i],
                 "has_pid": bool(r.pid),
+                "fingerprint_key": keys[r.email],
+                "schema_version": FINGERPRINT_SCHEMA_VERSION,
+                "dblp_fetch_complete": not bool(r.pid and r.pid in failed_pids),
             }
 
+        fp.save_fingerprint_cache(fp_cache, args.fingerprint_cache)
+    elif failed_pids:
+        # Persist retry state without changing the last known-good vectors.
         fp.save_fingerprint_cache(fp_cache, args.fingerprint_cache)
 
     print(

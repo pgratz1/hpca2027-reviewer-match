@@ -16,38 +16,71 @@ import numpy as np
 import fingerprint as fp
 import specter2_model
 
-
-def _is_complete(paper: dict) -> bool:
-    """A paper counts as complete once it has an abstract and a title of at
-    least 3 words — until the registration deadline, entries missing either
-    are tentative placeholders and must be ignored by every tool (policy)."""
-    return bool((paper.get("abstract") or "").strip()) and len(
-        (paper.get("title") or "").split()
-    ) >= 3
+PAPER_FINGERPRINT_SCHEMA_VERSION = 2
 
 
-def load_papers(path: str) -> list[dict]:
+def completeness_gaps(paper: dict) -> list[str]:
+    """Reasons a paper must be ignored by every tool; empty = assignable.
+
+    Until the registration deadline, entries missing a real title, abstract,
+    topics, or authors are tentative placeholders (policy), and withdrawn
+    papers need no reviewers.
+    """
+    gaps = []
+    if len((paper.get("title") or "").split()) < 3:
+        gaps.append("title under 3 words")
+    if not (paper.get("abstract") or "").strip():
+        gaps.append("no abstract")
+    if not paper.get("topics"):
+        gaps.append("no topics")
+    if not paper.get("authors"):
+        gaps.append("no authors")
+    if paper.get("withdrawn"):
+        gaps.append("withdrawn")
+    return gaps
+
+
+def load_papers(path: str, *, with_skipped: bool = False):
+    """Assignable papers from the HotCRP export, `completeness_gaps` applied.
+
+    With `with_skipped=True` returns `(papers, skipped)` instead, where
+    `skipped` is `[{pid, title, missing}, ...]` for the exclusion report.
+    """
     with open(path, encoding="utf-8") as f:
         papers = json.load(f)
-    complete = [p for p in papers if _is_complete(p)]
-    skipped = len(papers) - len(complete)
+    complete, skipped = [], []
+    for p in papers:
+        gaps = completeness_gaps(p)
+        if gaps:
+            skipped.append({"pid": p["pid"], "title": p.get("title") or "", "missing": gaps})
+        else:
+            complete.append(p)
     if skipped:
         print(
-            f"Skipping {skipped} incomplete papers (no abstract or <3-word title); "
+            f"Skipping {len(skipped)} papers (incomplete or withdrawn); "
             f"{len(complete)} of {len(papers)} remain",
             file=sys.stderr,
         )
+    if with_skipped:
+        return complete, skipped
     return complete
 
 
-def _doc_key(paper: dict) -> str:
+def _doc_key(paper: dict, area_weight: float = 1.0) -> str:
     """Hash of the paper fields that feed its SPECTER2 documents.
 
     Papers keep being edited until the registration deadline, so cache
     entries are keyed by content, not just pid — a changed title, abstract,
     or topic list re-encodes that paper on the next run.
     """
-    parts = [paper.get("title") or "", paper.get("abstract") or ""] + list(paper.get("topics", []))
+    parts = [
+        str(PAPER_FINGERPRINT_SCHEMA_VERSION),
+        specter2_model.BASE_MODEL,
+        specter2_model.PROXIMITY_ADAPTER,
+        repr(float(area_weight)),
+        paper.get("title") or "",
+        paper.get("abstract") or "",
+    ] + list(paper.get("topics", []))
     return hashlib.sha1("\x00".join(parts).encode("utf-8")).hexdigest()
 
 
@@ -69,7 +102,7 @@ def build_paper_fingerprints(
     """
     pending = [
         p for p in papers
-        if paper_cache.get(str(p["pid"]), {}).get("doc_key") != _doc_key(p)
+        if paper_cache.get(str(p["pid"]), {}).get("doc_key") != _doc_key(p, area_weight)
     ]
     if not pending:
         return
@@ -104,7 +137,8 @@ def build_paper_fingerprints(
         paper_cache[str(p["pid"])] = {
             "vector": fingerprint_vec.tolist(),
             "n_topics": len(p.get("topics", [])),
-            "doc_key": _doc_key(p),
+            "doc_key": _doc_key(p, area_weight),
+            "schema_version": PAPER_FINGERPRINT_SCHEMA_VERSION,
         }
 
     fp.save_fingerprint_cache(paper_cache, cache_path)

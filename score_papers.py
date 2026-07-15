@@ -64,6 +64,11 @@ def main() -> int:
     parser.add_argument("--device", default="cuda", help="torch device for SPECTER2 (default: cuda)")
     args = parser.parse_args()
 
+    if args.top < 0:
+        parser.error("--top must be non-negative")
+    if args.area_weight <= 0:
+        parser.error("--area-weight must be greater than 0")
+
     papers = load_papers(args.data)
     if args.pid is not None:
         papers = [p for p in papers if p["pid"] == args.pid]

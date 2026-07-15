@@ -1,7 +1,7 @@
 """Solve a global, load-capped assignment of reviewers to every paper.
 
     python assign_reviewers.py
-    python assign_reviewers.py --light-cap 1 --full-cap 2 --reviewers-per-paper 6
+    python assign_reviewers.py --light-cap 7 --full-cap 15 --reviewers-per-paper 6
 
 Unlike score_papers.py's independent per-paper ranking, a per-reviewer paper
 cap only makes sense considered across ALL papers at once: if two papers
@@ -18,28 +18,47 @@ each other over a current match) and is paper-optimal: each paper gets the
 best slate of reviewers achievable in any stable matching.
 
 Eligibility (COI exclusion + area gate) is identical to score_papers.py, via
-paper_matching.eligible_scores.
+paper_matching.eligible_scores. COI and reviewer capacity are absolute; the
+area gate is a soft constraint, released paper-by-paper when a paper can't
+otherwise fill its slate or senior slot (see the ladder below).
 
 Seniority constraints (needs reviewer_seniority.csv from classify_reviewers.py;
 skip them all with --no-seniority): every paper should get at least
---min-seniors senior reviewers and at most --max-juniors juniors, degrading
-gracefully when the pool can't satisfy that. Assignment runs in phases, each a
+--min-seniors senior reviewers, at most --max-juniors juniors, and at most
+--max-out-of-area out-of-area reviewers. Every paper should also end up with
+a full slate of --reviewers-per-paper reviewers; when the normal constraints
+can't deliver that, they are released in a fixed order — (1) the area gate,
+(2) the junior/out-of-area caps (almost-nots only), (3) the senior
+requirement — with every relaxed pool still ranked by fingerprint similarity
+so match goodness holds up. Assignment runs in phases, each a
 deferred-acceptance pass whose results are frozen before the next:
 
-  1.  senior anchors — every paper matches its best eligible senior;
-  1b. papers that got none fall back to an "almost senior" (a typical-class
-      reviewer with >= --almost-senior-window in-window papers);
-  2.  main fill — everyone with remaining capacity competes on score, but a
-      paper holds at most --max-juniors juniors at a time (a pure cap: a
+  A1. senior anchors — every paper matches its best eligible in-area senior;
+  A2. papers short a senior try area-released true seniors (a close-
+      fingerprint senior from another area beats an almost-senior);
+  A3. papers still senior-less fall back to an "almost senior" (a
+      typical-class reviewer with >= --almost-senior-window window papers),
+      any area;
+  F1. main fill — everyone with remaining capacity competes on score within
+      the area gate, but a paper holds at most --max-juniors juniors and
+      --max-out-of-area out-of-area reviewers at a time (pure caps: a
       well-matched junior can still beat a weak-matched typical to a slot);
-  3.  papers still under-filled may take extra "almost not junior" juniors
-      (>= --almost-junior-career career papers).
+  F2. under-filled papers fill from the area-released pool, the class caps
+      still counting everything held so far;
+  F3. papers still under-filled may exceed the caps with "almost not junior"
+      juniors (>= --almost-junior-pubs pubs overall) and "almost not
+      out-of-area" reviewers (>= --almost-out-of-area-career career papers).
 
 Papers that break the criteria even after degradation are printed in a report
-at the end. Each phase is individually stable, but freezing earlier phases
-(the anchors) and the junior cap mean the final assignment trades classical
-global stability for the composition constraints — the self-check verifies
-phase 2's cap-aware stability plus the final composition invariants instead.
+at the end; every paper gets a "match goodness" score — the mean similarity
+of its assigned reviewers — summarized worst-first; and a relaxation &
+exclusion report itemizes each paper skipped for missing information or
+withdrawal and each paper that needed a relaxed constraint, reviewer by
+reviewer. Each phase is individually stable, but freezing earlier phases
+(the anchors) and the per-class caps mean the final assignment trades
+classical global stability for the composition constraints — the self-check
+verifies F1's cap-aware stability plus the final composition invariants
+instead.
 """
 
 from __future__ import annotations
@@ -47,6 +66,7 @@ from __future__ import annotations
 import argparse
 import sys
 from collections import defaultdict, deque
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -68,48 +88,68 @@ def deferred_acceptance(
     paper_target: dict[int, int],
     reviewer_cap: dict[str, int],
     score_lookup: dict[tuple[str, int], float],
-    junior_emails: frozenset[str] = frozenset(),
-    max_juniors: int | None = None,
+    capped: Sequence[tuple[frozenset[str], int]] = (),
+    held_counts: dict[int, list[int]] | None = None,
 ) -> dict[int, list[str]]:
     """Paper-proposing Hospital/Residents deferred acceptance.
 
     `paper_prefs[pid]` must already be sorted by descending score (eligible
     reviewers only). Returns `{pid: [email, ...]}`, the stable assignment.
 
-    If `max_juniors` is set, a paper holds at most that many reviewers from
-    `junior_emails` at a time. Juniors it can't currently take are deferred,
-    not rejected: they stay proposable in score order and get their offer if
-    the paper's junior slot later opens (its held junior was bumped away).
-    Each (paper, reviewer) pair is still proposed at most once, so
-    termination is unchanged.
+    `capped` is a list of (emails, per-paper cap) pairs — disjoint reviewer
+    classes (e.g. juniors, out-of-area) of which a paper holds at most `cap`
+    members at a time. Class members a paper can't currently take are
+    deferred, not rejected: they stay proposable in score order and get their
+    offer if a class slot later opens (a held member was bumped away). Each
+    (paper, reviewer) pair is still proposed at most once, so termination is
+    unchanged. `held_counts` seeds each paper's per-class counts with frozen
+    assignments from earlier phases, so the caps stay cumulative across
+    phases.
     """
+    class_of = {email: k for k, (emails, _) in enumerate(capped) for email in emails}
     paper_ptr = {pid: 0 for pid in pids}
     paper_held: dict[int, list[str]] = {pid: [] for pid in pids}
-    juniors_held = {pid: 0 for pid in pids}
-    deferred: dict[int, deque[str]] = {pid: deque() for pid in pids}
+    held_counts = held_counts or {}
+    class_held = {pid: list(held_counts.get(pid, [0] * len(capped))) for pid in pids}
+    deferred: dict[int, list[deque[str]]] = {pid: [deque() for _ in capped] for pid in pids}
     reviewer_held: dict[str, list[tuple[int, float]]] = {}
 
-    def junior_ok(pid: int) -> bool:
-        return max_juniors is None or juniors_held[pid] < max_juniors
+    def class_ok(pid: int, k: int) -> bool:
+        return class_held[pid][k] < capped[k][1]
+
+    def count_class(pid: int, email: str, delta: int) -> None:
+        k = class_of.get(email)
+        if k is not None:
+            class_held[pid][k] += delta
+
+    def proposable(pid: int) -> bool:
+        return paper_ptr[pid] < len(paper_prefs[pid]) or any(
+            dq and class_ok(pid, k) for k, dq in enumerate(deferred[pid])
+        )
 
     def next_candidate(pid: int) -> str | None:
-        """Best-scoring proposable candidate, honoring the junior cap.
+        """Best-scoring proposable candidate, honoring the class caps.
 
-        While the cap is full, juniors at the head of the pref list are moved
-        to `deferred` (preserving score order — the pref list is descending,
-        so appends keep the deque sorted). When a junior may be taken, the
-        deferred head competes with the pref-list head on score.
+        Members of a currently-full class at the head of the pref list are
+        moved to that class's deferred deque (preserving score order — the
+        pref list is descending, so appends keep each deque sorted). Each
+        takeable deferred head then competes with the pref-list head on score.
         """
         prefs = paper_prefs[pid]
-        if not junior_ok(pid):
-            while paper_ptr[pid] < len(prefs) and prefs[paper_ptr[pid]] in junior_emails:
-                deferred[pid].append(prefs[paper_ptr[pid]])
-                paper_ptr[pid] += 1
+        while paper_ptr[pid] < len(prefs):
+            k = class_of.get(prefs[paper_ptr[pid]])
+            if k is None or class_ok(pid, k):
+                break
+            deferred[pid][k].append(prefs[paper_ptr[pid]])
+            paper_ptr[pid] += 1
         head = prefs[paper_ptr[pid]] if paper_ptr[pid] < len(prefs) else None
-        if junior_ok(pid) and deferred[pid]:
-            best_deferred = deferred[pid][0]
-            if head is None or score_lookup[(best_deferred, pid)] >= score_lookup[(head, pid)]:
-                return deferred[pid].popleft()
+        best, best_k = head, None
+        for k, dq in enumerate(deferred[pid]):
+            if dq and class_ok(pid, k):
+                if best is None or score_lookup[(dq[0], pid)] >= score_lookup[(best, pid)]:
+                    best, best_k = dq[0], k
+        if best_k is not None:
+            return deferred[pid][best_k].popleft()
         if head is not None:
             paper_ptr[pid] += 1
         return head
@@ -121,8 +161,8 @@ def deferred_acceptance(
             continue
         email = next_candidate(pid)
         if email is None:
-            # Nothing proposable right now. If deferred juniors remain, the
-            # paper is re-queued by the bump that frees its junior slot.
+            # Nothing proposable right now. If deferred class members remain,
+            # the paper is re-queued by the bump that frees its class slot.
             continue
 
         score = score_lookup[(email, pid)]
@@ -132,23 +172,22 @@ def deferred_acceptance(
         if len(held) < reviewer_cap[email]:
             held.append((pid, score))
             paper_held[pid].append(email)
-            juniors_held[pid] += email in junior_emails
+            count_class(pid, email, +1)
         else:
             worst_i = min(range(len(held)), key=lambda i: held[i][1])
             worst_pid, worst_score = held[worst_i]
             if score > worst_score:
                 held[worst_i] = (pid, score)
                 paper_held[pid].append(email)
-                juniors_held[pid] += email in junior_emails
+                count_class(pid, email, +1)
                 paper_held[worst_pid].remove(email)
-                juniors_held[worst_pid] -= email in junior_emails
+                count_class(worst_pid, email, -1)
                 bumped_pid = worst_pid
             # else: rejected — pid tries its next candidate on a later turn
 
         if bumped_pid is not None:
             queue.append(bumped_pid)
-        more = paper_ptr[pid] < len(paper_prefs[pid]) or (junior_ok(pid) and deferred[pid])
-        if len(paper_held[pid]) < paper_target[pid] and more:
+        if len(paper_held[pid]) < paper_target[pid] and proposable(pid):
             queue.append(pid)
 
     return paper_held
@@ -160,17 +199,17 @@ def count_blocking_pairs(
     reviewer_cap: dict[str, int],
     paper_target: dict[int, int],
     score_lookup: dict[tuple[str, int], float],
-    junior_emails: frozenset[str] = frozenset(),
-    max_juniors: int | None = None,
+    capped: Sequence[tuple[frozenset[str], int]] = (),
 ) -> int:
     """Number of (reviewer, paper) pairs that would both prefer each other
     over one of their current matches — should always be 0 for a stable
     assignment; a self-check on `deferred_acceptance`'s guarantee.
 
-    With `max_juniors` set, a junior doesn't block a paper whose junior slots
-    are full of better-scoring juniors: the paper could only take them by
-    dropping a junior, so a non-junior's slot is not up for grabs.
+    A member of a capped class doesn't block a paper whose class slots are
+    full of better-scoring members of the same class: the paper could only
+    take them by dropping a class member, so no other slot is up for grabs.
     """
+    class_of = {email: k for k, (emails, _) in enumerate(capped) for email in emails}
     reviewer_papers: dict[str, list[int]] = defaultdict(list)
     for pid, emails in paper_held.items():
         for email in emails:
@@ -179,7 +218,7 @@ def count_blocking_pairs(
     blocking = 0
     for pid, pairs in eligible_by_pid.items():
         held = set(paper_held[pid])
-        juniors_held = sum(1 for e in paper_held[pid] if e in junior_emails)
+        class_counts = [sum(1 for e in paper_held[pid] if e in emails) for emails, _ in capped]
         for email, score in pairs:
             if email in held:
                 continue
@@ -190,9 +229,11 @@ def count_blocking_pairs(
             if not reviewer_wants:
                 continue
             current = paper_held[pid]
-            if max_juniors is not None and email in junior_emails and juniors_held >= max_juniors:
+            k = class_of.get(email)
+            if k is not None and class_counts[k] >= capped[k][1]:
+                class_emails = capped[k][0]
                 paper_wants = any(
-                    r2 in junior_emails and score_lookup[(r2, pid)] < score for r2 in current
+                    r2 in class_emails and score_lookup[(r2, pid)] < score for r2 in current
                 )
             else:
                 paper_wants = len(current) < paper_target[pid] or any(
@@ -215,20 +256,27 @@ class SeniorityPools:
     seniors: frozenset[str]
     almost_seniors: frozenset[str]  # typical-class, window_total >= threshold
     juniors: frozenset[str]
-    almost_not_juniors: frozenset[str]  # junior-class, career_total >= threshold
+    almost_not_juniors: frozenset[str]  # junior-class, total_pubs >= threshold
+    out_of_area: frozenset[str]
+    almost_not_out_of_area: frozenset[str]  # out-of-area-class, career_total >= threshold
 
 
 def seniority_pools(
-    candidate_emails, seniority: dict[str, dict], almost_senior_window: int, almost_junior_career: int
+    candidate_emails,
+    seniority: dict[str, dict],
+    almost_senior_window: int,
+    almost_junior_pubs: int,
+    almost_out_of_area_career: int,
 ) -> tuple[SeniorityPools, list[str]]:
     """Split the candidate pool by seniority class from reviewer_seniority.csv.
 
     Candidates classified 'unknown' or missing from the CSV count as neither
-    senior nor junior (they can fill slots but not a senior one); the missing
-    ones are also returned so the caller can warn — they usually mean the CSV
-    is stale and classify_reviewers.py needs a rerun.
+    senior, junior, nor out-of-area (they can fill slots but not a senior
+    one); the missing ones are also returned so the caller can warn — they
+    usually mean the CSV is stale and classify_reviewers.py needs a rerun.
     """
     seniors, almost_seniors, juniors, almost_not = set(), set(), set(), set()
+    out_of_area, almost_not_oob = set(), set()
     missing: list[str] = []
     for email in candidate_emails:
         row = seniority.get(email)
@@ -240,12 +288,20 @@ def seniority_pools(
             seniors.add(email)
         elif cls == "junior":
             juniors.add(email)
-            if row["career_total"] is not None and row["career_total"] >= almost_junior_career:
+            if row["total_pubs"] is not None and row["total_pubs"] >= almost_junior_pubs:
                 almost_not.add(email)
+        elif cls == "out-of-area":
+            out_of_area.add(email)
+            if row["career_total"] is not None and row["career_total"] >= almost_out_of_area_career:
+                almost_not_oob.add(email)
         elif cls == "typical" and row["window_total"] is not None and row["window_total"] >= almost_senior_window:
             almost_seniors.add(email)
     return (
-        SeniorityPools(frozenset(seniors), frozenset(almost_seniors), frozenset(juniors), frozenset(almost_not)),
+        SeniorityPools(
+            frozenset(seniors), frozenset(almost_seniors),
+            frozenset(juniors), frozenset(almost_not),
+            frozenset(out_of_area), frozenset(almost_not_oob),
+        ),
         missing,
     )
 
@@ -259,16 +315,16 @@ def assignment_phase(
     reviewer_cap: dict[str, int],
     score_lookup: dict[tuple[str, int], float],
     candidates: frozenset[str] | set[str],
-    junior_emails: frozenset[str] = frozenset(),
-    max_juniors: int | None = None,
+    capped: Sequence[tuple[frozenset[str], int]] = (),
 ):
     """One accumulating deferred-acceptance pass, restricted to `candidates`.
 
     `phase_target[pid]` is the number of ADDITIONAL reviewers the paper may
     gain this phase; assignments from earlier phases are frozen — their
     reviewers can't be bumped, which is what makes a phase-1 senior a real
-    anchor. Folds the result into `slates` and `used`, and returns this
-    phase's (held, prefs, cap) view for self-checks.
+    anchor, but they do keep counting against the per-class caps. Folds the
+    result into `slates` and `used`, and returns this phase's (held, prefs,
+    cap) view for self-checks.
     """
     cap = {}
     for email in candidates:
@@ -279,11 +335,12 @@ def assignment_phase(
     for pid in pids:
         taken = set(slates[pid])
         prefs[pid] = [e for e in full_prefs[pid] if e in cap and e not in taken]
+    held_counts = {
+        pid: [sum(1 for e in slates[pid] if e in emails) for emails, _ in capped]
+        for pid in pids
+    }
 
-    held = deferred_acceptance(
-        pids, prefs, phase_target, cap, score_lookup,
-        junior_emails=junior_emails, max_juniors=max_juniors,
-    )
+    held = deferred_acceptance(pids, prefs, phase_target, cap, score_lookup, capped, held_counts)
     for pid, emails in held.items():
         slates[pid].extend(emails)
         for e in emails:
@@ -301,8 +358,10 @@ def seniority_report(
     reviewers_per_paper: int,
     min_seniors: int,
     max_juniors: int,
+    max_out_of_area: int,
     almost_senior_window: int,
-    almost_junior_career: int,
+    almost_junior_pubs: int,
+    almost_out_of_area_career: int,
 ) -> tuple[int, int, int]:
     """Print which papers meet, degrade on, or break the seniority criteria.
 
@@ -321,6 +380,8 @@ def seniority_report(
         almost = [e for e in slate if e in pools.almost_seniors]
         juniors = [e for e in slate if e in pools.juniors]
         deep_juniors = [e for e in juniors if e not in pools.almost_not_juniors]
+        oob = [e for e in slate if e in pools.out_of_area]
+        deep_oob = [e for e in oob if e not in pools.almost_not_out_of_area]
 
         degrade_notes: list[str] = []
         break_notes: list[str] = []
@@ -335,9 +396,9 @@ def seniority_report(
             else:
                 pool_size = sum(1 for e in full_prefs[pid] if e in pools.seniors)
                 detail = (
-                    f"{pool_size} eligible senior(s), all at capacity on better-matched papers"
+                    f"{pool_size} non-conflicted senior(s) (any area), all at capacity on better-matched papers"
                     if pool_size
-                    else "no senior passes the area gate for this paper"
+                    else "no non-conflicted senior exists for this paper"
                 )
                 break_notes.append(
                     f"only {len(true_seniors) + len(almost)} of {min_seniors} senior slot(s) filled "
@@ -345,8 +406,8 @@ def seniority_report(
                 )
         if len(juniors) > max_juniors:
             names = ", ".join(
-                f"{reviewers_by_email[e].name} ({seniority[e]['career_total']} career papers)"
-                for e in sorted(juniors, key=lambda e: seniority[e]["career_total"] or 0)
+                f"{reviewers_by_email[e].name} ({seniority[e]['total_pubs']} pubs)"
+                for e in sorted(juniors, key=lambda e: seniority[e]["total_pubs"] or 0)
             )
             if len(deep_juniors) <= max_juniors:
                 degrade_notes.append(
@@ -356,9 +417,22 @@ def seniority_report(
                 break_notes.append(
                     f"{len(deep_juniors)} juniors below the almost-not-junior line (cap {max_juniors}): {names}"
                 )
+        if len(oob) > max_out_of_area:
+            names = ", ".join(
+                f"{reviewers_by_email[e].name} ({seniority[e]['career_total']} career papers)"
+                for e in sorted(oob, key=lambda e: seniority[e]["career_total"] or 0)
+            )
+            if len(deep_oob) <= max_out_of_area:
+                degrade_notes.append(
+                    f"{len(oob)} out-of-area (cap {max_out_of_area}): {names} — extras within the almost-not-out-of-area allowance"
+                )
+            else:
+                break_notes.append(
+                    f"{len(deep_oob)} out-of-area below the almost-not-out-of-area line (cap {max_out_of_area}): {names}"
+                )
         if len(slate) < reviewers_per_paper:
             break_notes.append(
-                f"{reviewers_per_paper - len(slate)} slot(s) unfilled even after the almost-not-junior relaxation"
+                f"{reviewers_per_paper - len(slate)} slot(s) unfilled even after the almost-not relaxations"
             )
 
         if break_notes:
@@ -370,9 +444,11 @@ def seniority_report(
 
     print("\n=== Seniority criteria report ===")
     print(
-        f"Target: >= {min_seniors} senior and <= {max_juniors} junior reviewer(s) per paper. "
+        f"Target: >= {min_seniors} senior, <= {max_juniors} junior, and "
+        f"<= {max_out_of_area} out-of-area reviewer(s) per paper. "
         f"Fallbacks: almost-senior = typical with >= {almost_senior_window} window papers; "
-        f"almost-not-junior = junior with >= {almost_junior_career} career papers."
+        f"almost-not-junior = junior with >= {almost_junior_pubs} pubs overall; "
+        f"almost-not-out-of-area = out-of-area with >= {almost_out_of_area_career} career papers."
     )
     print(
         f"{ok_count} paper(s) OK outright, {len(degraded)} degraded but within policy, "
@@ -391,6 +467,97 @@ def seniority_report(
             for n in notes:
                 print(f"      {n}")
     return ok_count, len(degraded), len(breaking)
+
+
+def paper_goodness(paper_held: dict[int, list[str]], score_lookup: dict[tuple[str, int], float]) -> dict[int, float | None]:
+    """Per-paper match goodness: mean similarity of the assigned reviewers.
+
+    None for papers with no reviewers — "no slate" is a shortage-report
+    problem, not a goodness of 0.
+    """
+    return {
+        pid: sum(score_lookup[(e, pid)] for e in emails) / len(emails) if emails else None
+        for pid, emails in paper_held.items()
+    }
+
+
+def match_goodness_report(papers: list[dict], goodness: dict[int, float | None]) -> None:
+    """Print every paper's match goodness worst-first, so the papers whose
+    reviewer slates sit furthest from their topic are easy to spot."""
+    scored = sorted(
+        (p for p in papers if goodness[p["pid"]] is not None),
+        key=lambda p: (goodness[p["pid"]], p["pid"]),
+    )
+    unscored = [p for p in papers if goodness[p["pid"]] is None]
+
+    print("\n=== Match goodness (mean similarity of assigned reviewers, worst first) ===")
+    if scored:
+        values = [goodness[p["pid"]] for p in scored]
+        mean = sum(values) / len(values)
+        std = (sum((v - mean) ** 2 for v in values) / len(values)) ** 0.5
+        print(f"{len(scored)} paper(s): mean {mean:.3f}, std {std:.3f}")
+        for p in scored:
+            print(f"  {goodness[p['pid']]:.3f}  [{p['pid']}] {p['title']}")
+    if unscored:
+        print(f"{len(unscored)} paper(s) with no reviewers assigned:")
+        for p in unscored:
+            print(f"    n/a  [{p['pid']}] {p['title']}")
+
+
+UNRELAXED_PHASES = frozenset({"senior anchor", "fill"})
+
+
+def relaxation_report(
+    skipped: list[dict],
+    papers: list[dict],
+    paper_held: dict[int, list[str]],
+    paper_target: dict[int, int],
+    assigned_via: dict[tuple[int, str], str],
+    goodness: dict[int, float | None],
+    score_lookup: dict[tuple[str, int], float],
+    reviewers_by_email: dict,
+    seniority: dict[str, dict] | None,
+) -> tuple[int, int]:
+    """Itemize papers excluded from assignment and papers that needed relaxed
+    constraints (area gate, junior/out-of-area caps, senior requirement) to
+    fill their slate or senior slot — the chair's checklist of what to eyeball.
+    Returns (excluded, relaxed) paper counts.
+    """
+    print("\n=== Relaxation & exclusion report ===")
+    if skipped:
+        print(f"{len(skipped)} paper(s) excluded from assignment:")
+        for s in skipped:
+            print(f"  [{s['pid']}] {s['title'] or '(no title)'} — {', '.join(s['missing'])}")
+    else:
+        print("No papers excluded from assignment.")
+
+    relaxed_papers = []
+    for p in papers:
+        pid = p["pid"]
+        entries = []
+        for e in paper_held[pid]:
+            label = assigned_via.get((pid, e), "fill")
+            if label not in UNRELAXED_PHASES:
+                entries.append((score_lookup[(e, pid)], e, label))
+        missing = paper_target[pid] - len(paper_held[pid])
+        if entries or missing > 0:
+            relaxed_papers.append((p, sorted(entries, reverse=True), missing))
+
+    if not relaxed_papers:
+        print("No papers needed relaxed constraints.")
+        return len(skipped), 0
+    print(f"\n{len(relaxed_papers)} paper(s) needed relaxed constraints:")
+    for p, entries, missing in relaxed_papers:
+        pid = p["pid"]
+        g = goodness[pid]
+        print(f"  [{pid}] {p['title']} — match goodness {'n/a' if g is None else format(g, '.3f')}")
+        for score, e, label in entries:
+            r = reviewers_by_email[e]
+            cls = seniority[e]["class"] if seniority and e in seniority else "?"
+            print(f"      {label:28s} {score:.3f}  {r.name} <{e}>  [{cls}]  ({r.primary})")
+        if missing > 0:
+            print(f"      still {missing} slot(s) unfilled — see shortage report")
+    return len(skipped), len(relaxed_papers)
 
 
 def build_canonical_area_map(reviewers_by_email: dict) -> dict[str, str]:
@@ -457,7 +624,10 @@ def shortage_report(
             continue
         total_missing += missing
         under_filled_papers += 1
-        for topic in p.get("topics", []):
+        topics = p.get("topics", [])
+        if not topics:
+            shortfalls["Unspecified/no matching topic"].append((pid, p["title"], missing))
+        for topic in topics:
             area = canonical_areas.get(topic.lower(), topic)
             shortfalls[area].append((pid, p["title"], missing))
 
@@ -493,8 +663,8 @@ def main() -> int:
     parser.add_argument(
         "--reviewers-per-paper", type=int, default=6, help="target reviewer slots per paper (default: 6)"
     )
-    parser.add_argument("--light-cap", type=int, default=1, help="max papers per light PC member (default: 1)")
-    parser.add_argument("--full-cap", type=int, default=2, help="max papers per full PC member (default: 2)")
+    parser.add_argument("--light-cap", type=int, default=7, help="max papers per light PC member (default: 7)")
+    parser.add_argument("--full-cap", type=int, default=15, help="max papers per full PC member (default: 15)")
     parser.add_argument(
         "--area-weight", type=float, default=1.0,
         help="weight of the topics document relative to the title+abstract document (default: 1.0)"
@@ -520,17 +690,42 @@ def main() -> int:
         help="max junior reviewers per paper before the almost-not-junior relaxation (default: %(default)s)"
     )
     parser.add_argument(
+        "--max-out-of-area", type=int, default=3,
+        help="max out-of-area reviewers per paper before the almost-not-out-of-area relaxation (default: %(default)s)"
+    )
+    parser.add_argument(
         "--almost-senior-window", type=int, default=10,
         help="window papers for a typical-class reviewer to count as almost-senior; "
              "assumes classify_reviewers.py defaults, where senior needs 12 (default: %(default)s)"
     )
     parser.add_argument(
-        "--almost-junior-career", type=int, default=5,
-        help="career papers for a junior to count as almost-not-junior; "
-             "assumes classify_reviewers.py defaults, where junior means < 7 (default: %(default)s)"
+        "--almost-junior-pubs", type=int, default=15,
+        help="overall pubs for a junior to count as almost-not-junior; "
+             "assumes classify_reviewers.py defaults, where junior means < 20 (default: %(default)s)"
+    )
+    parser.add_argument(
+        "--almost-out-of-area-career", type=int, default=5,
+        help="career target-venue papers for an out-of-area reviewer to count as almost-not-out-of-area; "
+             "assumes classify_reviewers.py defaults, where out-of-area means < 5 (default: %(default)s)"
     )
     parser.add_argument("--device", default="cuda", help="torch device for SPECTER2 (default: cuda)")
     args = parser.parse_args()
+
+    if args.reviewers_per_paper < 0:
+        parser.error("--reviewers-per-paper must be non-negative")
+    if args.light_cap < 0 or args.full_cap < 0:
+        parser.error("--light-cap and --full-cap must be non-negative")
+    if args.area_weight <= 0:
+        parser.error("--area-weight must be greater than 0")
+    if args.min_seniors < 0 or args.max_juniors < 0 or args.max_out_of_area < 0:
+        parser.error("--min-seniors, --max-juniors, and --max-out-of-area must be non-negative")
+    if args.almost_senior_window < 0 or args.almost_junior_pubs < 0 or args.almost_out_of_area_career < 0:
+        print("Warning: negative near-threshold values make every applicable reviewer a fallback", file=sys.stderr)
+    if args.min_seniors > args.reviewers_per_paper:
+        print(
+            "Warning: --min-seniors exceeds --reviewers-per-paper; the criteria report will mark papers breaking",
+            file=sys.stderr,
+        )
 
     seniority: dict[str, dict] | None = None
     if not args.no_seniority:
@@ -544,7 +739,7 @@ def main() -> int:
             )
             return 1
 
-    papers = load_papers(args.data)
+    papers, skipped_papers = load_papers(args.data, with_skipped=True)
     if not papers:
         print(f"No papers found in {args.data}", file=sys.stderr)
         return 1
@@ -559,18 +754,24 @@ def main() -> int:
     candidate_emails = [e for e in reviewer_fp if e in reviewers_by_email]
     candidate_matrix = np.array([reviewer_fp[e]["vector"] for e in candidate_emails], dtype=np.float32)
 
+    # Gated pairs drive the normal phases; area-released pairs (COI-only)
+    # back the relaxation phases, so score_lookup and caps cover the superset.
     eligible_by_pid: dict[int, list[tuple[str, float]]] = {}
+    released_by_pid: dict[int, list[tuple[str, float]]] = {}
     score_lookup: dict[tuple[str, int], float] = {}
     reviewer_cap: dict[str, int] = {}
     for p in papers:
         pid = p["pid"]
         paper_vec = np.array(paper_cache[str(pid)]["vector"], dtype=np.float32)
-        pairs = eligible_scores(
+        pairs_all = eligible_scores(
             p, candidate_emails, candidate_matrix, paper_vec, reviewers_by_email,
-            area_gate=not args.no_area_gate,
+            area_gate=False,
         )
-        eligible_by_pid[pid] = pairs
-        for email, score in pairs:
+        released_by_pid[pid] = pairs_all
+        eligible_by_pid[pid] = pairs_all if args.no_area_gate else eligible_scores(
+            p, candidate_emails, candidate_matrix, paper_vec, reviewers_by_email,
+        )
+        for email, score in pairs_all:
             score_lookup[(email, pid)] = score
             reviewer_cap[email] = reviewer_paper_cap(reviewers_by_email[email], args.light_cap, args.full_cap)
 
@@ -579,15 +780,37 @@ def main() -> int:
     paper_prefs = {
         pid: [email for email, _ in sorted(eligible_by_pid[pid], key=lambda es: -es[1])] for pid in pids
     }
+    released_prefs = {
+        pid: [email for email, _ in sorted(released_by_pid[pid], key=lambda es: -es[1])] for pid in pids
+    }
+
+    assigned_via: dict[tuple[int, str], str] = {}
 
     if args.no_seniority:
-        paper_held = deferred_acceptance(pids, paper_prefs, paper_target, reviewer_cap, score_lookup)
-        blocking = count_blocking_pairs(eligible_by_pid, paper_held, reviewer_cap, paper_target, score_lookup)
-        blocking_label = "blocking pairs"
+        slates = deferred_acceptance(pids, paper_prefs, paper_target, reviewer_cap, score_lookup)
+        # Judge stability on the gated pass alone — the area-released fill
+        # below deliberately steps outside the gated preference lists.
+        blocking = count_blocking_pairs(eligible_by_pid, slates, reviewer_cap, paper_target, score_lookup)
+        blocking_label = "gated-pass blocking pairs"
         pools = None
+        assigned_via = {(pid, e): "fill" for pid, emails in slates.items() for e in emails}
+        used = defaultdict(int)
+        for emails in slates.values():
+            for e in emails:
+                used[e] += 1
+        relax_target = {pid: paper_target[pid] - len(slates[pid]) for pid in pids}
+        held_r, _, _ = assignment_phase(
+            pids, released_prefs, relax_target, slates, used, reviewer_cap, score_lookup,
+            set(reviewer_cap),
+        )
+        for pid, emails in held_r.items():
+            for e in emails:
+                assigned_via[(pid, e)] = "fill (area released)"
+        paper_held = slates
     else:
         pools, missing = seniority_pools(
-            set(reviewer_cap), seniority, args.almost_senior_window, args.almost_junior_career
+            set(reviewer_cap), seniority, args.almost_senior_window,
+            args.almost_junior_pubs, args.almost_out_of_area_career,
         )
         if missing:
             print(
@@ -598,47 +821,61 @@ def main() -> int:
         slates: dict[int, list[str]] = {pid: [] for pid in pids}
         used: dict[str, int] = defaultdict(int)
 
-        # Phase 1: anchor each paper's best eligible senior(s) — frozen afterwards.
+        def run_phase(label, prefs, target, candidates, capped=()):
+            held, phase_prefs, phase_cap = assignment_phase(
+                pids, prefs, target, slates, used, reviewer_cap, score_lookup, candidates, capped
+            )
+            for pid, emails in held.items():
+                for e in emails:
+                    assigned_via[(pid, e)] = label
+            return held, phase_prefs, phase_cap
+
+        # A1: anchor each paper's best eligible in-area senior(s) — frozen afterwards.
         anchor_target = {pid: min(args.min_seniors, args.reviewers_per_paper) for pid in pids}
-        assignment_phase(
-            pids, paper_prefs, anchor_target, slates, used, reviewer_cap, score_lookup, pools.seniors
-        )
-        # Phase 1b: papers that got no senior fall back to an almost-senior.
-        fallback_target = {pid: max(0, anchor_target[pid] - len(slates[pid])) for pid in pids}
-        assignment_phase(
-            pids, paper_prefs, fallback_target, slates, used, reviewer_cap, score_lookup, pools.almost_seniors
-        )
-        # Phase 2: main fill — everyone competes on score, juniors capped per paper.
+        run_phase("senior anchor", paper_prefs, anchor_target, pools.seniors)
+        # A2: papers short a senior try area-released true seniors (area is
+        # released before the senior requirement is relaxed).
+        a2_target = {pid: max(0, anchor_target[pid] - len(slates[pid])) for pid in pids}
+        run_phase("senior anchor (area released)", released_prefs, a2_target, pools.seniors)
+        # A3: papers still senior-less fall back to an almost-senior, any area.
+        a3_target = {pid: max(0, anchor_target[pid] - len(slates[pid])) for pid in pids}
+        run_phase("almost-senior anchor", released_prefs, a3_target, pools.almost_seniors)
+        # F1: main fill — everyone competes on score within the area gate,
+        # juniors and out-of-area reviewers each capped per paper.
+        capped = [(pools.juniors, args.max_juniors), (pools.out_of_area, args.max_out_of_area)]
         fill_target = {pid: args.reviewers_per_paper - len(slates[pid]) for pid in pids}
-        held2, prefs2, cap2 = assignment_phase(
-            pids, paper_prefs, fill_target, slates, used, reviewer_cap, score_lookup,
-            set(reviewer_cap), junior_emails=pools.juniors, max_juniors=args.max_juniors,
-        )
-        # Phase 3: still-under-filled papers may take extra almost-not-juniors.
-        relax_target = {pid: args.reviewers_per_paper - len(slates[pid]) for pid in pids}
-        assignment_phase(
-            pids, paper_prefs, relax_target, slates, used, reviewer_cap, score_lookup, pools.almost_not_juniors
+        held2, prefs2, cap2 = run_phase("fill", paper_prefs, fill_target, set(reviewer_cap), capped)
+        # F2: under-filled papers fill from the area-released pool; the caps
+        # keep counting what earlier phases assigned.
+        f2_target = {pid: args.reviewers_per_paper - len(slates[pid]) for pid in pids}
+        run_phase("fill (area released)", released_prefs, f2_target, set(reviewer_cap), capped)
+        # F3: papers still under-filled may exceed the caps with extra
+        # almost-not-juniors and almost-not-out-of-area reviewers.
+        f3_target = {pid: args.reviewers_per_paper - len(slates[pid]) for pid in pids}
+        run_phase(
+            "fill (cap relaxed)", released_prefs, f3_target,
+            pools.almost_not_juniors | pools.almost_not_out_of_area,
         )
         paper_held = slates
 
-        # Self-check the new junior-cap logic where its guarantee holds: the
-        # phase-2 pass, in phase-2 terms (its own prefs, caps, and targets).
+        # Self-check the class-cap logic where its guarantee holds: the F1
+        # pass, in F1 terms (its own prefs, caps, and targets).
         pairs2 = {pid: [(e, score_lookup[(e, pid)]) for e in prefs2[pid]] for pid in pids}
-        blocking = count_blocking_pairs(
-            pairs2, held2, cap2, fill_target, score_lookup,
-            junior_emails=pools.juniors, max_juniors=args.max_juniors,
-        )
-        blocking_label = "phase-2 blocking pairs"
+        blocking = count_blocking_pairs(pairs2, held2, cap2, fill_target, score_lookup, capped)
+        blocking_label = "F1 blocking pairs"
 
     # --- Report ---------------------------------------------------------------
+    goodness = paper_goodness(paper_held, score_lookup)
     reviewer_load: dict[str, int] = defaultdict(int)
     for p in papers:
         pid = p["pid"]
         assigned = sorted(paper_held[pid], key=lambda e: -score_lookup[(e, pid)])
         under_filled = "  *** UNDER-FILLED ***" if len(assigned) < args.reviewers_per_paper else ""
+        g = goodness[pid]
         print(f"\n=== [{pid}] {p['title']}")
         print(f"    topics: {', '.join(p.get('topics', []))}")
         print(f"    assigned {len(assigned)} of {args.reviewers_per_paper} requested{under_filled}")
+        print(f"    match goodness: {'n/a' if g is None else format(g, '.3f')}")
         for rank, email in enumerate(assigned, 1):
             r = reviewers_by_email[email]
             cls = "" if seniority is None else "/" + (seniority[email]["class"] if email in seniority else "?")
@@ -663,21 +900,34 @@ def main() -> int:
     seniority_summary = ""
     if pools is not None:
         ok_n, deg_n, brk_n = seniority_report(
-            papers, paper_held, pools, reviewers_by_email, seniority, paper_prefs,
-            args.reviewers_per_paper, args.min_seniors, args.max_juniors,
-            args.almost_senior_window, args.almost_junior_career,
+            papers, paper_held, pools, reviewers_by_email, seniority, released_prefs,
+            args.reviewers_per_paper, args.min_seniors, args.max_juniors, args.max_out_of_area,
+            args.almost_senior_window, args.almost_junior_pubs, args.almost_out_of_area_career,
         )
-        deep_over = sum(
+        deep_junior_over = sum(
             1
             for pid in pids
             if sum(1 for e in paper_held[pid] if e in pools.juniors and e not in pools.almost_not_juniors)
             > args.max_juniors
         )
+        deep_oob_over = sum(
+            1
+            for pid in pids
+            if sum(1 for e in paper_held[pid] if e in pools.out_of_area and e not in pools.almost_not_out_of_area)
+            > args.max_out_of_area
+        )
         over_target = sum(1 for pid in pids if len(paper_held[pid]) > args.reviewers_per_paper)
         seniority_summary = (
             f"seniority: {ok_n} papers OK, {deg_n} degraded, {brk_n} breaking — see report above; "
-            f"{deep_over} papers over the junior policy and {over_target} over target — should always be 0; "
+            f"{deep_junior_over} papers over the junior policy, {deep_oob_over} over the "
+            f"out-of-area policy, and {over_target} over target — should always be 0; "
         )
+
+    match_goodness_report(papers, goodness)
+    n_excluded, n_relaxed = relaxation_report(
+        skipped_papers, papers, paper_held, paper_target, assigned_via,
+        goodness, score_lookup, reviewers_by_email, seniority,
+    )
 
     print(
         f"\nDone. {total_pairs} reviewer-paper pairs assigned across {len(papers)} papers, "
@@ -686,6 +936,7 @@ def main() -> int:
         f"{light_over} light and {full_over} full over cap — should always be 0; "
         f"{blocking} {blocking_label} — should always be 0; "
         f"{seniority_summary}"
+        f"{n_excluded} papers excluded and {n_relaxed} relaxed — see relaxation report above; "
         f"{total_missing} reviewer-slot(s) unfilled — see shortage report above).",
         file=sys.stderr,
     )
