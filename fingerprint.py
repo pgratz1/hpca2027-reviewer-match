@@ -44,6 +44,13 @@ def title_doc_text(tokenizer: PreTrainedTokenizerBase, title: str) -> str:
     return doc_text(tokenizer, title)
 
 
+def publication_doc_text(
+    tokenizer: PreTrainedTokenizerBase, title: str, abstract: str = ""
+) -> str:
+    """A publication in SPECTER2's native title-plus-abstract shape."""
+    return doc_text(tokenizer, title, abstract)
+
+
 def select_titles(
     titles: list[tuple[int, str]], max_titles: int | None
 ) -> list[tuple[int, str]]:

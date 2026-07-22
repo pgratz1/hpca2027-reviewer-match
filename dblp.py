@@ -40,6 +40,8 @@ _USER_AGENT = (
     "HPCA2027-reviewer-match/0.1 (PC reviewer-paper matching; contact PC chairs)"
 )
 
+_DOI_RE = re.compile(r"10\.\d{4,9}/[^\s?#]+", re.IGNORECASE)
+
 
 # ---------------------------------------------------------------------------
 # PID extraction
@@ -245,7 +247,13 @@ def get_with_retry(
     shorter one at the call site.
     """
     for attempt in range(max_retries):
-        resp = session.get(url, params=params, timeout=timeout, headers=headers)
+        try:
+            resp = session.get(url, params=params, timeout=timeout, headers=headers)
+        except (requests.ConnectionError, requests.Timeout):
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(max(backoff_floor, backoff_floor * (2 ** attempt)))
+            continue
         if resp.status_code == 429:
             retry_after = resp.headers.get("Retry-After")
             wait = (
@@ -267,6 +275,30 @@ def _title_text(pub: ET.Element) -> str | None:
         return None
     text = "".join(title_el.itertext()).strip()
     return text or None
+
+
+def normalise_doi(value: str | None) -> str | None:
+    """Return a lowercase bare DOI extracted from a DOI or publisher URL."""
+    if not value:
+        return None
+    match = _DOI_RE.search(value.strip())
+    if not match:
+        return None
+    return match.group(0).rstrip(".>,)").lower()
+
+
+def _publication_doi(pub: ET.Element) -> str | None:
+    """Extract the first DOI encoded in a DBLP publication record."""
+    for ee in pub.findall("ee"):
+        doi = normalise_doi("".join(ee.itertext()))
+        if doi:
+            return doi
+    for note in pub.findall("note"):
+        if "doi" in (note.get("type") or "").split():
+            doi = normalise_doi("".join(note.itertext()))
+            if doi:
+                return doi
+    return None
 
 
 def _fetch_all_from_dblp(
@@ -296,20 +328,24 @@ def _fetch_all_from_dblp(
 
 
 def _fetch_all_records_from_dblp(
-    pid: str, session: requests.Session
+    pid: str, session: requests.Session, *, max_retries: int = 5,
+    backoff_floor: float = 15, base_url: str = "https://dblp.org",
 ) -> list[dict]:
     """Fetch ALL publication records for a PID, keeping venue and record type.
 
     Rich analogue of _fetch_all_from_dblp for callers that need to know
     *where* something was published (e.g. seniority classification). Each
-    record is {"title", "year": int, "venue", "type"} — matching the
+    record is {"title", "year": int, "venue", "type", "doi"} — matching the
     colleague-cache format — where type is the DBLP XML element tag
     (inproceedings/article/proceedings/...) and venue is the <booktitle> for
     inproceedings, the <journal> for articles, and "" otherwise. Same skip
     rules as _fetch_all_from_dblp (www records, missing title/year).
     Sorted year-descending.
     """
-    resp = get_with_retry(session, f"https://dblp.org/pid/{pid}.xml", headers={"User-Agent": _USER_AGENT})
+    resp = get_with_retry(
+        session, f"{base_url}/pid/{pid}.xml", headers={"User-Agent": _USER_AGENT},
+        max_retries=max_retries, backoff_floor=backoff_floor,
+    )
     root = ET.fromstring(resp.content)
 
     records: list[dict] = []
@@ -330,11 +366,40 @@ def _fetch_all_records_from_dblp(
                 venue_el = pub.find("journal")
             venue = (venue_el.text or "").strip() if venue_el is not None else ""
             records.append(
-                {"title": title, "year": year, "venue": venue, "type": pub.tag}
+                {
+                    "title": title, "year": year, "venue": venue,
+                    "type": pub.tag, "doi": _publication_doi(pub) or "",
+                }
             )
 
     records.sort(key=lambda r: r["year"], reverse=True)
     return records
+
+
+def fetch_doi_records(
+    pid: str, session: requests.Session | None = None
+) -> list[dict]:
+    """Fetch a PID's DBLP records live, including DOI identifiers.
+
+    This deliberately bypasses the older title and venue caches: their
+    schemas predate DOI retention, so treating them as authoritative would
+    permanently hide identifiers for already-cached reviewers.
+    """
+    session = session or requests.Session()
+    last_error: Exception | None = None
+    for base_url in (
+        "https://dblp.org",
+        "https://dblp.uni-trier.de",
+        "https://dblp.dagstuhl.de",
+    ):
+        try:
+            return _fetch_all_records_from_dblp(
+                pid, session, max_retries=2, backoff_floor=5, base_url=base_url,
+            )
+        except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as exc:
+            last_error = exc
+    assert last_error is not None
+    raise last_error
 
 
 # ---------------------------------------------------------------------------

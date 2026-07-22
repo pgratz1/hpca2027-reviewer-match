@@ -4,8 +4,9 @@
     python build_fingerprints.py              # full run
 
 Each reviewer's fingerprint pools SPECTER2 embeddings of: one document per
-DBLP title from the most recent --years calendar years (default: 4, no count
-cap unless --max-titles is set) and one document summarizing their declared
+DBLP publication from the most recent --years calendar years (default: 4, no
+count cap unless --max-titles is set), using an IEEE/ACM abstract when cached,
+and one document summarizing their declared
 areas + keywords (weighted --area-weight relative to a single title).
 Reviewers with no DBLP PID, or no titles in the --years window, fall back to
 an area-profile-only fingerprint.
@@ -41,14 +42,16 @@ DEFAULT_CSV = "HPCA'27 PC Member Acceptance Form (Responses) - Form Responses 1.
 DEFAULT_CACHE = "dblp_cache.json"
 DEFAULT_COLLEAGUE_CACHE = "dblp_pubs_cache.json"
 DEFAULT_FINGERPRINT_CACHE = "fingerprints.json"
-FINGERPRINT_SCHEMA_VERSION = 2
+DEFAULT_METADATA_CACHE = "reviewer_publications.json"
+DEFAULT_ABSTRACT_CACHE = "publication_abstracts.json"
+FINGERPRINT_SCHEMA_VERSION = 3
 
 # Always spot-checked if present in the current run; falls back to the first
 # few reviewers processed when empty.
 SPOT_CHECK_EMAILS: list[str] = []
 
 
-def fingerprint_key(r, titles, *, years, max_titles, area_weight) -> str:
+def fingerprint_key(r, publications, *, years, max_titles, area_weight) -> str:
     """Content and policy key for a reviewer fingerprint."""
     payload = {
         "schema_version": FINGERPRINT_SCHEMA_VERSION,
@@ -63,7 +66,7 @@ def fingerprint_key(r, titles, *, years, max_titles, area_weight) -> str:
         "years": years,
         "max_titles": max_titles,
         "area_weight": area_weight,
-        "titles": titles,
+        "publications": publications,
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -80,6 +83,18 @@ def main() -> int:
     parser.add_argument(
         "--fingerprint-cache", default=DEFAULT_FINGERPRINT_CACHE,
         help="path to the writable fingerprint cache"
+    )
+    parser.add_argument(
+        "--publication-metadata-cache", default=DEFAULT_METADATA_CACHE,
+        help="PID-keyed DBLP DOI metadata produced by enrich_publications.py"
+    )
+    parser.add_argument(
+        "--abstract-cache", default=DEFAULT_ABSTRACT_CACHE,
+        help="DOI-keyed abstract cache produced by enrich_publications.py"
+    )
+    parser.add_argument(
+        "--no-abstracts", action="store_true",
+        help="build a reproducible title-only baseline even if abstracts are cached"
     )
     parser.add_argument(
         "--years", type=int, default=4,
@@ -119,6 +134,8 @@ def main() -> int:
         reviewers = reviewers[: args.limit]
 
     fp_cache = fp.load_fingerprint_cache(args.fingerprint_cache)
+    publication_metadata = fp.load_fingerprint_cache(args.publication_metadata_cache)
+    abstract_cache = fp.load_fingerprint_cache(args.abstract_cache)
 
     # Resolve titles for every PID-backed reviewer. Cache hits are cheap, and
     # doing this before the fingerprint freshness check lets DBLP cache edits
@@ -157,9 +174,32 @@ def main() -> int:
         r.email: fp.select_titles(titles_by_pid.get(r.pid, []), args.max_titles)
         for r in reviewers
     }
+
+    def title_key(year: int, title: str) -> tuple[int, str]:
+        return int(year), title.lower().rstrip(". ")
+
+    doi_by_pid_title: dict[str, dict[tuple[int, str], str]] = {}
+    for pid, entry in publication_metadata.items():
+        doi_by_pid_title[pid] = {
+            title_key(record["year"], record["title"]): (record.get("doi") or "").lower()
+            for record in entry.get("records", [])
+            if record.get("year") is not None and record.get("title")
+        }
+
+    publications_by_email: dict[str, list[tuple[int, str, str, str, str]]] = {}
+    for r in reviewers:
+        publications = []
+        for year, title in selected_by_email[r.email]:
+            doi = doi_by_pid_title.get(r.pid, {}).get(title_key(year, title), "")
+            entry = abstract_cache.get(doi, {}) if doi and not args.no_abstracts else {}
+            abstract = entry.get("abstract", "") if entry.get("status") == "found" else ""
+            source = entry.get("source", "") if abstract else ""
+            publications.append((year, title, doi, abstract, source))
+        publications_by_email[r.email] = publications
+
     keys = {
         r.email: fingerprint_key(
-            r, selected_by_email[r.email], years=args.years,
+            r, publications_by_email[r.email], years=args.years,
             max_titles=args.max_titles, area_weight=args.area_weight,
         )
         for r in reviewers
@@ -194,11 +234,11 @@ def main() -> int:
         n_titles_used = [0] * len(pending)
 
         for i, r in enumerate(pending):
-            selected = selected_by_email[r.email]
+            selected = publications_by_email[r.email]
             n_titles_used[i] = len(selected)
 
-            for _, title in selected:
-                flat_texts.append(fp.title_doc_text(tokenizer, title))
+            for _, title, _, abstract, _ in selected:
+                flat_texts.append(fp.publication_doc_text(tokenizer, title, abstract))
                 flat_owner.append(i)
                 per_reviewer_weights[i].append(1.0)
 
@@ -224,6 +264,7 @@ def main() -> int:
             fp_cache[r.email] = {
                 "vector": fingerprint_vec.tolist(),
                 "n_titles": n_titles_used[i],
+                "n_abstracts": sum(bool(pub[3]) for pub in publications_by_email[r.email]),
                 "has_pid": bool(r.pid),
                 "fingerprint_key": keys[r.email],
                 "schema_version": FINGERPRINT_SCHEMA_VERSION,
@@ -237,7 +278,8 @@ def main() -> int:
 
     print(
         f"\nDone. computed={len(pending)} area_only_fallback={area_only} "
-        f"dblp_fetch_errors={fetch_errors}",
+        f"dblp_fetch_errors={fetch_errors} abstracts_used="
+        f"{sum(sum(bool(pub[3]) for pub in publications_by_email[r.email]) for r in reviewers)}",
         file=sys.stderr,
     )
 

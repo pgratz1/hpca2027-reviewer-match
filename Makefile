@@ -10,6 +10,11 @@
 
 PYTHON ?= $(HOME)/envs/hpca-matching/bin/python3
 
+# Optional local secrets. This file is gitignored; variables must be exported
+# so enrich_publications.py can read them from its environment.
+-include .env
+export IEEE_API_KEY S2_API_KEY
+
 CSV = HPCA'27 PC Member Acceptance Form (Responses) - Form Responses 1.csv
 # make splits prerequisite lists on spaces, so dependencies use this
 # backslash-escaped copy; recipes use the plain "$(CSV)" in shell quotes.
@@ -19,11 +24,17 @@ REVIEWER_LIBS = reviewers.py dblp.py
 EMBED_LIBS = fingerprint.py specter2_model.py
 
 .DELETE_ON_ERROR:
-.PHONY: all clean clean-fingerprints
+.PHONY: all enrich clean clean-fingerprints
 
-all: reviewer_seniority.csv fingerprints.json
+all: reviewer_seniority.csv enrich fingerprints.json
 	$(PYTHON) build_fingerprints.py --csv "$(CSV)" --fingerprint-cache fingerprints.json
 	$(MAKE) assignment.txt
+
+enrich: enrich_publications.py dblp.py reviewers.py $(CSV_DEP) dblp_overrides.csv
+	$(PYTHON) enrich_publications.py --csv "$(CSV)"
+
+reviewer_publications.json publication_abstracts.json &: enrich_publications.py dblp.py reviewers.py $(CSV_DEP) dblp_overrides.csv
+	$(PYTHON) enrich_publications.py --csv "$(CSV)"
 
 # classify_reviewers.py may append stub rows for unknown reviewers to
 # dblp_overrides.csv, leaving it newer than this target; the next make run
@@ -34,7 +45,7 @@ reviewer_seniority.csv: classify_reviewers.py $(REVIEWER_LIBS) $(CSV_DEP) dblp_o
 # build_fingerprints.py rewrites the cache only when content/policy changed or
 # a DBLP retry state changed. The all recipe also runs its cheap freshness
 # check so cache content, rather than timestamps alone, decides what is stale.
-fingerprints.json: build_fingerprints.py $(REVIEWER_LIBS) $(EMBED_LIBS) $(CSV_DEP) dblp_overrides.csv dblp_pubs_cache.json
+fingerprints.json: reviewer_publications.json publication_abstracts.json build_fingerprints.py $(REVIEWER_LIBS) $(EMBED_LIBS) $(CSV_DEP) dblp_overrides.csv dblp_pubs_cache.json
 	$(PYTHON) build_fingerprints.py --csv "$(CSV)" --fingerprint-cache $@
 
 # Stale paper fingerprints (edited titles/abstracts/topics) are detected and

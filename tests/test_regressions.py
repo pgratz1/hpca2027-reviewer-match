@@ -9,11 +9,16 @@ from pathlib import Path
 from unittest import mock
 
 import numpy as np
+import requests
 
 import assign_reviewers
 import build_fingerprints
 import classify_reviewers
+import compare_abstract_rankings
+import enrich_publications
 import paper_matching
+import fingerprint
+import score_abstract_evaluation
 from reviewers import Reviewer, _parse_override_cap
 
 
@@ -27,6 +32,108 @@ def reviewer(pid="1/Test"):
 
 class FakeTokenizer:
     sep_token = "[SEP]"
+
+
+class PublicationEnrichmentTests(unittest.TestCase):
+    def test_doi_publisher_and_abstract_cleanup(self):
+        self.assertEqual("ieee", enrich_publications.publisher_for_doi("https://doi.org/10.1109/ABC.12"))
+        self.assertEqual("acm", enrich_publications.publisher_for_doi("10.1145/123.456"))
+        self.assertIsNone(enrich_publications.publisher_for_doi("10.1000/example"))
+        self.assertEqual(
+            "A cache & memory study.",
+            enrich_publications.clean_abstract("<jats:p>A cache &amp; memory study.</jats:p>"),
+        )
+
+    def test_http_error_summary_does_not_expose_url_or_key(self):
+        response = mock.Mock(status_code=403)
+        response.request.method = "GET"
+        error = requests.HTTPError(
+            "403 for https://example.test/?apikey=top-secret", response=response
+        )
+        summary = enrich_publications.safe_request_error(error)
+        self.assertEqual("HTTP 403 from GET API request", summary)
+        self.assertNotIn("top-secret", summary)
+
+    def test_ieee_then_s2_fallback(self):
+        cache = {}
+        publishers = {"10.1109/a": "ieee", "10.1145/b": "acm"}
+        ieee = {
+            "10.1109/a": {"status": "not_found", "abstract": "", "source": "ieee"}
+        }
+        s2 = {
+            "10.1109/a": {"status": "found", "abstract": "IEEE fallback", "source": "semantic_scholar"},
+            "10.1145/b": {"status": "found", "abstract": "ACM abstract", "source": "semantic_scholar"},
+        }
+        with mock.patch.object(enrich_publications, "fetch_ieee_abstracts", return_value=ieee), \
+             mock.patch.object(enrich_publications, "fetch_s2_abstracts", return_value=s2):
+            found, attempted = enrich_publications.enrich_abstract_cache(
+                publishers, cache, ieee_key="secret", s2_key="secret", session=object()
+            )
+        self.assertEqual((2, 2), (found, attempted))
+        self.assertEqual("IEEE fallback", cache["10.1109/a"]["abstract"])
+        self.assertEqual("semantic_scholar", cache["10.1145/b"]["source"])
+
+    def test_missing_s2_key_uses_unauthenticated_fallback(self):
+        cache = {}
+        publishers = {"10.1109/a": "ieee", "10.1145/b": "acm"}
+        ieee = {
+            "10.1109/a": {"status": "not_found", "abstract": "", "source": "ieee"}
+        }
+        s2 = {
+            "10.1109/a": {"status": "found", "abstract": "IEEE fallback", "source": "semantic_scholar"},
+            "10.1145/b": {"status": "found", "abstract": "ACM abstract", "source": "semantic_scholar"},
+        }
+        session = object()
+        with mock.patch.object(enrich_publications, "fetch_ieee_abstracts", return_value=ieee), \
+             mock.patch.object(enrich_publications, "fetch_s2_abstracts", return_value=s2) as fetch_s2:
+            found, attempted = enrich_publications.enrich_abstract_cache(
+                publishers, cache, ieee_key="secret", s2_key="", session=session
+            )
+        self.assertEqual((2, 2), (found, attempted))
+        self.assertEqual("IEEE fallback", cache["10.1109/a"]["abstract"])
+        self.assertEqual("ACM abstract", cache["10.1145/b"]["abstract"])
+        fetch_s2.assert_called_once_with(
+            ["10.1145/b", "10.1109/a"], "", session
+        )
+
+    def test_ieee_http_failure_falls_back_to_s2(self):
+        cache = {}
+        publishers = {"10.1109/a": "ieee"}
+        response = mock.Mock(status_code=403)
+        response.request.method = "GET"
+        ieee_error = requests.HTTPError("secret URL", response=response)
+        s2 = {
+            "10.1109/a": {"status": "found", "abstract": "S2 copy", "source": "semantic_scholar"}
+        }
+        with mock.patch.object(enrich_publications, "fetch_ieee_abstracts", side_effect=ieee_error), \
+             mock.patch.object(enrich_publications, "fetch_s2_abstracts", return_value=s2), \
+             contextlib.redirect_stderr(io.StringIO()):
+            found, attempted = enrich_publications.enrich_abstract_cache(
+                publishers, cache, ieee_key="secret", s2_key="", session=object()
+            )
+        self.assertEqual((1, 1), (found, attempted))
+        self.assertEqual("S2 copy", cache["10.1109/a"]["abstract"])
+
+    def test_publication_document_uses_native_title_abstract_shape(self):
+        self.assertEqual(
+            "Title[SEP]Abstract",
+            fingerprint.publication_doc_text(FakeTokenizer(), "Title", "Abstract"),
+        )
+
+    def test_evaluation_sample_round_robins_topics(self):
+        rows = [
+            {"paper": {"pid": 1, "topics": ["Memory"]}, "disagreement": 0.9},
+            {"paper": {"pid": 2, "topics": ["Memory"]}, "disagreement": 0.8},
+            {"paper": {"pid": 3, "topics": ["Security"]}, "disagreement": 0.1},
+        ]
+        selected = compare_abstract_rankings.choose_stratified(rows, 2)
+        self.assertEqual({1, 3}, {row["paper"]["pid"] for row in selected})
+
+    def test_dcg_rewards_higher_early_ratings(self):
+        self.assertGreater(
+            score_abstract_evaluation.dcg([3, 0, 0]),
+            score_abstract_evaluation.dcg([0, 0, 3]),
+        )
 
 
 class FingerprintCacheTests(unittest.TestCase):
@@ -43,6 +150,19 @@ class FingerprintCacheTests(unittest.TestCase):
         )
         self.assertNotEqual(base, changed_title)
         self.assertNotEqual(base, changed_policy)
+
+    def test_key_changes_when_abstract_changes(self):
+        r = reviewer()
+        title_only = [(2026, "A title", "10.1109/a", "", "")]
+        enriched = [(2026, "A title", "10.1109/a", "A useful abstract", "ieee")]
+        self.assertNotEqual(
+            build_fingerprints.fingerprint_key(
+                r, title_only, years=4, max_titles=None, area_weight=1.0
+            ),
+            build_fingerprints.fingerprint_key(
+                r, enriched, years=4, max_titles=None, area_weight=1.0
+            ),
+        )
 
     def test_failed_fetch_is_temporary_and_retried(self):
         r = reviewer()

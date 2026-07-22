@@ -29,6 +29,8 @@ Both workflows share the reviewer loader (`reviewers.py`) and DBLP caches:
                        ┌─▶ classify_reviewers.py ──▶ reviewer_seniority.csv ──▶ (assign_reviewers.py)
 acceptance CSV ──▶ reviewers.py (+ dblp_overrides.csv)
                        └─▶ build_fingerprints.py ──▶ fingerprints.json ─┐
+                               ▲                                      │
+              enrich_publications.py (DBLP DOI + IEEE/S2 abstracts) ──┘
                                                                         ├─▶ score_papers.py
 paper JSON ──▶ paper_matching.py ──▶ paper_fingerprints.json ───────────┘    assign_reviewers.py
 ```
@@ -45,8 +47,10 @@ report).
 
 1. **Drop the inputs in place**: the latest acceptance-form CSV export (keep
    the exact filename) and a fresh `hpca2027-data.json` from HotCRP.
-2. **`make`** — rebuilds whatever is stale, in order: reviewer seniority
-   classification, reviewer fingerprints, then the assignment. The final
+2. **Fill in `IEEE_API_KEY` and `S2_API_KEY` in the gitignored `.env` file**,
+   then run **`make`** — rebuilds
+   whatever is stale, in order: reviewer seniority classification, cached
+   IEEE/ACM abstract enrichment, reviewer fingerprints, then the assignment. The final
    output lands in **`assignment.txt`**: per-paper reviewer slates, the
    per-area shortage report, and the seniority criteria report.
 3. **If classify reported reviewers with missing DBLP identities**, it
@@ -116,16 +120,88 @@ python3 classify_reviewers.py --window 10 --senior-rate 1.0
 ```
 
 ### `build_fingerprints.py` — reviewer SPECTER2 fingerprints
-Embeds each reviewer (recent DBLP titles + declared areas/keywords) into a
+Embeds each reviewer (recent DBLP publications + declared areas/keywords) into a
 768-dim vector, cached in `fingerprints.json` by email. Incremental: cached
 reviewers aren't recomputed. Reviewers with no PID get an area-only
 fingerprint. Cached entries are automatically refreshed when their reviewer
-metadata, PID, selected publications, model, or embedding flags change.
+metadata, PID, selected publications or abstracts, model, or embedding flags
+change. Publications use SPECTER2's native `title [SEP] abstract` shape when
+an enriched IEEE/ACM abstract is available and fall back to title-only.
 ```bash
 ~/envs/hpca-matching/bin/python3 build_fingerprints.py --limit 10   # validate first
 ~/envs/hpca-matching/bin/python3 build_fingerprints.py
 ```
 Key flags: `--years` (4), `--max-titles` (uncapped), `--area-weight` (1.0).
+Use `--no-abstracts` with a separate `--fingerprint-cache` to build the
+comparison baseline.
+
+### `enrich_publications.py` — IEEE/ACM reviewer-publication abstracts
+Fetches DOI-bearing DBLP records into `reviewer_publications.json`, then
+retrieves IEEE abstracts from the official IEEE Xplore Metadata Search API's
+DOI parameter. ACM papers
+and IEEE misses use Semantic Scholar's DOI batch API. Only DOI prefixes
+`10.1109` and `10.1145` are eligible; no publisher pages are scraped.
+Successful and confirmed-missing results persist in
+`publication_abstracts.json`, while DBLP/API failures remain retryable. The
+`S2_API_KEY` is optional: without it, ACM papers and IEEE misses use Semantic
+Scholar's shared unauthenticated rate limit with 429 backoff. IEEE retrieval is capped
+at 190 DOI requests per invocation to stay below the default 200/day quota;
+rerunning on a later day resumes the remaining records from cache.
+
+```bash
+# .env (gitignored; make loads and exports it automatically)
+IEEE_API_KEY=...
+S2_API_KEY=...
+
+~/envs/hpca-matching/bin/python3 enrich_publications.py --limit 10
+~/envs/hpca-matching/bin/python3 enrich_publications.py
+```
+
+The `.env` file is created with owner-only permissions. Do not put keys in
+tracked repository files. Commands invoked directly rather than through
+`make` still require loading the file first, for example `set -a; source
+.env; set +a`.
+
+### Abstract accuracy experiment
+Build a title-only cache, then create the blinded, topic-stratified chair
+rating sheet and its separately held rank key:
+
+```bash
+~/envs/hpca-matching/bin/python3 build_fingerprints.py \
+  --no-abstracts --fingerprint-cache fingerprints-title-only.json
+~/envs/hpca-matching/bin/python3 compare_abstract_rankings.py \
+  --baseline-fingerprints fingerprints-title-only.json \
+  --enriched-fingerprints fingerprints.json
+# Fill expertise_rating_0_to_3 in abstract-evaluation-ratings.csv, then:
+~/envs/hpca-matching/bin/python3 score_abstract_evaluation.py
+```
+
+The scorer reports mean nDCG@10, capable-or-expert fraction in the top six,
+and unsuitable candidates in the top six. Adopt enriched fingerprints only
+if the first two improve without increasing the third.
+
+#### July 2026 operational comparison
+
+The completed cache contains abstracts for 4,900 of 5,120 eligible IEEE/ACM
+DOIs. Abstract-aware profiles used 3,814 abstract-bearing publications across
+418 of 454 reviewers; all 454 current fingerprints use schema version 3.
+
+Against a freshly built title-only baseline on the 486 currently complete
+papers, abstracts materially changed the result:
+
+- 462 papers (95.1%) had at least one different reviewer in the constrained
+  six-person slate;
+- 1,085 of 2,916 assignment slots (37.2%) changed, with a mean 3.77 of six
+  reviewers retained per paper;
+- the highest-ranked eligible reviewer changed for 239 papers (49.2%);
+- mean overlap was 66.6% for the top six and 72.1% for the top ten.
+
+These figures establish that enrichment has a large operational effect, not
+that it improves ground-truth accuracy. Mean cosine goodness (0.968
+title-only versus 0.970 enriched) is not a valid significance test because
+the reviewer representation—and therefore the score scale—changes. Complete
+the blinded ratings above before claiming a statistically significant quality
+improvement.
 
 ### `nearest_neighbors.py` — reviewer/reviewer similarity (diagnostic)
 Prints each reviewer's most similar other reviewers by fingerprint cosine —
@@ -214,7 +290,10 @@ emails, treat as sensitive), `hpca2027-data.json` (HotCRP paper export),
 
 **Generated** (safe to delete; rebuilt incrementally): `dblp_cache.json`,
 `dblp_venue_cache.json`, `fingerprints.json`, `paper_fingerprints.json`,
-`reviewer_seniority.csv`, `assignment.txt`.
+`reviewer_publications.json`, `publication_abstracts.json`,
+`reviewer_seniority.csv`, `assignment.txt`, and experimental fingerprint
+caches such as `fingerprints-title-only.json`. The enrichment caches are
+rebuildable but expensive because live DBLP retrieval is rate-limited.
 
 **Retired** (left over from the removed lookup chain; kept only as
 historical reference, nothing reads them): `no_dblp_lookup_report.csv`,

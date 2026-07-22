@@ -2,6 +2,7 @@
 HPCA'27 PC Member Acceptance Form (Responses) - Form Responses 1.csv
 PCDB_with_emails.csv
 fingerprints.json
+fingerprints-*.json
 paper_fingerprints.json
 dblp_cache.json
 dblp_cache2.json
@@ -11,9 +12,12 @@ no_dblp_lookup_report.csv
 manual_review_report*.csv
 final_identity_resolution.csv
 dblp_venue_cache.json
+reviewer_publications.json
+publication_abstracts.json
 reviewer_seniority.csv
 dblp_overrides.csv
 assignment.txt
+abstract-evaluation*.csv
 
 # Test fixture with a placeholder author email, not core project data
 hpca2027-data.json
@@ -27,6 +31,9 @@ newresume.txt
 resume_codex.txt
 
 # Local tooling / session artifacts
+.env
+.env~
+.env.*
 restart.txt
 .claude/
 __pycache__/

@@ -22,12 +22,15 @@ contains spaces and parentheses — always quote it in shell commands).
 - Python env: `~/envs/hpca-matching/bin/python3` (torch+CUDA, transformers,
   adapters, numpy). `make` defaults to it; `requirements.txt` is
   documentation, not a reproducible installer.
-- `make` runs the whole pipeline (classify → fingerprints → `assignment.txt`)
+- `make` runs the whole pipeline (classify → abstract enrichment →
+  fingerprints → `assignment.txt`)
   and rebuilds only what's stale. Prefer it over invoking scripts by hand.
 - Library modules (imported, never run): `reviewers.py`, `dblp.py`,
   `paper_matching.py`, `fingerprint.py`, `specter2_model.py`. Runnable
   scripts: `classify_reviewers.py`, `build_fingerprints.py`,
-  `assign_reviewers.py`, `score_papers.py`, `nearest_neighbors.py`, `main.py`.
+  `enrich_publications.py`, `assign_reviewers.py`, `score_papers.py`,
+  `nearest_neighbors.py`, `compare_abstract_rankings.py`,
+  `score_abstract_evaluation.py`, `main.py`.
 
 ## Architecture (filter-then-rank, then constrained assignment)
 
@@ -42,8 +45,9 @@ contains spaces and parentheses — always quote it in shell commands).
    overrides from `PCDB_with_emails.csv` (email-matched, promote-only)
    then make chairs, TopPicks PC/ERC members, and PC/ERC score ≥6
    senior, and juniors with score ≥2 typical.
-3. **Affinity**: SPECTER2 fingerprints for reviewers (recent DBLP titles +
-   declared areas) and papers (title+abstract+topics); cosine similarity.
+3. **Affinity**: SPECTER2 fingerprints for reviewers (recent DBLP
+   publications, using IEEE/ACM abstracts where cached, plus declared areas)
+   and papers (title+abstract+topics); cosine similarity.
    COI is a hard filter and the area gate (reviewer primary/secondary ∩
    paper topics) governs the normal phases — neither is ever blended into
    the score, but the gate is released per-paper by the relaxation ladder.
@@ -74,12 +78,16 @@ enforced centrally in `paper_matching.load_papers` / `completeness_gaps`.
   to the GitHub remote. Check `git status` before committing.
 - Caches are incremental, versioned, and **content/policy-aware**: paper
   fingerprints include title/abstract/topics, model, and area weight;
-  reviewer fingerprints include metadata, PID, selected titles, model, and
-  embedding flags. Transient DBLP failures remain retryable. The DBLP
-  caches (`dblp_cache.json`, `dblp_venue_cache.json`, read-only
-  `dblp_pubs_cache.json`) are expensive to refill — live DBLP fetches are
+  reviewer fingerprints include metadata, PID, selected publications and
+  abstracts, model, and embedding flags. Transient DBLP/API failures remain
+  retryable. The DBLP caches (`dblp_cache.json`, `dblp_venue_cache.json`,
+  `reviewer_publications.json`, read-only `dblp_pubs_cache.json`) are expensive to refill — live DBLP fetches are
   rate-limited (~3s jittered delay, 429 backoff ≥15s). Never delete them;
   `make clean-fingerprints` deliberately spares them.
+- `.env` holds `IEEE_API_KEY` and optional `S2_API_KEY`; it and editor backup
+  variants are ignored. Never print, inspect, or commit secret values.
+- A title-only comparison cache must use a distinct path such as
+  `fingerprints-title-only.json`; all `fingerprints-*.json` files are ignored.
 
 ## Conventions
 
@@ -94,3 +102,5 @@ enforced centrally in `paper_matching.load_papers` / `completeness_gaps`.
 - When experimenting, work on scratch copies (`--out`, `--fingerprint-cache`,
   `--data`, `--paper-cache` flags exist for this); never mutate the real
   caches or `dblp_overrides.csv` in a test.
+- Run `~/envs/hpca-matching/bin/python3 -m unittest tests.test_regressions`
+  after changes, then run `make` for an end-to-end and self-check validation.
