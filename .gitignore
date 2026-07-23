@@ -1,8 +1,10 @@
 # PII / PII-derived — real PC member data
 HPCA'27 PC Member Acceptance Form (Responses) - Form Responses 1.csv
+Area Chair Acceptance Form (Responses) - Form Responses 1.csv
 PCDB_with_emails.csv
 fingerprints.json
 fingerprints-*.json
+area_chair_fingerprints.json
 paper_fingerprints.json
 dblp_cache.json
 dblp_cache2.json
@@ -16,7 +18,9 @@ reviewer_publications.json
 publication_abstracts.json
 reviewer_seniority.csv
 dblp_overrides.csv
+publication_exclusions.csv
 assignment.txt
+area_chair_assignment.txt
 abstract-evaluation*.csv
 
 # Test fixture with a placeholder author email, not core project data

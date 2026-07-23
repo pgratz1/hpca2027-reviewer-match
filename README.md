@@ -30,7 +30,7 @@ Both workflows share the reviewer loader (`reviewers.py`) and DBLP caches:
 acceptance CSV ──▶ reviewers.py (+ dblp_overrides.csv)
                        └─▶ build_fingerprints.py ──▶ fingerprints.json ─┐
                                ▲                                      │
-              enrich_publications.py (DBLP DOI + IEEE/S2 abstracts) ──┘
+              enrich_publications.py (DBLP DOI + S2 abstracts) ──┘
                                                                         ├─▶ score_papers.py
 paper JSON ──▶ paper_matching.py ──▶ paper_fingerprints.json ───────────┘    assign_reviewers.py
 ```
@@ -47,7 +47,7 @@ report).
 
 1. **Drop the inputs in place**: the latest acceptance-form CSV export (keep
    the exact filename) and a fresh `hpca2027-data.json` from HotCRP.
-2. **Fill in `IEEE_API_KEY` and `S2_API_KEY` in the gitignored `.env` file**,
+2. **Optionally fill in `S2_API_KEY` in the gitignored `.env` file**,
    then run **`make`** — rebuilds
    whatever is stale, in order: reviewer seniority classification, cached
    IEEE/ACM abstract enrichment, reviewer fingerprints, then the assignment. The final
@@ -135,22 +135,18 @@ Key flags: `--years` (4), `--max-titles` (uncapped), `--area-weight` (1.0).
 Use `--no-abstracts` with a separate `--fingerprint-cache` to build the
 comparison baseline.
 
-### `enrich_publications.py` — IEEE/ACM reviewer-publication abstracts
+### `enrich_publications.py` — reviewer-publication abstracts
 Fetches DOI-bearing DBLP records into `reviewer_publications.json`, then
-retrieves IEEE abstracts from the official IEEE Xplore Metadata Search API's
-DOI parameter. ACM papers
-and IEEE misses use Semantic Scholar's DOI batch API. Only DOI prefixes
+retrieves IEEE and ACM paper abstracts from Semantic Scholar's DOI batch API.
+Only DOI prefixes
 `10.1109` and `10.1145` are eligible; no publisher pages are scraped.
 Successful and confirmed-missing results persist in
 `publication_abstracts.json`, while DBLP/API failures remain retryable. The
-`S2_API_KEY` is optional: without it, ACM papers and IEEE misses use Semantic
-Scholar's shared unauthenticated rate limit with 429 backoff. IEEE retrieval is capped
-at 190 DOI requests per invocation to stay below the default 200/day quota;
-rerunning on a later day resumes the remaining records from cache.
+`S2_API_KEY` is optional: without it, requests use Semantic Scholar's shared
+unauthenticated rate limit with 429 backoff.
 
 ```bash
 # .env (gitignored; make loads and exports it automatically)
-IEEE_API_KEY=...
 S2_API_KEY=...
 
 ~/envs/hpca-matching/bin/python3 enrich_publications.py --limit 10
@@ -256,6 +252,48 @@ for under-filled papers still applies).
 ~/envs/hpca-matching/bin/python3 assign_reviewers.py --light-cap 7 --full-cap 15 --reviewers-per-paper 6
 ```
 
+### `assign_area_chairs.py` — balanced area-chair assignment
+
+This is an independent workflow layered on the completed reviewer assignment.
+It loads accepted responses from the area-chair form, builds research
+fingerprints with the same DBLP-publication, Semantic Scholar abstract, and
+declared-area policy used for reviewers, and assigns every paper with at least
+one reviewer to one area chair. HotCRP conflicts are hard exclusions.
+
+Area-chair profiles use a 10-year publication window (reviewer profiles retain
+their four-year default), giving the smaller chair pool a deeper research
+history. The optimizer maximizes total SPECTER2 cosine affinity globally while
+keeping each chair within 10% of the mean load (integer bounds are rounded
+inward). The report is grouped by area chair, with assigned paper IDs, titles,
+topics, and scores beneath each chair, followed by affinity, conflict,
+coverage, and load-bound checks.
+
+```bash
+make area-chairs
+# output: area_chair_assignment.txt
+```
+
+The workflow reuses the DBLP, publication metadata, abstract, and paper
+fingerprint caches, but writes chair vectors to
+`area_chair_fingerprints.json`. It is not part of the default `make` target.
+
+## Publication exclusions
+
+`publication_exclusions.csv` is an optional hand-maintained file with columns
+`email,doi,note`. Each row removes that DOI only from the named researcher's
+fingerprint; it does not alter the shared DBLP metadata or abstract caches.
+Emails are case-insensitive, and DOI URLs or bare DOIs are accepted. Both
+reviewer and area-chair fingerprint builds load the file automatically.
+
+```csv
+email,doi,note
+person@example.com,10.1109/example.1,Incorrect or unrepresentative publication
+```
+
+An exclusion that names a researcher in the current build but does not match
+their selected publication window is reported as a warning. Removing the row
+and rebuilding restores the publication.
+
 ## The DBLP override file
 
 `dblp_overrides.csv` (columns `email,dblp,note`) is the **single
@@ -281,19 +319,22 @@ override application) · `dblp.py` (DBLP fetch, caching, rate limiting) ·
 
 ## Data files
 
-**Inputs:** the acceptance-form CSV (Google Forms export — real names and
-emails, treat as sensitive), `hpca2027-data.json` (HotCRP paper export),
-`dblp_pubs_cache.json` (colleague's read-only rich DBLP cache),
-`PCDB_with_emails.csv` (PC-service history with emails — also sensitive).
+**Inputs:** the reviewer and area-chair acceptance-form CSVs (Google Forms
+exports — real names and emails, treat as sensitive), `hpca2027-data.json`
+(HotCRP paper export), `dblp_pubs_cache.json` (colleague's read-only rich DBLP
+cache), and `PCDB_with_emails.csv` (PC-service history with emails — also
+sensitive).
 
-**Hand-maintained:** `dblp_overrides.csv`.
+**Hand-maintained:** `dblp_overrides.csv`, `publication_exclusions.csv`.
 
 **Generated** (safe to delete; rebuilt incrementally): `dblp_cache.json`,
-`dblp_venue_cache.json`, `fingerprints.json`, `paper_fingerprints.json`,
+`dblp_venue_cache.json`, `fingerprints.json`,
+`area_chair_fingerprints.json`, `paper_fingerprints.json`,
 `reviewer_publications.json`, `publication_abstracts.json`,
-`reviewer_seniority.csv`, `assignment.txt`, and experimental fingerprint
-caches such as `fingerprints-title-only.json`. The enrichment caches are
-rebuildable but expensive because live DBLP retrieval is rate-limited.
+`reviewer_seniority.csv`, `assignment.txt`, `area_chair_assignment.txt`, and
+experimental fingerprint caches such as `fingerprints-title-only.json`. The
+enrichment caches are rebuildable but expensive because live DBLP retrieval
+is rate-limited.
 
 **Retired** (left over from the removed lookup chain; kept only as
 historical reference, nothing reads them): `no_dblp_lookup_report.csv`,

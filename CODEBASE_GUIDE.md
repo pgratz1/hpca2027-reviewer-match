@@ -11,7 +11,7 @@ The system is best understood as four layers:
 1. **Reviewer identity and metadata** — `reviewers.py` parses the acceptance CSV, keeps the latest submission per case-insensitive email, removes declines, applies hand-maintained DBLP overrides, and produces `Reviewer` records.
 2. **Evidence and representations** — `dblp.py` obtains publication histories; `classify_reviewers.py` derives seniority; `build_fingerprints.py`, `fingerprint.py`, and `specter2_model.py` derive normalized reviewer vectors.
 3. **Paper eligibility and affinity** — `paper_matching.py` filters incomplete papers, builds content-aware paper vectors, excludes conflicts, applies the area gate, and calculates cosine scores.
-4. **Assignment and reporting** — `assign_reviewers.py` distributes reviewers globally under load and composition constraints. `score_papers.py`, `nearest_neighbors.py`, and `main.py` provide diagnostic views of intermediate results.
+4. **Assignment and reporting** — `assign_reviewers.py` distributes reviewers globally under load and composition constraints. The orthogonal area-chair path loads accepted chairs, builds 10-year fingerprints, and uses `assign_area_chairs.py` to maximize total affinity under hard COIs and balanced loads. `score_papers.py`, `nearest_neighbors.py`, and `main.py` provide diagnostic views of intermediate results.
 
 The normal data flow is:
 
@@ -29,6 +29,8 @@ HotCRP JSON --> paper_matching.py --> paper_fingerprints.json --> assign_reviewe
 ```
 
 `make` encodes this dependency order and is the preferred entry point.
+After the reviewer assignment exists, `make area-chairs` runs the independent
+chair enrichment, fingerprint, and assignment path.
 
 ## Module map
 
@@ -47,12 +49,14 @@ HotCRP JSON --> paper_matching.py --> paper_fingerprints.json --> assign_reviewe
 ### Embeddings
 
 - `specter2_model.py` is the model boundary: it loads `allenai/specter2_base` with the proximity adapter and returns CLS embeddings in batches.
-- `enrich_publications.py` resolves DOI-bearing reviewer publications through DBLP and caches IEEE/ACM abstracts. IEEE Xplore is queried directly when available; Semantic Scholar handles ACM records and IEEE misses, with authenticated and rate-limited unauthenticated modes. Confirmed results and retryable failures have distinct cache states.
+- `enrich_publications.py` resolves DOI-bearing reviewer publications through DBLP and caches IEEE/ACM paper abstracts from Semantic Scholar, with authenticated and rate-limited unauthenticated modes. Confirmed results and retryable failures have distinct cache states.
 - `fingerprint.py` supplies SPECTER2's `title [SEP] abstract` document shape and normalized weighted pooling. A reviewer is represented by one document per recent DBLP publication plus one area/keyword document; publications without a cached abstract fall back to title-only.
-- `build_fingerprints.py` orchestrates reviewer fetching and encoding. Reviewers without usable recent publications receive an area-only vector. Reviewer cache entries are keyed by normalized email and record schema/provenance, title count, abstract count, PID presence, and DBLP fetch completeness. `--no-abstracts` builds a controlled title-only baseline when paired with a separate cache path.
+- `build_fingerprints.py` orchestrates researcher fetching and encoding for reviewer and area-chair form schemas. Researchers without usable recent publications receive an area-only vector. Cache entries are keyed by normalized email and record schema/provenance, selected publications and abstracts, PID presence, and DBLP fetch completeness. `--no-abstracts` builds a controlled title-only baseline when paired with a separate cache path.
 - `paper_matching.py` represents each paper with two documents: title plus abstract, and the topic list. Their pooled vector is normalized, so dot products against reviewer vectors are cosine similarities.
+- `assign_area_chairs.py` independently assigns reviewer-assigned papers to accepted area chairs. It reuses the publication and paper caches, excludes HotCRP conflicts, and maximizes global SPECTER2 affinity within a ±10% chair-load band.
+- `publication_exclusions.csv` provides reversible per-email DOI exclusions before reviewer or area-chair publication embeddings are pooled; the exclusion list participates in fingerprint freshness through the filtered publication content.
 
-Both fingerprint caches store versioned provenance keys. Paper keys cover title, abstract, topics, area weight, and model identifiers. Reviewer keys cover identity, declared metadata, selected DBLP publications and abstracts, embedding policy, and model identifiers. Legacy entries rebuild once, and transient DBLP/API failures remain marked for retry. `make clean-fingerprints` remains available when an explicit full rebuild is desired.
+All fingerprint caches store versioned provenance keys. Paper keys cover title, abstract, topics, area weight, and model identifiers. Researcher keys cover identity, declared metadata, the post-exclusion publication set and abstracts, embedding policy, and model identifiers. Legacy entries rebuild once, and transient DBLP/API failures remain marked for retry. `make clean-fingerprints` remains available when an explicit full rebuild is desired.
 
 ### Eligibility and assignment
 

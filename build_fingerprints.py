@@ -25,6 +25,7 @@ neighbors by fingerprint cosine similarity.
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import sys
@@ -35,7 +36,8 @@ import torch
 
 import fingerprint as fp
 import specter2_model
-from dblp import fetch_titles_for_pids, load_cache, load_colleague_cache
+from area_chairs import load_area_chairs
+from dblp import fetch_titles_for_pids, load_cache, load_colleague_cache, normalise_doi
 from reviewers import load_reviewers
 
 DEFAULT_CSV = "HPCA'27 PC Member Acceptance Form (Responses) - Form Responses 1.csv"
@@ -44,11 +46,52 @@ DEFAULT_COLLEAGUE_CACHE = "dblp_pubs_cache.json"
 DEFAULT_FINGERPRINT_CACHE = "fingerprints.json"
 DEFAULT_METADATA_CACHE = "reviewer_publications.json"
 DEFAULT_ABSTRACT_CACHE = "publication_abstracts.json"
+DEFAULT_PUBLICATION_EXCLUSIONS = "publication_exclusions.csv"
 FINGERPRINT_SCHEMA_VERSION = 3
 
 # Always spot-checked if present in the current run; falls back to the first
 # few reviewers processed when empty.
 SPOT_CHECK_EMAILS: list[str] = []
+
+
+def load_publication_exclusions(path: str) -> dict[str, set[str]]:
+    """Load per-email DOI exclusions from an optional hand-maintained CSV."""
+    try:
+        f = open(path, newline="", encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    exclusions: dict[str, set[str]] = {}
+    with f:
+        reader = csv.DictReader(f)
+        required = {"email", "doi"}
+        missing = required - set(reader.fieldnames or [])
+        if missing:
+            raise ValueError(
+                f"{path}: missing required column(s): {', '.join(sorted(missing))}"
+            )
+        for line_number, row in enumerate(reader, 2):
+            email = (row.get("email") or "").strip().lower()
+            raw_doi = (row.get("doi") or "").strip()
+            if not email and not raw_doi and not (row.get("note") or "").strip():
+                continue
+            if not email or not raw_doi:
+                raise ValueError(f"{path}:{line_number}: email and doi are required")
+            doi = normalise_doi(raw_doi)
+            if doi is None:
+                raise ValueError(f"{path}:{line_number}: invalid DOI {raw_doi!r}")
+            exclusions.setdefault(email, set()).add(doi)
+    return exclusions
+
+
+def apply_publication_exclusions(
+    email: str,
+    publications: list[tuple[int, str, str, str, str]],
+    exclusions: dict[str, set[str]],
+) -> tuple[list[tuple[int, str, str, str, str]], set[str]]:
+    """Remove publications whose DOI is excluded for `email`."""
+    excluded_dois = exclusions.get(email.lower(), set())
+    matched = {pub[2] for pub in publications if pub[2] in excluded_dois}
+    return [pub for pub in publications if pub[2] not in excluded_dois], matched
 
 
 def fingerprint_key(r, publications, *, years, max_titles, area_weight) -> str:
@@ -75,6 +118,10 @@ def fingerprint_key(r, publications, *, years, max_titles, area_weight) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--csv", default=DEFAULT_CSV, help="path to the reviewer CSV")
+    parser.add_argument(
+        "--role", choices=("reviewer", "area-chair"), default="reviewer",
+        help="acceptance-form schema to load (default: reviewer)",
+    )
     parser.add_argument("--cache", default=DEFAULT_CACHE, help="path to the writable DBLP title cache")
     parser.add_argument(
         "--colleague-cache", default=DEFAULT_COLLEAGUE_CACHE,
@@ -91,6 +138,10 @@ def main() -> int:
     parser.add_argument(
         "--abstract-cache", default=DEFAULT_ABSTRACT_CACHE,
         help="DOI-keyed abstract cache produced by enrich_publications.py"
+    )
+    parser.add_argument(
+        "--publication-exclusions", default=DEFAULT_PUBLICATION_EXCLUSIONS,
+        help="optional CSV of per-email publication DOIs to exclude"
     )
     parser.add_argument(
         "--no-abstracts", action="store_true",
@@ -129,13 +180,21 @@ def main() -> int:
         print("WARN: cuda requested but not available, falling back to cpu", file=sys.stderr)
         args.device = "cpu"
 
-    reviewers = load_reviewers(args.csv)
+    reviewers = (
+        load_area_chairs(args.csv) if args.role == "area-chair"
+        else load_reviewers(args.csv)
+    )
+    role_label = "area chairs" if args.role == "area-chair" else "reviewers"
     if args.limit is not None:
         reviewers = reviewers[: args.limit]
 
     fp_cache = fp.load_fingerprint_cache(args.fingerprint_cache)
     publication_metadata = fp.load_fingerprint_cache(args.publication_metadata_cache)
     abstract_cache = fp.load_fingerprint_cache(args.abstract_cache)
+    try:
+        publication_exclusions = load_publication_exclusions(args.publication_exclusions)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     # Resolve titles for every PID-backed reviewer. Cache hits are cheap, and
     # doing this before the fingerprint freshness check lets DBLP cache edits
@@ -187,6 +246,7 @@ def main() -> int:
         }
 
     publications_by_email: dict[str, list[tuple[int, str, str, str, str]]] = {}
+    matched_exclusions: dict[str, set[str]] = {}
     for r in reviewers:
         publications = []
         for year, title in selected_by_email[r.email]:
@@ -195,7 +255,19 @@ def main() -> int:
             abstract = entry.get("abstract", "") if entry.get("status") == "found" else ""
             source = entry.get("source", "") if abstract else ""
             publications.append((year, title, doi, abstract, source))
+        publications, matched = apply_publication_exclusions(
+            r.email, publications, publication_exclusions
+        )
         publications_by_email[r.email] = publications
+        matched_exclusions[r.email] = matched
+
+    active_emails = {r.email for r in reviewers}
+    for email in sorted(active_emails & set(publication_exclusions)):
+        for doi in sorted(publication_exclusions[email] - matched_exclusions[email]):
+            print(
+                f"WARN: publication exclusion for {email} did not match a selected DOI: {doi}",
+                file=sys.stderr,
+            )
 
     keys = {
         r.email: fingerprint_key(
@@ -216,7 +288,7 @@ def main() -> int:
             pending.append(r)
 
     print(
-        f"Loaded {len(reviewers)} accepted reviewers; {len(pending)} need fingerprints "
+        f"Loaded {len(reviewers)} accepted {role_label}; {len(pending)} need fingerprints "
         f"({len(reviewers) - len(pending)} already cached).",
         file=sys.stderr,
     )
@@ -265,6 +337,7 @@ def main() -> int:
                 "vector": fingerprint_vec.tolist(),
                 "n_titles": n_titles_used[i],
                 "n_abstracts": sum(bool(pub[3]) for pub in publications_by_email[r.email]),
+                "n_excluded": len(matched_exclusions[r.email]),
                 "has_pid": bool(r.pid),
                 "fingerprint_key": keys[r.email],
                 "schema_version": FINGERPRINT_SCHEMA_VERSION,
@@ -279,7 +352,8 @@ def main() -> int:
     print(
         f"\nDone. computed={len(pending)} area_only_fallback={area_only} "
         f"dblp_fetch_errors={fetch_errors} abstracts_used="
-        f"{sum(sum(bool(pub[3]) for pub in publications_by_email[r.email]) for r in reviewers)}",
+        f"{sum(sum(bool(pub[3]) for pub in publications_by_email[r.email]) for r in reviewers)} "
+        f"publications_excluded={sum(len(matched_exclusions[r.email]) for r in reviewers)}",
         file=sys.stderr,
     )
 

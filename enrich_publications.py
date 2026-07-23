@@ -1,12 +1,12 @@
-"""Cache DBLP publication DOIs and IEEE/ACM abstracts for reviewer profiles.
+"""Cache DBLP publication DOIs and abstracts for reviewer profiles.
 
     python enrich_publications.py --limit 10
-    IEEE_API_KEY=... S2_API_KEY=... python enrich_publications.py
+    S2_API_KEY=... python enrich_publications.py
 
 DBLP remains the authority for reviewer identities and publication lists. Its
-person XML supplies DOI links but not abstracts. IEEE abstracts are requested
-from the official IEEE Xplore Metadata Search API by DOI; ACM papers and missing IEEE results use
-Semantic Scholar's DOI batch API. Nothing scrapes publisher web pages.
+person XML supplies DOI links but not abstracts. IEEE and ACM paper abstracts
+are requested from Semantic Scholar's DOI batch API. Nothing scrapes publisher
+web pages.
 
 Two atomic, incremental caches are written. Transient failures remain
 retryable, while successful and confirmed-missing results are reused.
@@ -28,7 +28,8 @@ from pathlib import Path
 
 import requests
 
-from dblp import fetch_doi_records, get_with_retry, normalise_doi
+from dblp import fetch_doi_records, normalise_doi
+from area_chairs import load_area_chairs
 from reviewers import load_reviewers
 
 DEFAULT_CSV = "HPCA'27 PC Member Acceptance Form (Responses) - Form Responses 1.csv"
@@ -37,9 +38,7 @@ DEFAULT_ABSTRACT_CACHE = "publication_abstracts.json"
 METADATA_SCHEMA_VERSION = 1
 ABSTRACT_SCHEMA_VERSION = 1
 ALLOWED_PUBLISHERS = frozenset({"ieee", "acm"})
-IEEE_DAILY_REQUEST_BUDGET = 190
 S2_BATCH_SIZE = 500
-IEEE_URL = "https://ieeexploreapi.ieee.org/api/v1/search/articles"
 S2_URL = "https://api.semanticscholar.org/graph/v1/paper/batch"
 _TAG_RE = re.compile(r"<[^>]+>")
 _SPACE_RE = re.compile(r"\s+")
@@ -92,39 +91,6 @@ def safe_request_error(exc: requests.RequestException) -> str:
 def chunks(items: list[str], size: int):
     for start in range(0, len(items), size):
         yield items[start : start + size]
-
-
-def fetch_ieee_abstracts(
-    dois: list[str], api_key: str, session: requests.Session
-) -> dict[str, dict]:
-    """Return DOI-keyed IEEE Metadata Search results within a daily budget."""
-    output: dict[str, dict] = {}
-    for index, requested in enumerate(dois[:IEEE_DAILY_REQUEST_BUDGET]):
-        if index:
-            time.sleep(0.11)  # remain below the documented 10 requests/second
-        response = get_with_retry(
-            session, IEEE_URL,
-            params={"apikey": api_key, "format": "json", "doi": requested},
-            backoff_floor=2,
-        )
-        matched = False
-        for article in response.json().get("articles", []):
-            doi = normalise_doi(article.get("doi"))
-            if doi != requested:
-                continue
-            matched = True
-            abstract = clean_abstract(article.get("abstract"))
-            output[requested] = {
-                "status": "found" if abstract else "not_found",
-                "abstract": abstract, "source": "ieee",
-                "title": (article.get("title") or "").strip(),
-            }
-            break
-        if not matched:
-            output[requested] = {
-                "status": "not_found", "abstract": "", "source": "ieee"
-            }
-    return output
 
 
 def fetch_s2_abstracts(
@@ -189,8 +155,8 @@ def selected_dois(metadata_cache: dict, years: int) -> dict[str, str]:
 
 
 def enrich_abstract_cache(
-    doi_publishers: dict[str, str], abstract_cache: dict, *, ieee_key: str,
-    s2_key: str, session: requests.Session,
+    doi_publishers: dict[str, str], abstract_cache: dict, *, s2_key: str,
+    session: requests.Session,
 ) -> tuple[int, int]:
     """Populate abstract_cache in place; return (found, attempted)."""
     pending = [
@@ -200,38 +166,7 @@ def enrich_abstract_cache(
     if not pending:
         return 0, 0
 
-    ieee = [
-        doi for doi in pending
-        if doi_publishers[doi] == "ieee"
-        and abstract_cache.get(doi, {}).get("status") != "pending_fallback"
-    ]
-    acm = [doi for doi in pending if doi_publishers[doi] == "acm"]
-    ieee_failed = False
-    try:
-        results = fetch_ieee_abstracts(ieee, ieee_key, session) if ieee else {}
-    except requests.RequestException as exc:
-        ieee_failed = True
-        results = {}
-        print(
-            f"WARN: IEEE API unavailable ({safe_request_error(exc)}); "
-            "falling back to Semantic Scholar",
-            file=sys.stderr,
-        )
-    ieee_fallback = [
-        doi for doi in pending
-        if doi_publishers[doi] == "ieee"
-        and (
-            abstract_cache.get(doi, {}).get("status") == "pending_fallback"
-            or ieee_failed
-            or (doi in results and results[doi]["status"] != "found")
-        )
-    ]
-    fallback = acm + ieee_fallback
-    if fallback:
-        s2_results = fetch_s2_abstracts(fallback, s2_key, session)
-        for doi, result in s2_results.items():
-            if result["status"] == "found" or doi not in results:
-                results[doi] = result
+    results = fetch_s2_abstracts(pending, s2_key, session)
 
     retrieved_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     for doi, result in results.items():
@@ -245,6 +180,10 @@ def enrich_abstract_cache(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--csv", default=DEFAULT_CSV)
+    parser.add_argument(
+        "--role", choices=("reviewer", "area-chair"), default="reviewer",
+        help="acceptance-form schema to load (default: reviewer)",
+    )
     parser.add_argument("--metadata-cache", default=DEFAULT_METADATA_CACHE)
     parser.add_argument("--abstract-cache", default=DEFAULT_ABSTRACT_CACHE)
     parser.add_argument("--years", type=int, default=4)
@@ -256,17 +195,17 @@ def main() -> int:
     if args.delay < 0:
         parser.error("--delay must be non-negative")
 
-    ieee_key = os.environ.get("IEEE_API_KEY", "").strip()
     s2_key = os.environ.get("S2_API_KEY", "").strip()
-    if not ieee_key:
-        parser.error("IEEE_API_KEY must be set")
     if not s2_key:
         print(
             "INFO: S2_API_KEY is not set; using the shared unauthenticated S2 rate limit",
             file=sys.stderr,
         )
 
-    reviewers = load_reviewers(args.csv)
+    reviewers = (
+        load_area_chairs(args.csv) if args.role == "area-chair"
+        else load_reviewers(args.csv)
+    )
     if args.limit is not None:
         reviewers = reviewers[:args.limit]
     pids = list(dict.fromkeys(r.pid for r in reviewers if r.pid))
@@ -314,7 +253,7 @@ def main() -> int:
     dois = selected_dois(metadata, args.years)
     try:
         found, attempted = enrich_abstract_cache(
-            dois, abstracts, ieee_key=ieee_key, s2_key=s2_key, session=session,
+            dois, abstracts, s2_key=s2_key, session=session,
         )
     except requests.RequestException as exc:
         print(

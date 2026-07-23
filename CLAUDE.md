@@ -25,12 +25,15 @@ contains spaces and parentheses — always quote it in shell commands).
 - `make` runs the whole pipeline (classify → abstract enrichment →
   fingerprints → `assignment.txt`)
   and rebuilds only what's stale. Prefer it over invoking scripts by hand.
+- `make area-chairs` is deliberately separate: it requires `assignment.txt`,
+  builds 10-year chair fingerprints, and writes a chair-grouped
+  `area_chair_assignment.txt` under hard COIs and ±10% loads.
 - Library modules (imported, never run): `reviewers.py`, `dblp.py`,
   `paper_matching.py`, `fingerprint.py`, `specter2_model.py`. Runnable
   scripts: `classify_reviewers.py`, `build_fingerprints.py`,
   `enrich_publications.py`, `assign_reviewers.py`, `score_papers.py`,
   `nearest_neighbors.py`, `compare_abstract_rankings.py`,
-  `score_abstract_evaluation.py`, `main.py`.
+  `score_abstract_evaluation.py`, `assign_area_chairs.py`, `main.py`.
 
 ## Architecture (filter-then-rank, then constrained assignment)
 
@@ -72,10 +75,10 @@ enforced centrally in `paper_matching.load_papers` / `completeness_gaps`.
   `awk`/`cut`/line counting: fields contain embedded commas, quoted `""`
   escapes, and embedded newlines. `reviewers.load_reviewers` collapses
   duplicate form submissions to the latest per email and applies overrides.
-- **Never commit data.** Everything derived from real PC members (the CSV,
-  all caches, `dblp_overrides.csv`, `reviewer_seniority.csv`,
-  `assignment.txt`, retired report CSVs) is gitignored; only code and docs go
-  to the GitHub remote. Check `git status` before committing.
+- **Never commit data.** Everything derived from real PC members (both form
+  CSVs, all caches, `dblp_overrides.csv`, `publication_exclusions.csv`,
+  classifications, assignments, and retired report CSVs) is gitignored; only
+  code and docs go to the GitHub remote. Check `git status` before committing.
 - Caches are incremental, versioned, and **content/policy-aware**: paper
   fingerprints include title/abstract/topics, model, and area weight;
   reviewer fingerprints include metadata, PID, selected publications and
@@ -84,8 +87,11 @@ enforced centrally in `paper_matching.load_papers` / `completeness_gaps`.
   `reviewer_publications.json`, read-only `dblp_pubs_cache.json`) are expensive to refill — live DBLP fetches are
   rate-limited (~3s jittered delay, 429 backoff ≥15s). Never delete them;
   `make clean-fingerprints` deliberately spares them.
-- `.env` holds `IEEE_API_KEY` and optional `S2_API_KEY`; it and editor backup
+- `.env` may hold an optional `S2_API_KEY`; it and editor backup
   variants are ignored. Never print, inspect, or commit secret values.
+- `publication_exclusions.csv` is the hand-maintained, per-email DOI exclusion
+  layer for reviewer and area-chair fingerprints; exclusions never delete
+  entries from the shared publication or abstract caches.
 - A title-only comparison cache must use a distinct path such as
   `fingerprints-title-only.json`; all `fingerprints-*.json` files are ignored.
 

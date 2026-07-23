@@ -13,9 +13,11 @@ PYTHON ?= $(HOME)/envs/hpca-matching/bin/python3
 # Optional local secrets. This file is gitignored; variables must be exported
 # so enrich_publications.py can read them from its environment.
 -include .env
-export IEEE_API_KEY S2_API_KEY
+export S2_API_KEY
 
 CSV = HPCA'27 PC Member Acceptance Form (Responses) - Form Responses 1.csv
+AREA_CHAIR_CSV = Area Chair Acceptance Form (Responses) - Form Responses 1.csv
+AREA_CHAIR_YEARS = 10
 # make splits prerequisite lists on spaces, so dependencies use this
 # backslash-escaped copy; recipes use the plain "$(CSV)" in shell quotes.
 CSV_DEP = HPCA'27\ PC\ Member\ Acceptance\ Form\ (Responses)\ -\ Form\ Responses\ 1.csv
@@ -24,7 +26,7 @@ REVIEWER_LIBS = reviewers.py dblp.py
 EMBED_LIBS = fingerprint.py specter2_model.py
 
 .DELETE_ON_ERROR:
-.PHONY: all enrich clean clean-fingerprints
+.PHONY: all enrich area-chairs clean clean-fingerprints
 
 all: reviewer_seniority.csv enrich fingerprints.json
 	$(PYTHON) build_fingerprints.py --csv "$(CSV)" --fingerprint-cache fingerprints.json
@@ -32,6 +34,14 @@ all: reviewer_seniority.csv enrich fingerprints.json
 
 enrich: enrich_publications.py dblp.py reviewers.py $(CSV_DEP) dblp_overrides.csv
 	$(PYTHON) enrich_publications.py --csv "$(CSV)"
+
+area-chairs:
+	@test -f assignment.txt || { echo "ERROR: assignment.txt not found; run make first" >&2; exit 1; }
+	$(PYTHON) enrich_publications.py --role area-chair --csv "$(AREA_CHAIR_CSV)" \
+		--years $(AREA_CHAIR_YEARS)
+	$(PYTHON) build_fingerprints.py --role area-chair --csv "$(AREA_CHAIR_CSV)" \
+		--fingerprint-cache area_chair_fingerprints.json --years $(AREA_CHAIR_YEARS)
+	$(PYTHON) assign_area_chairs.py --csv "$(AREA_CHAIR_CSV)" > area_chair_assignment.txt
 
 reviewer_publications.json publication_abstracts.json &: enrich_publications.py dblp.py reviewers.py $(CSV_DEP) dblp_overrides.csv
 	$(PYTHON) enrich_publications.py --csv "$(CSV)"
@@ -55,7 +65,7 @@ assignment.txt: assign_reviewers.py paper_matching.py classify_reviewers.py $(EM
 	$(PYTHON) assign_reviewers.py --csv "$(CSV)" > $@
 
 clean:
-	rm -f assignment.txt
+	rm -f assignment.txt area_chair_assignment.txt
 
 clean-fingerprints:
-	rm -f fingerprints.json paper_fingerprints.json
+	rm -f fingerprints.json paper_fingerprints.json area_chair_fingerprints.json

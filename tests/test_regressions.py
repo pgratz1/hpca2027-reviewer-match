@@ -1,10 +1,12 @@
 import contextlib
+import csv
 import io
 import json
 import random
 import sys
 import tempfile
 import unittest
+from collections import Counter
 from pathlib import Path
 from unittest import mock
 
@@ -12,6 +14,8 @@ import numpy as np
 import requests
 
 import assign_reviewers
+import assign_area_chairs
+import area_chairs
 import build_fingerprints
 import classify_reviewers
 import compare_abstract_rankings
@@ -54,65 +58,44 @@ class PublicationEnrichmentTests(unittest.TestCase):
         self.assertEqual("HTTP 403 from GET API request", summary)
         self.assertNotIn("top-secret", summary)
 
-    def test_ieee_then_s2_fallback(self):
+    def test_s2_enriches_ieee_and_acm_dois(self):
         cache = {}
         publishers = {"10.1109/a": "ieee", "10.1145/b": "acm"}
-        ieee = {
-            "10.1109/a": {"status": "not_found", "abstract": "", "source": "ieee"}
-        }
         s2 = {
-            "10.1109/a": {"status": "found", "abstract": "IEEE fallback", "source": "semantic_scholar"},
-            "10.1145/b": {"status": "found", "abstract": "ACM abstract", "source": "semantic_scholar"},
-        }
-        with mock.patch.object(enrich_publications, "fetch_ieee_abstracts", return_value=ieee), \
-             mock.patch.object(enrich_publications, "fetch_s2_abstracts", return_value=s2):
-            found, attempted = enrich_publications.enrich_abstract_cache(
-                publishers, cache, ieee_key="secret", s2_key="secret", session=object()
-            )
-        self.assertEqual((2, 2), (found, attempted))
-        self.assertEqual("IEEE fallback", cache["10.1109/a"]["abstract"])
-        self.assertEqual("semantic_scholar", cache["10.1145/b"]["source"])
-
-    def test_missing_s2_key_uses_unauthenticated_fallback(self):
-        cache = {}
-        publishers = {"10.1109/a": "ieee", "10.1145/b": "acm"}
-        ieee = {
-            "10.1109/a": {"status": "not_found", "abstract": "", "source": "ieee"}
-        }
-        s2 = {
-            "10.1109/a": {"status": "found", "abstract": "IEEE fallback", "source": "semantic_scholar"},
+            "10.1109/a": {"status": "found", "abstract": "IEEE abstract", "source": "semantic_scholar"},
             "10.1145/b": {"status": "found", "abstract": "ACM abstract", "source": "semantic_scholar"},
         }
         session = object()
-        with mock.patch.object(enrich_publications, "fetch_ieee_abstracts", return_value=ieee), \
-             mock.patch.object(enrich_publications, "fetch_s2_abstracts", return_value=s2) as fetch_s2:
+        with mock.patch.object(enrich_publications, "fetch_s2_abstracts", return_value=s2) as fetch_s2:
             found, attempted = enrich_publications.enrich_abstract_cache(
-                publishers, cache, ieee_key="secret", s2_key="", session=session
+                publishers, cache, s2_key="secret", session=session
             )
         self.assertEqual((2, 2), (found, attempted))
-        self.assertEqual("IEEE fallback", cache["10.1109/a"]["abstract"])
-        self.assertEqual("ACM abstract", cache["10.1145/b"]["abstract"])
+        self.assertEqual("IEEE abstract", cache["10.1109/a"]["abstract"])
+        self.assertEqual("semantic_scholar", cache["10.1109/a"]["source"])
+        self.assertEqual("semantic_scholar", cache["10.1145/b"]["source"])
         fetch_s2.assert_called_once_with(
-            ["10.1145/b", "10.1109/a"], "", session
+            ["10.1109/a", "10.1145/b"], "secret", session
         )
 
-    def test_ieee_http_failure_falls_back_to_s2(self):
-        cache = {}
-        publishers = {"10.1109/a": "ieee"}
-        response = mock.Mock(status_code=403)
-        response.request.method = "GET"
-        ieee_error = requests.HTTPError("secret URL", response=response)
+    def test_missing_s2_key_uses_unauthenticated_api(self):
+        cache = {"10.1109/a": {"status": "pending_fallback"}}
+        publishers = {"10.1109/a": "ieee", "10.1145/b": "acm"}
         s2 = {
-            "10.1109/a": {"status": "found", "abstract": "S2 copy", "source": "semantic_scholar"}
+            "10.1109/a": {"status": "found", "abstract": "IEEE abstract", "source": "semantic_scholar"},
+            "10.1145/b": {"status": "found", "abstract": "ACM abstract", "source": "semantic_scholar"},
         }
-        with mock.patch.object(enrich_publications, "fetch_ieee_abstracts", side_effect=ieee_error), \
-             mock.patch.object(enrich_publications, "fetch_s2_abstracts", return_value=s2), \
-             contextlib.redirect_stderr(io.StringIO()):
+        session = object()
+        with mock.patch.object(enrich_publications, "fetch_s2_abstracts", return_value=s2) as fetch_s2:
             found, attempted = enrich_publications.enrich_abstract_cache(
-                publishers, cache, ieee_key="secret", s2_key="", session=object()
+                publishers, cache, s2_key="", session=session
             )
-        self.assertEqual((1, 1), (found, attempted))
-        self.assertEqual("S2 copy", cache["10.1109/a"]["abstract"])
+        self.assertEqual((2, 2), (found, attempted))
+        self.assertEqual("IEEE abstract", cache["10.1109/a"]["abstract"])
+        self.assertEqual("ACM abstract", cache["10.1145/b"]["abstract"])
+        fetch_s2.assert_called_once_with(
+            ["10.1109/a", "10.1145/b"], "", session
+        )
 
     def test_publication_document_uses_native_title_abstract_shape(self):
         self.assertEqual(
@@ -136,7 +119,110 @@ class PublicationEnrichmentTests(unittest.TestCase):
         )
 
 
+class AreaChairAssignmentTests(unittest.TestCase):
+    def test_area_chair_loader_keeps_latest_explicit_acceptance(self):
+        headers = [
+            "Timestamp", "Please confirm your HotCRP email address",
+            "Area Chair membership", "First Name", "Last Name",
+            "Enter your DBLP Link", "institutional affiliation",
+            "primary area", "keywords", "secondary area",
+        ]
+        rows = [
+            ["07/01/2026 10:00:00", "chair@example.com", "No, I am unable to accept",
+             "Old", "Name", "none", "Example", "Memory", "", "Security"],
+            ["07/02/2026 10:00:00", "CHAIR@example.com",
+             "Yes, I accept the role of being an Area Chair for HPCA 2027",
+             "New", "Name", "https://dblp.org/pid/1/Test", "Example",
+             "Microarchitecture", "branches", "Memory"],
+            ["07/02/2026 11:00:00", "decline@example.com",
+             "No, I would prefer to be a PC full or light member",
+             "", "", "none", "", "", "", ""],
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "chairs.csv"
+            with path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(headers)
+                writer.writerows(rows)
+            chairs = area_chairs.load_area_chairs(str(path), str(Path(tmp) / "missing.csv"))
+        self.assertEqual(1, len(chairs))
+        self.assertEqual("chair@example.com", chairs[0].email)
+        self.assertEqual("New Name", chairs[0].name)
+        self.assertEqual("1/Test", chairs[0].pid)
+        self.assertEqual("", chairs[0].tertiary)
+
+    def test_load_reviewer_assigned_pids(self):
+        text = (
+            "=== [2] Included\n"
+            "    assigned 6 of 6 requested\n"
+            "=== [3] Empty\n"
+            "    assigned 0 of 6 requested\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "assignment.txt"
+            path.write_text(text, encoding="utf-8")
+            self.assertEqual([2], assign_area_chairs.load_reviewer_assigned_pids(str(path)))
+
+    def test_balanced_optimizer_finds_global_maximum(self):
+        scores = {
+            (1, "a"): 10.0, (1, "b"): 9.0,
+            (2, "a"): 8.0, (2, "b"): 0.0,
+        }
+        result = assign_area_chairs.maximize_balanced_affinity(
+            [1, 2], ["a", "b"], scores, 1, 1
+        )
+        self.assertEqual({1: "b", 2: "a"}, result)
+
+    def test_balanced_optimizer_respects_conflicts_and_loads(self):
+        scores = {
+            (1, "b"): 5.0,
+            (2, "a"): 4.0, (2, "b"): 1.0,
+            (3, "a"): 3.0, (3, "b"): 2.0,
+            (4, "a"): 1.0, (4, "b"): 4.0,
+        }
+        result = assign_area_chairs.maximize_balanced_affinity(
+            [1, 2, 3, 4], ["a", "b"], scores, 2, 2
+        )
+        self.assertEqual("b", result[1])
+        self.assertEqual({"a": 2, "b": 2}, dict(Counter(result.values())))
+
+    def test_load_bounds_round_inward(self):
+        self.assertEqual((30, 35), assign_area_chairs.load_bounds(486, 15, 0.10))
+
+
 class FingerprintCacheTests(unittest.TestCase):
+    def test_publication_exclusions_are_normalized_and_person_specific(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "publication_exclusions.csv"
+            path.write_text(
+                "email,doi,note\n"
+                "PERSON@EXAMPLE.COM,https://doi.org/10.1109/ABC.1,exclude\n"
+                "person@example.com,10.1109/abc.1,duplicate\n",
+                encoding="utf-8",
+            )
+            exclusions = build_fingerprints.load_publication_exclusions(str(path))
+        self.assertEqual({"10.1109/abc.1"}, exclusions["person@example.com"])
+        publications = [
+            (2026, "Excluded", "10.1109/abc.1", "Abstract", "semantic_scholar"),
+            (2025, "Retained", "10.1145/other", "", ""),
+        ]
+        filtered, matched = build_fingerprints.apply_publication_exclusions(
+            "person@example.com", publications, exclusions
+        )
+        other_filtered, _ = build_fingerprints.apply_publication_exclusions(
+            "other@example.com", publications, exclusions
+        )
+        self.assertEqual({"10.1109/abc.1"}, matched)
+        self.assertEqual(["Retained"], [pub[1] for pub in filtered])
+        self.assertEqual(publications, other_filtered)
+
+    def test_malformed_publication_exclusion_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "publication_exclusions.csv"
+            path.write_text("email,doi\nperson@example.com,not-a-doi\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "invalid DOI"):
+                build_fingerprints.load_publication_exclusions(str(path))
+
     def test_key_changes_with_inputs_and_policy(self):
         r = reviewer()
         base = build_fingerprints.fingerprint_key(

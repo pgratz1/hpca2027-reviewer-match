@@ -12,7 +12,7 @@ Automate and improve reviewer-paper assignment for HPCA 2027, which has the larg
 
 ## Design decided so far
 1. **Area filter (hard gate).** A reviewer is only eligible for a paper if there's overlap between {reviewer primary, reviewer secondary} and {paper primary, paper secondary}. This is a hard constraint, not a soft weight — reviewers should not be assigned outside their declared areas.
-2. **DBLP fetch and enrichment.** Pull recent publications from each known DBLP PID, cache their DOIs, and enrich IEEE/ACM records with abstracts from IEEE Xplore and Semantic Scholar. DOI metadata and abstracts are persistent, resumable caches.
+2. **DBLP fetch and enrichment.** Pull recent publications from each known DBLP PID, cache their DOIs, and enrich IEEE/ACM records with abstracts from Semantic Scholar. DOI metadata and abstracts are persistent, resumable caches.
 3. **Embedding model.** Use SPECTER2 (`allenai/specter2`) — purpose-built for scientific paper similarity (trained on citation-graph relatedness), used by OpenReview/ARR for the same reviewer-matching problem. Sentence-transformers (`all-mpnet-base-v2`) as a fallback if SPECTER2 setup is troublesome.
 4. **Scoring.** Mean-pool normalized SPECTER2 documents for each reviewer's recent publications and declared areas. Use native `title [SEP] abstract` documents where an abstract is cached and title-only otherwise. Papers use title, abstract, and topics. Cosine similarity ranks eligible candidates.
 5. **Output and assignment.** Run a phased, load-capped deferred-acceptance assignment with COI, area, seniority, junior, and out-of-area policy checks, plus explicit shortage and relaxation reports.
