@@ -4,8 +4,8 @@ The accepted PC cannot cover the submission volume: the papers need
 `--reviewers-per-paper` reviews each, and the PC supplies only as many review
 slots as its per-member caps allow. The gap has to be filled by reserve
 reviewers — the senior authors each submission nominates in HotCRP's
-`reserve_reviewer` field (see extract_reserve_reviewers.py) — each of whom is
-expected to take `--reviews-per-reserve` reviews.
+`reserve_reviewer` field — each of whom is expected to take
+`--reviews-per-reserve` reviews.
 
 Pure arithmetic on the same inputs the real assignment uses: no embeddings, no
 network. It deliberately ignores COI and the area gate, so it is a *floor* on
@@ -140,9 +140,9 @@ def main() -> int:
     else:
         print(
             f"\nNote: this ignores COI and the area gate, so {needed} is a floor. "
-            f"Compare it against the candidate count from "
-            f"extract_reserve_reviewers.py — if the pool is smaller, either the "
-            f"per-reserve load or the papers-per-reviewer caps have to rise.",
+            f"Compare it against the size of the recruited reserve list — if "
+            f"that pool is smaller, either the per-reserve load or the "
+            f"papers-per-reviewer caps have to rise.",
             file=sys.stderr,
         )
     return 0

@@ -42,7 +42,7 @@ legacy-policy artifacts without overwriting those defaults.
 
 - `reviewers.py` is the canonical reviewer loader used throughout the project. CSV headers are found by case-insensitive substring rather than exact spelling. Missing expected columns fail loudly. Repeat form submissions are resolved by timestamp before acceptance status is evaluated.
 - `dblp_overrides.csv` is the durable, email-keyed identity correction layer. A valid nonblank override wins over the form's DBLP value. The file is sensitive, hand-maintained, and gitignored.
-- `dblp.py` has no CSV knowledge. It parses several PID formats, reads title-only and rich-publication caches, fetches DBLP XML from official mirrors when necessary, retries rate limits, and writes live results atomically after each successful fetch. `fetch_person_names` is the third view of the same person XML alongside titles and rich records: it reads only the nested `<person>` element, whose `<author>` children are the canonical name and its aliases, never the co-authors listed on the publications.
+- `dblp.py` has no CSV knowledge. It parses several PID formats, reads title-only and rich-publication caches, fetches DBLP XML from official mirrors when necessary, retries rate limits, and writes live results atomically after each successful fetch. It also owns the shared name and `dblp`-field parsing: `name_tokens` folds accents, initials, DBLP's homonym suffix, and word order into a comparable token set, and `split_dblp_field` splits a submission's `dblp` list while keeping it positionally aligned with the author list.
 
 ### Seniority
 
@@ -58,7 +58,7 @@ legacy-policy artifacts without overwriting those defaults.
 - `build_fingerprints.py` orchestrates researcher fetching and encoding for reviewer and area-chair form schemas. Researchers without usable recent publications receive an area-only vector. Cache entries are keyed by normalized email and record schema/provenance, selected publications and abstracts, PID presence, and DBLP fetch completeness. `--no-abstracts` builds a controlled title-only baseline when paired with a separate cache path.
 - `paper_matching.py` represents each paper with two documents: title plus abstract, and the topic list. Their pooled vector is normalized, so dot products against reviewer vectors are cosine similarities.
 - `assign_area_chairs.py` independently assigns reviewer-assigned papers to accepted area chairs. It reuses the publication and paper caches, excludes HotCRP conflicts, and maximizes global SPECTER2 affinity within a ±10% chair-load band or the closest integer balance when that band is infeasible.
-- `estimate_reserve_need.py` and `extract_reserve_reviewers.py` form the reserve-reviewer path, which uses no embeddings at all. The first is arithmetic over the selected papers and the PC's per-member caps and produces a floor on the cohort size, since it ignores COI and the area gate. The second normalizes HotCRP's free-text `reserve_reviewer` field into a person-per-row list. Its two identity problems are handled separately: the *person* comes from an email in the field or an exact name match against the paper's authors, and the *DBLP PID* comes from the paper's positionally aligned `dblp` list, which is trusted only when its entry count equals the author count. Everything else is settled by looking the candidate PIDs up in DBLP and comparing person names, or dropped and reported.
+- `estimate_reserve_need.py` sizes the reserve-reviewer cohort and uses no embeddings at all: arithmetic over the selected papers and the PC's per-member caps, producing a floor on the cohort size, since it ignores COI and the area gate. Recruiting the reserves is done outside this repo, so nothing here consumes a reserve list.
 - `publication_exclusions.csv` provides reversible per-email DOI exclusions before reviewer or area-chair publication embeddings are pooled; the exclusion list participates in fingerprint freshness through the filtered publication content.
 
 All fingerprint caches store versioned provenance keys. Paper keys cover title, abstract, topics, area weight, and model identifiers. Researcher keys cover identity, declared metadata, the post-exclusion publication set and abstracts, embedding policy, and model identifiers. Legacy entries rebuild once, and transient DBLP/API failures remain marked for retry. `make clean-fingerprints` remains available when an explicit full rebuild is desired.
@@ -120,11 +120,10 @@ This builds seniority, reviewer fingerprints, and the final assignment when thei
 ~/envs/hpca-matching/bin/python3 build_fingerprints.py --limit 10
 ~/envs/hpca-matching/bin/python3 score_papers.py --pid 8 --top 10
 ~/envs/hpca-matching/bin/python3 nearest_neighbors.py --email someone@example.com
-~/envs/hpca-matching/bin/python3 extract_reserve_reviewers.py --no-name-probe --out /tmp/dry.csv
 ~/envs/hpca-matching/bin/python3 -m unittest tests.test_regressions
 ```
 
-`make reserve-reviewers` runs the reserve-reviewer path. It is independent of `make` and of every fingerprint cache, but its name probe fills the rate-limited `dblp_person_cache.json`; `--no-name-probe` is the offline dry run.
+`make reserve-need` sizes the reserve-reviewer shortfall. It is independent of `make` and of every fingerprint cache, needs no network, and is safe to run at any point.
 
 Use alternate `--out`, `--data`, `--fingerprint-cache`, and `--paper-cache` paths for experiments. Avoid deleting the rate-limited DBLP caches. `make clean-fingerprints` intentionally removes only embedding caches.
 

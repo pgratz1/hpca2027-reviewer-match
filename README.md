@@ -86,10 +86,10 @@ make complete-papers          # assignment-complete.txt
 make area-chairs-complete     # area_chair_assignment-complete.txt
 ```
 
-The PC is smaller than the submission volume needs, so `make reserve-reviewers`
-sizes the shortfall and turns HotCRP's `reserve_reviewer` nominations into a
-DBLP-resolved recruiting list in `reserve_reviewers.csv`. It touches neither
-the assignment nor the fingerprint caches and can be run at any time.
+The PC is smaller than the submission volume needs, so `make reserve-need`
+sizes the shortfall: how many reserve reviewers have to be recruited to cover
+it. It touches neither the assignment nor the fingerprint caches and can be run
+at any time. Recruiting the reserves themselves is done outside this repo.
 
 Make notes: `make PYTHON=python3` overrides the interpreter (the default is
 the venv above); `make clean-fingerprints` forces a full re-embed but never
@@ -292,32 +292,6 @@ several per-reserve loads so the one driving assumption is visible.
 ~/envs/hpca-matching/bin/python3 estimate_reserve_need.py --reviews-per-reserve 3
 ```
 
-### `extract_reserve_reviewers.py` — the reserve-reviewer candidate list
-Normalises HotCRP's free-text `reserve_reviewer` field — one senior author each
-submission nominates as callable-upon — into `reserve_reviewers.csv`
-(`name,email,affiliation,dblp,pid,nominating_pids,resolution`), one row per
-person, deduplicated across their nominations.
-
-A nomination identifies a person if the field contains an email, or (unless
-`--no-name-match`) if the whole field exactly matches one of the paper's
-authors; exemption text and multi-person fields fall out naturally. DBLP comes
-from the paper's own `dblp` field, a delimited list positionally aligned with
-`authors`. Positional indexing is trusted only when the list length equals the
-author count — about one paper in six disagrees. Otherwise, and when a person's
-nominations disagree about their PID, every PID on their papers is looked up in
-DBLP's person record and matched by name (accent-, initial-, and word-order
-insensitive; `--no-name-probe` skips the network entirely). Person names are
-cached in `dblp_person_cache.json`, so the probe is paid once.
-
-Candidates already on the PC (by email, or by PID under a different email) are
-dropped, as are those whose DBLP stays ambiguous or absent. Every dropped
-person is listed on stderr by reason, so borderline cases can be resolved by
-hand.
-```bash
-make reserve-reviewers            # estimate, then extract
-~/envs/hpca-matching/bin/python3 extract_reserve_reviewers.py --no-name-probe --out /tmp/dry.csv
-```
-
 ### `resolve_trc_members.py` — Training Review Committee roster
 
 Fills two columns into the TRC roster CSV (`hpca2027-trc - hpca2027-trc.csv`),
@@ -439,9 +413,8 @@ back into, so it is also hand-maintained.
 `dblp_venue_cache.json`, `fingerprints.json`,
 `area_chair_fingerprints.json`, `paper_fingerprints.json`,
 `reviewer_publications.json`, `publication_abstracts.json`,
-`dblp_person_cache.json`, `dblp_profile_cache.json`,
-`dblp_author_search_cache.json`, `reviewer_seniority.csv`, `assignment.txt`,
-`area_chair_assignment.txt`, `reserve_reviewers.csv`, and
+`dblp_profile_cache.json`, `dblp_author_search_cache.json`,
+`reviewer_seniority.csv`, `assignment.txt`, `area_chair_assignment.txt`, and
 experimental fingerprint caches such as `fingerprints-title-only.json`. The
 enrichment caches are rebuildable but expensive because live DBLP retrieval
 is rate-limited.

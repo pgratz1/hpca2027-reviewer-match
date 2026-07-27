@@ -22,7 +22,6 @@ import compare_abstract_rankings
 import dblp
 import enrich_publications
 import estimate_reserve_need
-import extract_reserve_reviewers
 import paper_matching
 import fingerprint
 import resolve_trc_members
@@ -636,83 +635,11 @@ class ReserveNeedTests(unittest.TestCase):
         self.assertEqual([7, 2, 15], caps)
 
 
-class ReserveExtractionTests(unittest.TestCase):
-    def paper(self, pid, reserve, authors, dblp=None):
-        return {"pid": pid, "reserve_reviewer": reserve, "authors": authors, "dblp": dblp}
+class DblpNameHelperTests(unittest.TestCase):
+    """dblp.py's name and `dblp`-field parsing, which the TRC matching rests on."""
 
-    AUTHORS = [
-        {"given_name": "Xiangfeng", "family_name": "Sun", "email": "xsunbv@connect.ust.hk",
-         "affiliation": "HKUST"},
-        {"given_name": "Ceyu", "family_name": "Xu", "email": "eeentropy@ust.hk",
-         "affiliation": "HKUST"},
-        {"given_name": "Yuan", "family_name": "Xie", "email": "yuanxie@ust.hk",
-         "affiliation": "HKUST"},
-    ]
-    DBLP = ("https://dblp.org/pid/345/0608.html; None; "
-            "https://dblp.org/pid/x/YuanXie.html")
-
-    def test_email_nomination_takes_the_authors_record_and_positional_pid(self):
-        papers = [self.paper(1, "Yuan Xie / HKUST / yuanxie@ust.hk", self.AUTHORS, self.DBLP)]
-        candidates, stats = extract_reserve_reviewers.collect_candidates(papers)
-        self.assertEqual(1, stats["nominations"])
-        candidate = candidates["yuanxie@ust.hk"]
-        self.assertEqual(("Yuan Xie", "HKUST"), (candidate.name, candidate.affiliation))
-        self.assertEqual({"x/YuanXie": 1}, dict(candidate.positional_pids))
-
-    def test_typoed_email_still_yields_a_person_but_no_positional_pid(self):
-        # The real data has "eentropy@ust.hk" (one 'e' short) for eeentropy@.
-        papers = [
-            self.paper(1, "Ceyu Xu / HKUST / eentropy@ust.hk", self.AUTHORS, self.DBLP)
-        ]
-        candidates, _ = extract_reserve_reviewers.collect_candidates(papers)
-        candidate = candidates["eentropy@ust.hk"]
-        self.assertEqual(("Ceyu Xu", "HKUST"), (candidate.name, candidate.affiliation))
-        self.assertEqual({}, dict(candidate.positional_pids))
-
-    def test_exemptions_and_multi_person_fields_name_nobody(self):
-        for reserve in (
-            "exempt", "Exempt", "N/A", "not applicable",
-            "exempt (Jiayi Huang is already on the main PC)",
-            "At least one senior author is already on the main or light program committee.",
-            "Chenxu Wang, Fengwei Zhang",
-            "Natalie Enright Jerger; Jiechen Zhao",
-        ):
-            with self.subTest(reserve=reserve):
-                candidates, stats = extract_reserve_reviewers.collect_candidates(
-                    [self.paper(1, reserve, self.AUTHORS, self.DBLP)]
-                )
-                self.assertEqual({}, candidates)
-                self.assertEqual(1, stats["unparseable"])
-
-    def test_bare_name_matches_one_author_and_recovers_their_email(self):
-        papers = [self.paper(1, "Ceyu Xu", self.AUTHORS, self.DBLP)]
-        candidates, _ = extract_reserve_reviewers.collect_candidates(papers)
-        self.assertEqual(["eeentropy@ust.hk"], list(candidates))
-        # The same field with name matching off names nobody.
-        candidates, stats = extract_reserve_reviewers.collect_candidates(
-            papers, allow_name_match=False
-        )
-        self.assertEqual(({}, 1), (candidates, stats["unparseable"]))
-
-    def test_a_name_matching_two_authors_is_dropped(self):
-        twins = [
-            {"given_name": "Yang", "family_name": "Wang", "email": "a@x.org"},
-            {"given_name": "Wang", "family_name": "Yang", "email": "b@x.org"},
-        ]
-        candidates, stats = extract_reserve_reviewers.collect_candidates(
-            [self.paper(1, "Yang Wang", twins, "1/A; 2/B")]
-        )
-        self.assertEqual(({}, 1), (candidates, stats["unparseable"]))
-
-    def test_blank_fields_are_counted_not_nominations(self):
-        papers = [self.paper(1, "", self.AUTHORS), self.paper(2, None, self.AUTHORS)]
-        candidates, stats = extract_reserve_reviewers.collect_candidates(papers)
-        self.assertEqual(({}, 2, 0), (candidates, stats["blank"], stats["nominations"]))
-
-
-class ReserveDblpResolutionTests(unittest.TestCase):
     def test_field_splits_on_either_delimiter_and_keeps_alignment(self):
-        split = extract_reserve_reviewers.split_dblp_field
+        split = dblp.split_dblp_field
         self.assertEqual(
             ["https://dblp.org/pid/345/0608.html", "", "https://dblp.org/pid/x/YuanXie.html"],
             split("https://dblp.org/pid/345/0608.html; None; https://dblp.org/pid/x/YuanXie.html"),
@@ -725,92 +652,13 @@ class ReserveDblpResolutionTests(unittest.TestCase):
         self.assertEqual(["", "58/292", "", "r/WonWooRo"], split("None; 58/292; N/A; r/WonWooRo;"))
         self.assertEqual([], split(None))
 
-    def test_positional_pid_is_refused_when_the_lengths_disagree(self):
-        authors = [
-            {"given_name": "A", "family_name": "One", "email": "a@x.org"},
-            {"given_name": "B", "family_name": "Two", "email": "b@x.org"},
-            {"given_name": "C", "family_name": "Three", "email": "c@x.org"},
-        ]
-        papers = [{
-            "pid": 1, "reserve_reviewer": "c@x.org", "authors": authors,
-            "dblp": "1/A; 2/B",  # two entries, three authors
-        }]
-        candidates, _ = extract_reserve_reviewers.collect_candidates(papers)
-        candidate = candidates["c@x.org"]
-        self.assertEqual({}, dict(candidate.positional_pids))
-        # Every listed PID stays available as a probe suspect.
-        self.assertEqual(["1/A", "2/B"], extract_reserve_reviewers.probe_pool(candidate))
-
     def test_name_tokens_fold_suffixes_initials_accents_and_order(self):
-        tokens = extract_reserve_reviewers.name_tokens
+        tokens = dblp.name_tokens
         self.assertEqual(tokens("Yang Wang 0089"), tokens("Yang Wang"))
         self.assertEqual(tokens("Matthew D. Sinclair"), tokens("Matthew Sinclair"))
-        self.assertEqual(tokens("José Renau"), tokens("Jose Renau"))
+        self.assertEqual(tokens("Jos\u00e9 Renau"), tokens("Jose Renau"))
         self.assertEqual(tokens("Won Woo Ro"), tokens("Ro Won Woo"))
         self.assertNotEqual(tokens("Zhe Jiang"), tokens("Hugo Jiang"))
-
-    def test_pid_homonym_variants_are_distinct_and_left_ambiguous(self):
-        candidate = extract_reserve_reviewers.Candidate(email="x@x.org")
-        candidate.names["Libo Huang"] = 2
-        candidate.positional_pids.update(["48/4863", "48/4863-2", "48/4863-2"])
-        pool = extract_reserve_reviewers.probe_pool(candidate)
-        self.assertEqual(["48/4863", "48/4863-2"], pool)
-        # Both DBLP records carry the same name, so the probe can't choose.
-        both = {"48/4863": ["Libo Huang"], "48/4863-2": ["Libo Huang 0002"]}
-        self.assertIsNone(extract_reserve_reviewers.probe_match(candidate, pool, both))
-        # One matching record resolves it.
-        one = {"48/4863": ["Libo Huang"], "48/4863-2": ["Bo Huang"]}
-        self.assertEqual("48/4863", extract_reserve_reviewers.probe_match(candidate, pool, one))
-
-    def test_rows_sharing_a_pid_merge_onto_the_most_nominated_address(self):
-        rows = [
-            {"name": "Ceyu Xu", "email": "eeentropy@ust.hk", "affiliation": "HKUST",
-             "dblp": "d", "pid": "314/7085", "nominating_pids": "1863",
-             "resolution": "positional"},
-            {"name": "Ceyu Xu", "email": "eentropy@ust.hk", "affiliation": "HKUST",
-             "dblp": "d", "pid": "314/7085", "nominating_pids": "1 109 263",
-             "resolution": "dblp-name-probe"},
-            {"name": "Solo", "email": "s@x.org", "affiliation": "", "dblp": "d",
-             "pid": "1/Solo", "nominating_pids": "7", "resolution": "positional"},
-        ]
-        merged, groups = extract_reserve_reviewers.merge_by_pid(rows)
-        self.assertEqual(2, len(merged))
-        self.assertEqual(1, len(groups))
-        person = next(r for r in merged if r["pid"] == "314/7085")
-        # The typo'd address carried three nominations, so it is the survivor,
-        # and every nominating paper is pooled and numerically sorted.
-        self.assertEqual("eentropy@ust.hk", person["email"])
-        self.assertEqual("1 109 263 1863", person["nominating_pids"])
-        self.assertEqual("dblp-name-probe+merged", person["resolution"])
-        self.assertEqual(rows[2], next(r for r in merged if r["pid"] == "1/Solo"))
-
-    def test_probe_pool_is_empty_once_the_positional_read_agrees(self):
-        candidate = extract_reserve_reviewers.Candidate(email="x@x.org")
-        candidate.positional_pids.update(["x/YuanXie", "x/YuanXie"])
-        self.assertEqual([], extract_reserve_reviewers.probe_pool(candidate))
-
-    def test_person_names_read_the_person_record_not_the_coauthors(self):
-        xml = (
-            b'<dblpperson name="Yang Wang 0089" pid="181/2842-89">'
-            b'<person key="homepages/181/2842-89">'
-            b'<author pid="181/2842-89">Yang Wang 0089</author>'
-            b'<author pid="181/2842-89">Y. Wang</author></person>'
-            b'<r><inproceedings><author>A Coauthor</author>'
-            b'<title>A paper</title><year>2025</year></inproceedings></r>'
-            b'</dblpperson>'
-        )
-        session = mock.Mock()
-        session.get.return_value = mock.Mock(status_code=200, content=xml)
-        cache = {}
-        names, source = dblp.fetch_person_names("181/2842-89", session=session, write_cache=cache)
-        self.assertEqual(["Yang Wang 0089", "Y. Wang"], names)
-        self.assertEqual("live", source)
-        self.assertEqual({"181/2842-89": ["Yang Wang 0089", "Y. Wang"]}, cache)
-        # Second call is served from the cache without touching the network.
-        session.get.reset_mock()
-        self.assertEqual((["Yang Wang 0089", "Y. Wang"], "cache"),
-                         dblp.fetch_person_names("181/2842-89", session=session, write_cache=cache))
-        session.get.assert_not_called()
 
 
 class FakeDblp:
@@ -1098,7 +946,7 @@ class TrcRosterTests(unittest.TestCase):
 
     def test_one_name_transliterated_two_ways_still_needs_confirming(self):
         compatible = resolve_trc_members.tokens_compatible
-        tokens = extract_reserve_reviewers.name_tokens
+        tokens = dblp.name_tokens
         self.assertEqual("partial", compatible(tokens("Maryam Elgamal"), tokens("Mariam Elgamal")))
         # One shared token is required, so unrelated short names stay apart.
         self.assertIsNone(compatible(tokens("Jing Li"), tokens("Jung Lee")))

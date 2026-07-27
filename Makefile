@@ -1,7 +1,7 @@
 # HPCA 2027 reviewer-paper matching pipeline.
 #
 #   make                  rebuild whatever is stale; final output: assignment.txt
-#   make reserve-reviewers size and extract the reserve-reviewer recruiting pool
+#   make reserve-need     size the reserve-reviewer shortfall
 #   make complete-papers   retain the pre-registration completeness filter
 #   make clean             remove assignment outputs
 #   make clean-fingerprints  force a full re-embed (e.g. after changing
@@ -32,7 +32,7 @@ REVIEWER_LIBS = reviewers.py dblp.py
 EMBED_LIBS = fingerprint.py specter2_model.py
 
 .DELETE_ON_ERROR:
-.PHONY: all enrich area-chairs reserve-reviewers complete-papers area-chairs-complete clean clean-fingerprints
+.PHONY: all enrich area-chairs reserve-need complete-papers area-chairs-complete clean clean-fingerprints
 
 all: reviewer_seniority.csv enrich fingerprints.json
 	$(PYTHON) build_fingerprints.py --csv "$(CSV)" --fingerprint-cache fingerprints.json
@@ -50,12 +50,12 @@ area-chairs:
 	$(PYTHON) assign_area_chairs.py --paper-policy $(PAPER_POLICY) \
 		--csv "$(AREA_CHAIR_CSV)" > area_chair_assignment.txt
 
-# Recruiting pool for the review-slot shortfall. Independent of the assignment
-# and of the fingerprint caches: pure HotCRP-field parsing plus DBLP identity
-# lookups, so it needs no GPU and is safe to run at any point.
-reserve-reviewers:
+# How many reserve reviewers the review-slot shortfall needs. Independent of
+# the assignment and of the fingerprint caches: pure arithmetic over the
+# selected papers and the PC's caps, no network and no GPU, so it is safe to
+# run at any point.
+reserve-need:
 	$(PYTHON) estimate_reserve_need.py --paper-policy $(PAPER_POLICY) --csv "$(CSV)"
-	$(PYTHON) extract_reserve_reviewers.py --csv "$(CSV)" --out reserve_reviewers.csv
 
 complete-papers: assignment-complete.txt
 
@@ -95,7 +95,7 @@ assignment-complete.txt: assign_reviewers.py paper_matching.py classify_reviewer
 
 clean:
 	rm -f assignment.txt area_chair_assignment.txt assignment-complete.txt \
-		area_chair_assignment-complete.txt reserve_reviewers.csv
+		area_chair_assignment-complete.txt
 
 clean-fingerprints:
 	rm -f fingerprints.json paper_fingerprints.json area_chair_fingerprints.json

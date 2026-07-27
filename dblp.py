@@ -17,6 +17,7 @@ import json
 import random
 import re
 import time
+import unicodedata
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Callable
@@ -41,6 +42,24 @@ _USER_AGENT = (
 )
 
 _DOI_RE = re.compile(r"10\.\d{4,9}/[^\s?#]+", re.IGNORECASE)
+
+# A submission's dblp field lists one entry per author. Its entries are
+# separated by ';', ',', or a newline — and often by ',\n' or ';\n' together,
+# which is ONE separator, not two. Collapsing only the newline-bearing runs
+# keeps a bare ';;' meaning "this author has no page", which is what makes the
+# positional alignment hold: matching the author count for 1,138 of the 1,354
+# papers that have the field, against 970 if ',\n' is read as two separators.
+# No DBLP URL or bare PID contains any of these characters, so one rule covers
+# every observed shape.
+_DBLP_SPLIT_RE = re.compile(r"[ \t]*(?:[;,][ \t]*\n|\n|[;,])[ \t]*")
+
+# Placeholders authors type for "this author has no DBLP page". Filtered before
+# parse_pid, whose bare-PID branch would happily read "N/A" as the PID "N/A".
+_DBLP_PLACEHOLDERS = {"", "-", "--", "n/a", "na", "none", "null", "no", "nil", "?"}
+
+# A trailing all-digit token is DBLP's homonym discriminator ("Yang Wang 0089"),
+# not part of the name.
+_HOMONYM_SUFFIX_RE = re.compile(r"\s+\d+$")
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +89,39 @@ def parse_pid(url: str) -> str | None:
             return bare.group(1) if bare else None
     match = _PID_RE.search(url)
     return match.group(1) if match else None
+
+
+def name_tokens(name: str) -> frozenset[str]:
+    """Comparable token set for a person's name.
+
+    Accent-folded and lowercased, with DBLP's homonym suffix and bare initials
+    dropped, so "Matthew D. Sinclair" matches "Matthew Sinclair" and a name
+    written family-first matches the same name written given-first (the common
+    case for CJK names in author lists). Returns a set, so token *order* never
+    matters — deliberate, since that ordering is exactly what varies.
+    """
+    name = _HOMONYM_SUFFIX_RE.sub("", name.strip())
+    folded = unicodedata.normalize("NFKD", name)
+    folded = "".join(c for c in folded if not unicodedata.combining(c))
+    tokens = re.findall(r"\w+", folded.lower())
+    return frozenset(t for t in tokens if len(t) > 1)
+
+
+def split_dblp_field(raw: str | None) -> list[str]:
+    """Split a paper's `dblp` field into one entry per author, placeholders kept.
+
+    Placeholder entries become "" rather than being dropped, so the list stays
+    positionally aligned with the author list — dropping them is what breaks
+    the alignment.
+    """
+    if not raw:
+        return []
+    entries = [e.strip() for e in _DBLP_SPLIT_RE.split(raw.strip())]
+    # A trailing delimiter yields one empty tail entry that is punctuation, not
+    # an author; anything else empty is a real "no DBLP page" slot.
+    while entries and entries[-1] == "":
+        entries.pop()
+    return ["" if e.lower() in _DBLP_PLACEHOLDERS else e for e in entries]
 
 
 # ---------------------------------------------------------------------------
@@ -511,106 +563,6 @@ def fetch_titles_for_pids(
         results[pid] = (titles, source)
         if on_result is not None:
             on_result(pid, titles, source)
-
-    return results
-
-
-def _fetch_person_names_from_dblp(
-    pid: str, session: requests.Session, *, base_url: str = "https://dblp.org"
-) -> list[str]:
-    """Fetch the canonical name and every alias DBLP records for a PID.
-
-    The root element carries the canonical name
-    (``<dblpperson name="Yang Wang 0089">``) and the nested ``<person>`` record
-    lists that name plus any aliases as ``<author>`` children. Both are
-    collected — a paper's author list may use an alias spelling — with the
-    canonical name first and duplicates removed in order. Only the ``<person>``
-    element's authors are read: the rest of the document is the publication
-    list, whose ``<author>`` elements are co-authors, not this person.
-    """
-    resp = get_with_retry(
-        session, f"{base_url}/pid/{pid}.xml", headers={"User-Agent": _USER_AGENT}
-    )
-    root = ET.fromstring(resp.content)
-
-    names: list[str] = []
-    canonical = (root.get("name") or "").strip()
-    if canonical:
-        names.append(canonical)
-    person = root.find("person")
-    for author in [] if person is None else person.findall("author"):
-        name = "".join(author.itertext()).strip()
-        if name:
-            names.append(name)
-
-    seen: set[str] = set()
-    return [n for n in names if not (n in seen or seen.add(n))]
-
-
-def fetch_person_names(
-    pid: str,
-    session: requests.Session | None = None,
-    write_cache: dict | None = None,
-) -> tuple[list[str], str]:
-    """Return every name DBLP knows for a PID (canonical first, then aliases).
-
-    Same cache-then-network shape as fetch_titles, minus the colleague cache —
-    that one stores publications only, not person names. Returns
-    (names, source) where source is 'cache' or 'live'.
-    """
-    if write_cache is not None and pid in write_cache:
-        return list(write_cache[pid]), "cache"
-    session = session or requests.Session()
-    names = _fetch_person_names_from_dblp(pid, session)
-    if write_cache is not None:
-        write_cache[pid] = names
-    return names, "live"
-
-
-def fetch_person_names_for_pids(
-    pids: list[str],
-    *,
-    session: requests.Session | None = None,
-    write_cache: dict | None = None,
-    cache_path: str | None = None,
-    delay: float = 3.0,
-    on_result: Callable[[str, list[str], str], None] | None = None,
-    on_error: Callable[[str, Exception], None] | None = None,
-) -> dict[str, tuple[list[str], str]]:
-    """Fetch person names for each PID in turn, applying fetch_person_names's cache order.
-
-    Mirror of fetch_titles_for_pids: jitters `delay` seconds between
-    consecutive *live* DBLP fetches (no delay when served from cache) and
-    persists `write_cache` to `cache_path` after every live fetch, so progress
-    survives an interruption. `on_result(pid, names, source)` and
-    `on_error(pid, exc)` are optional progress hooks. Returns
-    {pid: (names, source)} for the PIDs that succeeded; failed PIDs are
-    omitted.
-    """
-    session = session or requests.Session()
-    results: dict[str, tuple[list[str], str]] = {}
-    last_was_live = False
-
-    for pid in pids:
-        if last_was_live and delay:
-            jitter = random.uniform(-0.5, 0.5) * delay
-            time.sleep(max(0.5, delay + jitter))
-
-        try:
-            names, source = fetch_person_names(pid, session=session, write_cache=write_cache)
-        except Exception as exc:  # noqa: BLE001
-            last_was_live = False
-            if on_error is not None:
-                on_error(pid, exc)
-            continue
-
-        last_was_live = source == "live"
-        if last_was_live and write_cache is not None and cache_path is not None:
-            save_cache(write_cache, cache_path)
-
-        results[pid] = (names, source)
-        if on_result is not None:
-            on_result(pid, names, source)
 
     return results
 

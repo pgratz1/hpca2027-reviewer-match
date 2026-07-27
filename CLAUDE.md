@@ -28,10 +28,10 @@ contains spaces and parentheses — always quote it in shell commands).
 - `make area-chairs` is deliberately separate: it requires `assignment.txt`,
   builds 10-year chair fingerprints, and writes a chair-grouped
   `area_chair_assignment.txt` under hard COIs and the closest feasible loads.
-- `make reserve-reviewers` is also separate and independent of the assignment:
-  it sizes the review-slot shortfall and turns HotCRP's free-text
-  `reserve_reviewer` nominations into a DBLP-resolved `reserve_reviewers.csv`.
-  No GPU, no fingerprints — only HotCRP-field parsing and DBLP person lookups.
+- `make reserve-need` is also separate and independent of the assignment: it
+  sizes the review-slot shortfall, i.e. how many reserve reviewers have to be
+  recruited. No GPU, no fingerprints, no network — pure arithmetic. Recruiting
+  the reserves themselves happens outside this repo.
 - `make complete-papers` and `make area-chairs-complete` retain the former
   completeness filter in separate `*-complete.txt` artifacts.
 - Library modules (imported, never run): `reviewers.py`, `dblp.py`,
@@ -40,8 +40,7 @@ contains spaces and parentheses — always quote it in shell commands).
   `enrich_publications.py`, `assign_reviewers.py`, `score_papers.py`,
   `nearest_neighbors.py`, `compare_abstract_rankings.py`,
   `score_abstract_evaluation.py`, `assign_area_chairs.py`,
-  `estimate_reserve_need.py`, `extract_reserve_reviewers.py`,
-  `resolve_trc_members.py`, `main.py`.
+  `estimate_reserve_need.py`, `resolve_trc_members.py`, `main.py`.
 
 ## Architecture (filter-then-rank, then constrained assignment)
 
@@ -103,9 +102,9 @@ large shortage/relaxation reports are expected, not a bug.
   retryable. The DBLP caches (`dblp_cache.json`, `dblp_venue_cache.json`,
   `reviewer_publications.json`, read-only `dblp_pubs_cache.json`) are expensive to refill — live DBLP fetches are
   rate-limited (~3s jittered delay, 429 backoff ≥15s). Never delete them;
-  `make clean-fingerprints` deliberately spares them. `dblp_person_cache.json`
-  (PID → DBLP's canonical name and aliases) is the same kind of cache, filled
-  by `extract_reserve_reviewers.py`'s name probe.
+  `make clean-fingerprints` deliberately spares them. `dblp_profile_cache.json`
+  and `dblp_author_search_cache.json`, filled by `resolve_trc_members.py`, are
+  the same kind of cache.
 - `.env` may hold an optional `S2_API_KEY`; it and editor backup
   variants are ignored. Never print, inspect, or commit secret values.
 - `publication_exclusions.csv` is the hand-maintained, per-email DOI exclusion

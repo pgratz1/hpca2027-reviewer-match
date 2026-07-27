@@ -20,8 +20,8 @@ undisambiguated bucket page of 700+ papers under that bare name. So three
 independent routes propose candidate PIDs --
 
   1. *self-declared*: the student is an author on a submission, and that
-     submission's `dblp` field (positionally aligned with its author list, the
-     same read extract_reserve_reviewers.py trusts) names their page;
+     submission's `dblp` field (positionally aligned with its author list)
+     names their page;
   2. *co-author*: the student appears in their advisor's DBLP record, which
      lists every co-author with their PID;
   3. *search*: DBLP's author search, which is fuzzy and proposes near-misses.
@@ -60,8 +60,15 @@ from pathlib import Path
 
 import requests
 
-from dblp import _USER_AGENT, get_with_retry, load_cache, parse_pid, save_cache
-from extract_reserve_reviewers import author_name, name_tokens, split_dblp_field
+from dblp import (
+    _USER_AGENT,
+    get_with_retry,
+    load_cache,
+    name_tokens,
+    parse_pid,
+    save_cache,
+    split_dblp_field,
+)
 
 DEFAULT_TRC = "hpca2027-trc - hpca2027-trc.csv"
 DEFAULT_CSV = "HPCA'27 PC Member Acceptance Form (Responses) - Form Responses 1.csv"
@@ -117,7 +124,7 @@ _AFFILIATION_STOPWORDS = frozenset(
 def affiliation_tokens(text: str) -> frozenset[str]:
     """Distinctive tokens of an affiliation, for tie-breaking only.
 
-    Reuses name_tokens' accent folding, then drops the words that every
+    Reuses dblp.name_tokens' accent folding, then drops the words that every
     institution shares, so "University of California San Diego" and "UCSD"
     both keep what identifies them ({california, san, diego} / {ucsd}) — the
     comparison is an overlap test, never an equality test.
@@ -128,6 +135,11 @@ def affiliation_tokens(text: str) -> frozenset[str]:
 def split_advisor_names(raw: str) -> list[str]:
     """Split an advisor cell into the individual people it names."""
     return [part.strip() for part in _ADVISOR_SPLIT_RE.split(raw or "") if part.strip()]
+
+
+def author_name(author: dict) -> str:
+    """One name string from a HotCRP author/contact record."""
+    return f"{author.get('given_name') or ''} {author.get('family_name') or ''}".strip()
 
 
 def same_name_respelt(one: str, other: str) -> bool:
@@ -284,8 +296,7 @@ def index_self_declared_pids(papers: list[dict]) -> dict[str, Counter]:
     """{author email: Counter(pid)} read off the submissions' own `dblp` fields.
 
     The field is a delimited list positionally aligned with the author list, so
-    it is only read when its length matches the author count — the same rule
-    extract_reserve_reviewers.py applies, for the same reason: about one paper
+    it is only read when its length matches the author count: about one paper
     in six lists a different number of entries than authors, and indexing into
     those returns a co-author's page.
     """
