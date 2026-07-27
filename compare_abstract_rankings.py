@@ -20,7 +20,7 @@ from collections import defaultdict, deque
 import numpy as np
 
 import fingerprint as fp
-from paper_matching import eligible_scores, load_papers
+from paper_matching import PAPER_POLICIES, eligible_scores, load_papers
 from reviewers import load_reviewers
 
 DEFAULT_CSV = "HPCA'27 PC Member Acceptance Form (Responses) - Form Responses 1.csv"
@@ -57,6 +57,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--csv", default=DEFAULT_CSV)
     parser.add_argument("--data", default=DEFAULT_DATA)
+    parser.add_argument(
+        "--paper-policy", choices=PAPER_POLICIES, default="registered",
+        help="paper selection policy (default: registered)",
+    )
     parser.add_argument("--paper-cache", default=DEFAULT_PAPER_CACHE)
     parser.add_argument("--baseline-fingerprints", required=True)
     parser.add_argument("--enriched-fingerprints", required=True)
@@ -69,7 +73,7 @@ def main() -> int:
     if args.sample_size <= 0 or args.top <= 0:
         parser.error("--sample-size and --top must be greater than 0")
 
-    papers = load_papers(args.data)
+    papers = load_papers(args.data, paper_policy=args.paper_policy)
     paper_cache = fp.load_fingerprint_cache(args.paper_cache)
     missing = [str(p["pid"]) for p in papers if str(p["pid"]) not in paper_cache]
     if missing:

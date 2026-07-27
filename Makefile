@@ -1,14 +1,20 @@
 # HPCA 2027 reviewer-paper matching pipeline.
 #
 #   make                  rebuild whatever is stale; final output: assignment.txt
-#   make clean            remove assignment.txt
+#   make reserve-reviewers size and extract the reserve-reviewer recruiting pool
+#   make complete-papers   retain the pre-registration completeness filter
+#   make clean             remove assignment outputs
 #   make clean-fingerprints  force a full re-embed (e.g. after changing
 #                            --years / --area-weight policy); never touches
 #                            the rate-limited DBLP caches
 #
 # Override the interpreter with `make PYTHON=python3` if not using the venv.
+# assignment.txt and area_chair_assignment.txt cover the registered papers;
+# once HotCRP has real submissions, switch with
+# `make PAPER_POLICY=submitted` (and the same for `make area-chairs`).
 
 PYTHON ?= $(HOME)/envs/hpca-matching/bin/python3
+PAPER_POLICY ?= registered
 
 # Optional local secrets. This file is gitignored; variables must be exported
 # so enrich_publications.py can read them from its environment.
@@ -26,7 +32,7 @@ REVIEWER_LIBS = reviewers.py dblp.py
 EMBED_LIBS = fingerprint.py specter2_model.py
 
 .DELETE_ON_ERROR:
-.PHONY: all enrich area-chairs clean clean-fingerprints
+.PHONY: all enrich area-chairs reserve-reviewers complete-papers area-chairs-complete clean clean-fingerprints
 
 all: reviewer_seniority.csv enrich fingerprints.json
 	$(PYTHON) build_fingerprints.py --csv "$(CSV)" --fingerprint-cache fingerprints.json
@@ -41,7 +47,26 @@ area-chairs:
 		--years $(AREA_CHAIR_YEARS)
 	$(PYTHON) build_fingerprints.py --role area-chair --csv "$(AREA_CHAIR_CSV)" \
 		--fingerprint-cache area_chair_fingerprints.json --years $(AREA_CHAIR_YEARS)
-	$(PYTHON) assign_area_chairs.py --csv "$(AREA_CHAIR_CSV)" > area_chair_assignment.txt
+	$(PYTHON) assign_area_chairs.py --paper-policy $(PAPER_POLICY) \
+		--csv "$(AREA_CHAIR_CSV)" > area_chair_assignment.txt
+
+# Recruiting pool for the review-slot shortfall. Independent of the assignment
+# and of the fingerprint caches: pure HotCRP-field parsing plus DBLP identity
+# lookups, so it needs no GPU and is safe to run at any point.
+reserve-reviewers:
+	$(PYTHON) estimate_reserve_need.py --paper-policy $(PAPER_POLICY) --csv "$(CSV)"
+	$(PYTHON) extract_reserve_reviewers.py --csv "$(CSV)" --out reserve_reviewers.csv
+
+complete-papers: assignment-complete.txt
+
+area-chairs-complete: assignment-complete.txt
+	$(PYTHON) enrich_publications.py --role area-chair --csv "$(AREA_CHAIR_CSV)" \
+		--years $(AREA_CHAIR_YEARS)
+	$(PYTHON) build_fingerprints.py --role area-chair --csv "$(AREA_CHAIR_CSV)" \
+		--fingerprint-cache area_chair_fingerprints.json --years $(AREA_CHAIR_YEARS)
+	$(PYTHON) assign_area_chairs.py --paper-policy complete \
+		--reviewer-assignment assignment-complete.txt --csv "$(AREA_CHAIR_CSV)" \
+		> area_chair_assignment-complete.txt
 
 reviewer_publications.json publication_abstracts.json &: enrich_publications.py dblp.py reviewers.py $(CSV_DEP) dblp_overrides.csv
 	$(PYTHON) enrich_publications.py --csv "$(CSV)"
@@ -62,10 +87,15 @@ fingerprints.json: reviewer_publications.json publication_abstracts.json build_f
 # re-encoded inside this run, so paper_fingerprints.json needs no target.
 assignment.txt: assign_reviewers.py paper_matching.py classify_reviewers.py $(EMBED_LIBS) \
 		fingerprints.json reviewer_seniority.csv hpca2027-data.json
-	$(PYTHON) assign_reviewers.py --csv "$(CSV)" > $@
+	$(PYTHON) assign_reviewers.py --paper-policy $(PAPER_POLICY) --csv "$(CSV)" > $@
+
+assignment-complete.txt: assign_reviewers.py paper_matching.py classify_reviewers.py $(EMBED_LIBS) \
+		fingerprints.json reviewer_seniority.csv hpca2027-data.json
+	$(PYTHON) assign_reviewers.py --paper-policy complete --csv "$(CSV)" > $@
 
 clean:
-	rm -f assignment.txt area_chair_assignment.txt
+	rm -f assignment.txt area_chair_assignment.txt assignment-complete.txt \
+		area_chair_assignment-complete.txt reserve_reviewers.csv
 
 clean-fingerprints:
 	rm -f fingerprints.json paper_fingerprints.json area_chair_fingerprints.json

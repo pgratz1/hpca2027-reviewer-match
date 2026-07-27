@@ -10,7 +10,7 @@ The system is best understood as four layers:
 
 1. **Reviewer identity and metadata** — `reviewers.py` parses the acceptance CSV, keeps the latest submission per case-insensitive email, removes declines, applies hand-maintained DBLP overrides, and produces `Reviewer` records.
 2. **Evidence and representations** — `dblp.py` obtains publication histories; `classify_reviewers.py` derives seniority; `build_fingerprints.py`, `fingerprint.py`, and `specter2_model.py` derive normalized reviewer vectors.
-3. **Paper eligibility and affinity** — `paper_matching.py` filters incomplete papers, builds content-aware paper vectors, excludes conflicts, applies the area gate, and calculates cosine scores.
+3. **Paper selection, eligibility, and affinity** — `paper_matching.py` selects registered papers by default (non-withdrawn, with authors, a non-placeholder title, and an abstract of more than one sentence), builds content-aware paper vectors, excludes conflicts, applies the area gate, and calculates cosine scores. HotCRP-submitted-only selection and the legacy completeness filter are explicit alternate policies.
 4. **Assignment and reporting** — `assign_reviewers.py` distributes reviewers globally under load and composition constraints. The orthogonal area-chair path loads accepted chairs, builds 10-year fingerprints, and uses `assign_area_chairs.py` to maximize total affinity under hard COIs and balanced loads. `score_papers.py`, `nearest_neighbors.py`, and `main.py` provide diagnostic views of intermediate results.
 
 The normal data flow is:
@@ -31,6 +31,10 @@ HotCRP JSON --> paper_matching.py --> paper_fingerprints.json --> assign_reviewe
 `make` encodes this dependency order and is the preferred entry point.
 After the reviewer assignment exists, `make area-chairs` runs the independent
 chair enrichment, fingerprint, and assignment path.
+Both honor `PAPER_POLICY` (default `registered`); use
+`make PAPER_POLICY=submitted` once HotCRP has real submissions.
+`make complete-papers` and `make area-chairs-complete` produce separate
+legacy-policy artifacts without overwriting those defaults.
 
 ## Module map
 
@@ -38,7 +42,7 @@ chair enrichment, fingerprint, and assignment path.
 
 - `reviewers.py` is the canonical reviewer loader used throughout the project. CSV headers are found by case-insensitive substring rather than exact spelling. Missing expected columns fail loudly. Repeat form submissions are resolved by timestamp before acceptance status is evaluated.
 - `dblp_overrides.csv` is the durable, email-keyed identity correction layer. A valid nonblank override wins over the form's DBLP value. The file is sensitive, hand-maintained, and gitignored.
-- `dblp.py` has no CSV knowledge. It parses several PID formats, reads title-only and rich-publication caches, fetches DBLP XML from official mirrors when necessary, retries rate limits, and writes live results atomically after each successful fetch.
+- `dblp.py` has no CSV knowledge. It parses several PID formats, reads title-only and rich-publication caches, fetches DBLP XML from official mirrors when necessary, retries rate limits, and writes live results atomically after each successful fetch. `fetch_person_names` is the third view of the same person XML alongside titles and rich records: it reads only the nested `<person>` element, whose `<author>` children are the canonical name and its aliases, never the co-authors listed on the publications.
 
 ### Seniority
 
@@ -53,7 +57,8 @@ chair enrichment, fingerprint, and assignment path.
 - `fingerprint.py` supplies SPECTER2's `title [SEP] abstract` document shape and normalized weighted pooling. A reviewer is represented by one document per recent DBLP publication plus one area/keyword document; publications without a cached abstract fall back to title-only.
 - `build_fingerprints.py` orchestrates researcher fetching and encoding for reviewer and area-chair form schemas. Researchers without usable recent publications receive an area-only vector. Cache entries are keyed by normalized email and record schema/provenance, selected publications and abstracts, PID presence, and DBLP fetch completeness. `--no-abstracts` builds a controlled title-only baseline when paired with a separate cache path.
 - `paper_matching.py` represents each paper with two documents: title plus abstract, and the topic list. Their pooled vector is normalized, so dot products against reviewer vectors are cosine similarities.
-- `assign_area_chairs.py` independently assigns reviewer-assigned papers to accepted area chairs. It reuses the publication and paper caches, excludes HotCRP conflicts, and maximizes global SPECTER2 affinity within a ±10% chair-load band.
+- `assign_area_chairs.py` independently assigns reviewer-assigned papers to accepted area chairs. It reuses the publication and paper caches, excludes HotCRP conflicts, and maximizes global SPECTER2 affinity within a ±10% chair-load band or the closest integer balance when that band is infeasible.
+- `estimate_reserve_need.py` and `extract_reserve_reviewers.py` form the reserve-reviewer path, which uses no embeddings at all. The first is arithmetic over the selected papers and the PC's per-member caps and produces a floor on the cohort size, since it ignores COI and the area gate. The second normalizes HotCRP's free-text `reserve_reviewer` field into a person-per-row list. Its two identity problems are handled separately: the *person* comes from an email in the field or an exact name match against the paper's authors, and the *DBLP PID* comes from the paper's positionally aligned `dblp` list, which is trusted only when its entry count equals the author count. Everything else is settled by looking the candidate PIDs up in DBLP and comparing person names, or dropped and reported.
 - `publication_exclusions.csv` provides reversible per-email DOI exclusions before reviewer or area-chair publication embeddings are pooled; the exclusion list participates in fingerprint freshness through the filtered publication content.
 
 All fingerprint caches store versioned provenance keys. Paper keys cover title, abstract, topics, area weight, and model identifiers. Researcher keys cover identity, declared metadata, the post-exclusion publication set and abstracts, embedding policy, and model identifiers. Legacy entries rebuild once, and transient DBLP/API failures remain marked for retry. `make clean-fingerprints` remains available when an explicit full rebuild is desired.
@@ -82,13 +87,21 @@ Earlier phases are frozen. This preserves the composition policy but means the f
 
 - Email is the reviewer identity key and is normalized to lowercase.
 - The latest Google Forms row per email is authoritative, including a later decline.
-- Paper-side tools ignore entries without an abstract or with a title shorter than three words.
+- Paper-side tools select the registered papers by default: not withdrawn,
+  at least one author, a title of at least one word that isn't just "test",
+  and an abstract of more than one sentence. Topics are not required.
+- `--paper-policy submitted` selects exactly `status == "submitted"`,
+  independent of title, abstract, topics, authors, or auxiliary flags, and
+  is the policy whose assignments must be complete.
+- `--paper-policy complete` retains the old completeness and withdrawn checks.
 - COI is never released. Area overlap is a hard gate in the normal assignment phases, not a score component; it may be released per paper by the documented shortage ladder.
 - Primary and secondary reviewer areas count for eligibility; tertiary does not.
 - Fingerprint vectors are L2-normalized, so matrix dot products are cosine similarity.
 - DBLP cache priority is colleague read-only cache, local writable cache, then live DBLP.
 - Cache writes use temporary files plus replacement; reruns should be idempotent.
-- Under-filled papers without topics appear in the shortage report under `Unspecified/no matching topic`.
+- Submitted assignments fail rather than retaining a partial reviewer slate.
+  Under-filled legacy papers without topics appear in the shortage report
+  under `Unspecified/no matching topic`.
 - Results belong on stdout; progress, warnings, and summaries generally belong on stderr. `assignment.txt` is produced by redirecting assignment stdout.
 - Real reviewer and paper data, overrides, caches, classifications, and assignments contain sensitive information and must not be committed.
 
@@ -107,14 +120,17 @@ This builds seniority, reviewer fingerprints, and the final assignment when thei
 ~/envs/hpca-matching/bin/python3 build_fingerprints.py --limit 10
 ~/envs/hpca-matching/bin/python3 score_papers.py --pid 8 --top 10
 ~/envs/hpca-matching/bin/python3 nearest_neighbors.py --email someone@example.com
+~/envs/hpca-matching/bin/python3 extract_reserve_reviewers.py --no-name-probe --out /tmp/dry.csv
 ~/envs/hpca-matching/bin/python3 -m unittest tests.test_regressions
 ```
+
+`make reserve-reviewers` runs the reserve-reviewer path. It is independent of `make` and of every fingerprint cache, but its name probe fills the rate-limited `dblp_person_cache.json`; `--no-name-probe` is the offline dry run.
 
 Use alternate `--out`, `--data`, `--fingerprint-cache`, and `--paper-cache` paths for experiments. Avoid deleting the rate-limited DBLP caches. `make clean-fingerprints` intentionally removes only embedding caches.
 
 ## Maintenance notes
 
-The regression suite in `tests/test_regressions.py` covers enrichment fallback and cache behavior, fingerprint provenance, evaluation utilities, completeness filtering, policy validation, and assignment invariants. Validation also includes deterministic reruns and the self-check summary at the end of a full `make`; a successful process exit alone is insufficient for matching-logic changes.
+The regression suite in `tests/test_regressions.py` covers enrichment and cache behavior, fingerprint provenance, registered/submitted/completeness paper selection, evaluation utilities, policy validation, and assignment invariants. Validation also includes deterministic reruns and the self-check summary at the end of a full `make`; a successful process exit alone is insufficient for matching-logic changes.
 
 For the abstract experiment, `compare_abstract_rankings.py` creates a blinded,
 topic-stratified rating sheet and a separate rank key. After chair ratings are
@@ -128,7 +144,7 @@ Good extension points are intentionally narrow:
 - CSV interpretation and reviewer fields belong in `reviewers.py`.
 - DBLP parsing, retry, and cache behavior belong in `dblp.py`.
 - embedding mechanics belong in `specter2_model.py` and `fingerprint.py`;
-- shared paper completeness, fingerprinting, conflict, and area policy belong in `paper_matching.py`;
+- shared paper selection, fingerprinting, conflict, and area policy belong in `paper_matching.py`;
 - global capacity and seniority policy belong in `assign_reviewers.py`.
 
 When adding command-line behavior, follow the existing style: a useful module docstring reused by `argparse`, module-level default constants, explicit flags for tunable policy, and simple standard-library data handling rather than a framework. Before committing, inspect `git status` carefully because nearly all operational data is intentionally ignored and the only expected tracked changes are code and documentation.

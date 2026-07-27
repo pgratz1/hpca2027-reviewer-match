@@ -1,6 +1,7 @@
 # PII / PII-derived — real PC member data
 HPCA'27 PC Member Acceptance Form (Responses) - Form Responses 1.csv
 Area Chair Acceptance Form (Responses) - Form Responses 1.csv
+hpca2027-trc*.csv
 PCDB_with_emails.csv
 fingerprints.json
 fingerprints-*.json
@@ -14,6 +15,10 @@ no_dblp_lookup_report.csv
 manual_review_report*.csv
 final_identity_resolution.csv
 dblp_venue_cache.json
+dblp_person_cache.json
+dblp_profile_cache.json
+dblp_author_search_cache.json
+reserve_reviewers.csv
 reviewer_publications.json
 publication_abstracts.json
 reviewer_seniority.csv
@@ -21,6 +26,8 @@ dblp_overrides.csv
 publication_exclusions.csv
 assignment.txt
 area_chair_assignment.txt
+assignment-complete.txt
+area_chair_assignment-complete.txt
 abstract-evaluation*.csv
 
 # Test fixture with a placeholder author email, not core project data
@@ -39,7 +46,15 @@ resume_codex.txt
 .env~
 .env.*
 restart.txt
+codex_resume.txt
+resume_claude.txt
+prompt_*.txt
 .claude/
 __pycache__/
 *.pyc
+# Atomic-write scratch files (tmp + replace); left behind only by a crash
+*.tmp
+# Editor backups
+*~
 \#*\#
+.~lock.*\#

@@ -1,4 +1,4 @@
-"""Shared paper-fingerprinting and eligibility logic for the paper-scoring scripts.
+"""Shared paper selection, fingerprinting, and eligibility logic.
 
 Used by both score_papers.py (independent per-paper top-N ranking) and
 assign_reviewers.py (global load-capped assignment across all papers), so
@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sys
 
 import numpy as np
@@ -17,6 +18,50 @@ import fingerprint as fp
 import specter2_model
 
 PAPER_FINGERPRINT_SCHEMA_VERSION = 2
+PAPER_POLICIES = ("registered", "submitted", "complete")
+
+# A registered paper needs an abstract of more than one sentence and a title
+# that isn't one of these stand-ins for an unwritten one (compared lowercased).
+MIN_ABSTRACT_SENTENCES = 2
+PLACEHOLDER_TITLES = {"test"}
+
+_SENTENCE_RE = re.compile(r"[.!?]+")
+
+
+def _is_withdrawn(paper: dict) -> bool:
+    return bool(paper.get("withdrawn")) or str(paper.get("status") or "") == "withdrawn"
+
+
+def _sentence_count(text: str) -> int:
+    """Sentences in `text`: `.!?`-separated chunks that contain a letter.
+
+    Deliberately crude — it only has to tell a real abstract from a
+    placeholder like "TBD", "1. 2. 3." or "Abstract goes here."
+    """
+    return sum(1 for chunk in _SENTENCE_RE.split(text) if any(c.isalpha() for c in chunk))
+
+
+def registration_gaps(paper: dict) -> list[str]:
+    """Reasons a registered paper isn't real enough to assign reviewers to.
+
+    HotCRP status stays "draft" until the submission deadline, so before it a
+    paper counts as registered on its content: at least one author, a title of
+    at least one non-placeholder word, and an abstract of more than one
+    sentence. Withdrawn papers need no reviewers.
+    """
+    gaps = []
+    title = (paper.get("title") or "").strip()
+    if not title.split():
+        gaps.append("no title")
+    elif title.lower() in PLACEHOLDER_TITLES:
+        gaps.append("placeholder title")
+    if _sentence_count(paper.get("abstract") or "") < MIN_ABSTRACT_SENTENCES:
+        gaps.append(f"abstract under {MIN_ABSTRACT_SENTENCES} sentences")
+    if not paper.get("authors"):
+        gaps.append("no authors")
+    if _is_withdrawn(paper):
+        gaps.append("withdrawn")
+    return gaps
 
 
 def completeness_gaps(paper: dict) -> list[str]:
@@ -35,35 +80,54 @@ def completeness_gaps(paper: dict) -> list[str]:
         gaps.append("no topics")
     if not paper.get("authors"):
         gaps.append("no authors")
-    if paper.get("withdrawn"):
+    if _is_withdrawn(paper):
         gaps.append("withdrawn")
     return gaps
 
 
-def load_papers(path: str, *, with_skipped: bool = False):
-    """Assignable papers from the HotCRP export, `completeness_gaps` applied.
+def selection_gaps(paper: dict, paper_policy: str) -> list[str]:
+    """Reasons `paper` is excluded under the requested selection policy."""
+    if paper_policy == "registered":
+        return registration_gaps(paper)
+    if paper_policy == "submitted":
+        status = str(paper.get("status") or "missing")
+        return [] if status == "submitted" else [f"status {status}"]
+    if paper_policy == "complete":
+        return completeness_gaps(paper)
+    raise ValueError(
+        f"unknown paper policy {paper_policy!r}; expected one of {', '.join(PAPER_POLICIES)}"
+    )
+
+
+def load_papers(
+    path: str, *, paper_policy: str = "registered", with_skipped: bool = False
+):
+    """Select assignable papers from a HotCRP export.
 
     With `with_skipped=True` returns `(papers, skipped)` instead, where
     `skipped` is `[{pid, title, missing}, ...]` for the exclusion report.
+    The default ``registered`` policy takes every non-withdrawn paper whose
+    content is real (see `registration_gaps`); ``submitted`` trusts HotCRP
+    status alone, and ``complete`` preserves the older completeness checks.
     """
     with open(path, encoding="utf-8") as f:
         papers = json.load(f)
-    complete, skipped = [], []
+    selected, skipped = [], []
     for p in papers:
-        gaps = completeness_gaps(p)
+        gaps = selection_gaps(p, paper_policy)
         if gaps:
             skipped.append({"pid": p["pid"], "title": p.get("title") or "", "missing": gaps})
         else:
-            complete.append(p)
+            selected.append(p)
     if skipped:
         print(
-            f"Skipping {len(skipped)} papers (incomplete or withdrawn); "
-            f"{len(complete)} of {len(papers)} remain",
+            f"Skipping {len(skipped)} papers under the {paper_policy} policy; "
+            f"{len(selected)} of {len(papers)} remain",
             file=sys.stderr,
         )
     if with_skipped:
-        return complete, skipped
-    return complete
+        return selected, skipped
+    return selected
 
 
 def _doc_key(paper: dict, area_weight: float = 1.0) -> str:

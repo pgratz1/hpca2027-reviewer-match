@@ -35,13 +35,20 @@ acceptance CSV ──▶ reviewers.py (+ dblp_overrides.csv)
 paper JSON ──▶ paper_matching.py ──▶ paper_fingerprints.json ───────────┘    assign_reviewers.py
 ```
 
-**Paper-completeness policy:** until the registration deadline, any paper in
-`hpca2027-data.json` with a title under 3 words or missing its abstract,
-topics, or authors is a placeholder; withdrawn papers need no reviewers.
-`paper_matching.load_papers` (via `completeness_gaps`) drops them all, so
-every paper-side tool sees only assignable papers (skip count reported to
-stderr; `assign_reviewers.py` itemizes them in its relaxation & exclusion
-report).
+**Paper-selection policy:** by default (`--paper-policy registered`), every
+paper-side tool processes the *registered* papers — every record that has not
+been withdrawn, has at least one author, a title of at least one word that
+isn't just "test", and an abstract of more than one sentence. HotCRP `status`
+stays `draft` until the submission deadline, so before it the content is what
+distinguishes a real registration from a placeholder; topics are not
+required (a topicless paper simply relies on the area-gate release).
+
+Two alternate policies stay available: `--paper-policy submitted` selects
+exactly the records whose HotCRP `status` is `submitted`, ignoring all other
+metadata, and requires that every such paper receive a full reviewer slate
+and one area chair — switch to it once submissions are in. `--paper-policy
+complete` retains the older title-≥3-words/abstract/topics/authors and
+withdrawn checks.
 
 ## Start-to-finish workflow
 
@@ -67,6 +74,22 @@ The equivalent manual commands, in dependency order:
 ~/envs/hpca-matching/bin/python3 build_fingerprints.py
 ~/envs/hpca-matching/bin/python3 assign_reviewers.py > assignment.txt
 ```
+
+Once HotCRP has real submissions, build the submitted-only assignment with
+`make PAPER_POLICY=submitted` (and `make PAPER_POLICY=submitted area-chairs`);
+`PAPER_POLICY` defaults to `registered` and feeds both targets. To reproduce
+the former completeness-based selection in its own artifacts, without
+overwriting `assignment.txt`:
+
+```bash
+make complete-papers          # assignment-complete.txt
+make area-chairs-complete     # area_chair_assignment-complete.txt
+```
+
+The PC is smaller than the submission volume needs, so `make reserve-reviewers`
+sizes the shortfall and turns HotCRP's `reserve_reviewer` nominations into a
+DBLP-resolved recruiting list in `reserve_reviewers.csv`. It touches neither
+the assignment nor the fingerprint caches and can be run at any time.
 
 Make notes: `make PYTHON=python3` overrides the interpreter (the default is
 the venv above); `make clean-fingerprints` forces a full re-embed but never
@@ -207,7 +230,7 @@ a sanity check that fingerprints cluster by topic.
 ```
 
 ### `score_papers.py` — rank reviewers per paper (unconstrained)
-Fingerprints each complete paper and prints its top-N reviewers by cosine
+Fingerprints each selected paper and prints its top-N reviewers by cosine
 similarity, after excluding COI (`pc_conflicts`) and applying the area gate
 (reviewer primary/secondary ∩ paper topics; `--no-area-gate` disables).
 Per-paper and independent — no load awareness.
@@ -244,12 +267,92 @@ that stay unfilled even after relaxation (papers without topics appear under
 `Unspecified/no matching topic`); the **match goodness** section ranks all
 papers worst-first by the mean similarity of their assigned reviewers; and a
 **relaxation & exclusion report** itemizes every skipped paper (what's
-missing, or withdrawn) and every relaxed paper, reviewer by reviewer with
-the released constraint and score. `--no-seniority` skips the seniority
+missing, or withdrawn) under the registered and complete policies, and every
+relaxed paper, reviewer by reviewer with the released constraint and score.
+Under `--paper-policy submitted`, non-submitted records are summarized by
+status instead and any unfilled submitted paper makes the command fail; the
+registered policy expects shortages, since the registered set is far larger
+than the PC's total review capacity. `--no-seniority` skips the seniority
 constraints and criteria report (single-pass assignment; the area release
 for under-filled papers still applies).
 ```bash
 ~/envs/hpca-matching/bin/python3 assign_reviewers.py --light-cap 7 --full-cap 15 --reviewers-per-paper 6
+```
+
+### `estimate_reserve_need.py` — size the reserve-reviewer cohort
+Pure arithmetic on the selected papers and the PC's per-member caps: how many
+review slots the papers need, how many the PC supplies, and how many reserve
+reviewers close the gap at `--reviews-per-reserve` (default 4) reviews each. No
+embeddings, no network, no GPU. It ignores COI and the area gate, so the count
+is a *floor*; pass `--unfilled-slots N` to size the cohort against
+`assign_reviewers.py`'s shortage-report total instead. Prints the cohort size at
+several per-reserve loads so the one driving assumption is visible.
+```bash
+~/envs/hpca-matching/bin/python3 estimate_reserve_need.py
+~/envs/hpca-matching/bin/python3 estimate_reserve_need.py --reviews-per-reserve 3
+```
+
+### `extract_reserve_reviewers.py` — the reserve-reviewer candidate list
+Normalises HotCRP's free-text `reserve_reviewer` field — one senior author each
+submission nominates as callable-upon — into `reserve_reviewers.csv`
+(`name,email,affiliation,dblp,pid,nominating_pids,resolution`), one row per
+person, deduplicated across their nominations.
+
+A nomination identifies a person if the field contains an email, or (unless
+`--no-name-match`) if the whole field exactly matches one of the paper's
+authors; exemption text and multi-person fields fall out naturally. DBLP comes
+from the paper's own `dblp` field, a delimited list positionally aligned with
+`authors`. Positional indexing is trusted only when the list length equals the
+author count — about one paper in six disagrees. Otherwise, and when a person's
+nominations disagree about their PID, every PID on their papers is looked up in
+DBLP's person record and matched by name (accent-, initial-, and word-order
+insensitive; `--no-name-probe` skips the network entirely). Person names are
+cached in `dblp_person_cache.json`, so the probe is paid once.
+
+Candidates already on the PC (by email, or by PID under a different email) are
+dropped, as are those whose DBLP stays ambiguous or absent. Every dropped
+person is listed on stderr by reason, so borderline cases can be resolved by
+hand.
+```bash
+make reserve-reviewers            # estimate, then extract
+~/envs/hpca-matching/bin/python3 extract_reserve_reviewers.py --no-name-probe --out /tmp/dry.csv
+```
+
+### `resolve_trc_members.py` — Training Review Committee roster
+
+Fills two columns into the TRC roster CSV (`hpca2027-trc - hpca2027-trc.csv`),
+the cohort of PhD students reviewing alongside the PC: `DBLP` (the student's
+page, the identity every fingerprint here is built from) and `Advisor HotCRP
+Email` (their advisor's account — a student inherits their advisor's conflicts).
+Existing values in either column are left alone unless `--overwrite`; the file
+is both the input and the output, so hand edits survive a rerun.
+
+Advisor emails are resolved offline: the PC acceptance form first (its first
+question *is* "confirm your HotCRP email address", so it is authoritative even
+for those who declined — and those rows, which leave every other column blank,
+are still matched when the address's local part names them and its domain is
+their institution), then the author and contact lists of the submissions. Where
+one name matches several accounts, the roster's advisor-affiliation cell breaks
+the tie; where it can't, the cell stays blank and is reported. Advisors
+reachable at more than one HotCRP address are listed separately, since the
+conflict may need all of them.
+
+Student DBLP identities are proposed by three independent routes — the `dblp`
+field of a submission the student is an author on, the co-author list of their
+advisor's DBLP record, and DBLP's author search — and then verified against the
+candidate's own record. A page is only accepted if its name matches and its
+publication count is plausible for a student: DBLP keeps *undisambiguated*
+pages under bare common names (its "Cheng Chen" holds 725 papers by many
+people), and fingerprinting one of those would poison the matching. Names that
+are one person spelt two ways ("Maryam"/"Mariam") are matched only when
+co-authorship with the advisor confirms them; same-named co-authors of one
+advisor are separated by DBLP's recorded affiliation. Anything still ambiguous
+is left blank and reported with the pages that were considered. Two caches,
+`dblp_profile_cache.json` and `dblp_author_search_cache.json`, make reruns free.
+```bash
+~/envs/hpca-matching/bin/python3 resolve_trc_members.py
+~/envs/hpca-matching/bin/python3 resolve_trc_members.py --out /tmp/dry-run.csv
+~/envs/hpca-matching/bin/python3 resolve_trc_members.py --no-network   # caches only
 ```
 
 ### `assign_area_chairs.py` — balanced area-chair assignment
@@ -258,15 +361,18 @@ This is an independent workflow layered on the completed reviewer assignment.
 It loads accepted responses from the area-chair form, builds research
 fingerprints with the same DBLP-publication, Semantic Scholar abstract, and
 declared-area policy used for reviewers, and assigns every paper with at least
-one reviewer to one area chair. HotCRP conflicts are hard exclusions.
+one reviewer to one area chair. Pass it the same `--paper-policy` the
+reviewer assignment used; under `submitted`, that assignment must cover the
+complete submitted-paper set. HotCRP conflicts are hard exclusions.
 
 Area-chair profiles use a 10-year publication window (reviewer profiles retain
 their four-year default), giving the smaller chair pool a deeper research
 history. The optimizer maximizes total SPECTER2 cosine affinity globally while
-keeping each chair within 10% of the mean load (integer bounds are rounded
-inward). The report is grouped by area chair, with assigned paper IDs, titles,
-topics, and scores beneath each chair, followed by affinity, conflict,
-coverage, and load-bound checks.
+keeping each chair within 10% of the mean load when integer bounds permit it.
+Otherwise it uses the closest possible floor/ceiling balance; for 56 papers
+and 15 chairs, loads are 3–4. The report is grouped by area chair, with
+assigned paper IDs, titles, topics, and scores beneath each chair, followed by
+affinity, conflict, coverage, and load-bound checks.
 
 ```bash
 make area-chairs
@@ -314,7 +420,7 @@ It absorbed the output of a retired semi-automated lookup chain
 
 `reviewers.py` (acceptance-CSV parsing, duplicate-submission collapsing,
 override application) · `dblp.py` (DBLP fetch, caching, rate limiting) ·
-`paper_matching.py` (paper loading + completeness filter, eligibility) ·
+`paper_matching.py` (paper selection, fingerprinting, and eligibility) ·
 `fingerprint.py` / `specter2_model.py` (embedding plumbing).
 
 ## Data files
@@ -323,7 +429,9 @@ override application) · `dblp.py` (DBLP fetch, caching, rate limiting) ·
 exports — real names and emails, treat as sensitive), `hpca2027-data.json`
 (HotCRP paper export), `dblp_pubs_cache.json` (colleague's read-only rich DBLP
 cache), and `PCDB_with_emails.csv` (PC-service history with emails — also
-sensitive).
+sensitive). `hpca2027-trc - hpca2027-trc.csv` is the Training Review Committee
+roster: an input that `resolve_trc_members.py` writes its two resolved columns
+back into, so it is also hand-maintained.
 
 **Hand-maintained:** `dblp_overrides.csv`, `publication_exclusions.csv`.
 
@@ -331,7 +439,9 @@ sensitive).
 `dblp_venue_cache.json`, `fingerprints.json`,
 `area_chair_fingerprints.json`, `paper_fingerprints.json`,
 `reviewer_publications.json`, `publication_abstracts.json`,
-`reviewer_seniority.csv`, `assignment.txt`, `area_chair_assignment.txt`, and
+`dblp_person_cache.json`, `dblp_profile_cache.json`,
+`dblp_author_search_cache.json`, `reviewer_seniority.csv`, `assignment.txt`,
+`area_chair_assignment.txt`, `reserve_reviewers.csv`, and
 experimental fingerprint caches such as `fingerprints-title-only.json`. The
 enrichment caches are rebuildable but expensive because live DBLP retrieval
 is rate-limited.

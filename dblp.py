@@ -515,6 +515,106 @@ def fetch_titles_for_pids(
     return results
 
 
+def _fetch_person_names_from_dblp(
+    pid: str, session: requests.Session, *, base_url: str = "https://dblp.org"
+) -> list[str]:
+    """Fetch the canonical name and every alias DBLP records for a PID.
+
+    The root element carries the canonical name
+    (``<dblpperson name="Yang Wang 0089">``) and the nested ``<person>`` record
+    lists that name plus any aliases as ``<author>`` children. Both are
+    collected — a paper's author list may use an alias spelling — with the
+    canonical name first and duplicates removed in order. Only the ``<person>``
+    element's authors are read: the rest of the document is the publication
+    list, whose ``<author>`` elements are co-authors, not this person.
+    """
+    resp = get_with_retry(
+        session, f"{base_url}/pid/{pid}.xml", headers={"User-Agent": _USER_AGENT}
+    )
+    root = ET.fromstring(resp.content)
+
+    names: list[str] = []
+    canonical = (root.get("name") or "").strip()
+    if canonical:
+        names.append(canonical)
+    person = root.find("person")
+    for author in [] if person is None else person.findall("author"):
+        name = "".join(author.itertext()).strip()
+        if name:
+            names.append(name)
+
+    seen: set[str] = set()
+    return [n for n in names if not (n in seen or seen.add(n))]
+
+
+def fetch_person_names(
+    pid: str,
+    session: requests.Session | None = None,
+    write_cache: dict | None = None,
+) -> tuple[list[str], str]:
+    """Return every name DBLP knows for a PID (canonical first, then aliases).
+
+    Same cache-then-network shape as fetch_titles, minus the colleague cache —
+    that one stores publications only, not person names. Returns
+    (names, source) where source is 'cache' or 'live'.
+    """
+    if write_cache is not None and pid in write_cache:
+        return list(write_cache[pid]), "cache"
+    session = session or requests.Session()
+    names = _fetch_person_names_from_dblp(pid, session)
+    if write_cache is not None:
+        write_cache[pid] = names
+    return names, "live"
+
+
+def fetch_person_names_for_pids(
+    pids: list[str],
+    *,
+    session: requests.Session | None = None,
+    write_cache: dict | None = None,
+    cache_path: str | None = None,
+    delay: float = 3.0,
+    on_result: Callable[[str, list[str], str], None] | None = None,
+    on_error: Callable[[str, Exception], None] | None = None,
+) -> dict[str, tuple[list[str], str]]:
+    """Fetch person names for each PID in turn, applying fetch_person_names's cache order.
+
+    Mirror of fetch_titles_for_pids: jitters `delay` seconds between
+    consecutive *live* DBLP fetches (no delay when served from cache) and
+    persists `write_cache` to `cache_path` after every live fetch, so progress
+    survives an interruption. `on_result(pid, names, source)` and
+    `on_error(pid, exc)` are optional progress hooks. Returns
+    {pid: (names, source)} for the PIDs that succeeded; failed PIDs are
+    omitted.
+    """
+    session = session or requests.Session()
+    results: dict[str, tuple[list[str], str]] = {}
+    last_was_live = False
+
+    for pid in pids:
+        if last_was_live and delay:
+            jitter = random.uniform(-0.5, 0.5) * delay
+            time.sleep(max(0.5, delay + jitter))
+
+        try:
+            names, source = fetch_person_names(pid, session=session, write_cache=write_cache)
+        except Exception as exc:  # noqa: BLE001
+            last_was_live = False
+            if on_error is not None:
+                on_error(pid, exc)
+            continue
+
+        last_was_live = source == "live"
+        if last_was_live and write_cache is not None and cache_path is not None:
+            save_cache(write_cache, cache_path)
+
+        results[pid] = (names, source)
+        if on_result is not None:
+            on_result(pid, names, source)
+
+    return results
+
+
 def fetch_records(
     pid: str,
     session: requests.Session | None = None,

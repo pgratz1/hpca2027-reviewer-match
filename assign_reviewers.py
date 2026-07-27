@@ -65,7 +65,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -73,7 +73,12 @@ import numpy as np
 
 import fingerprint as fp
 from classify_reviewers import DEFAULT_OUT as DEFAULT_SENIORITY, load_seniority
-from paper_matching import build_paper_fingerprints, eligible_scores, load_papers
+from paper_matching import (
+    PAPER_POLICIES,
+    build_paper_fingerprints,
+    eligible_scores,
+    load_papers,
+)
 from reviewers import load_reviewers
 
 DEFAULT_CSV = "HPCA'27 PC Member Acceptance Form (Responses) - Form Responses 1.csv"
@@ -517,6 +522,8 @@ def relaxation_report(
     score_lookup: dict[tuple[str, int], float],
     reviewers_by_email: dict,
     seniority: dict[str, dict] | None,
+    *,
+    itemize_excluded: bool = True,
 ) -> tuple[int, int]:
     """Itemize papers excluded from assignment and papers that needed relaxed
     constraints (area gate, junior/out-of-area caps, senior requirement) to
@@ -526,8 +533,13 @@ def relaxation_report(
     print("\n=== Relaxation & exclusion report ===")
     if skipped:
         print(f"{len(skipped)} paper(s) excluded from assignment:")
-        for s in skipped:
-            print(f"  [{s['pid']}] {s['title'] or '(no title)'} — {', '.join(s['missing'])}")
+        if itemize_excluded:
+            for s in skipped:
+                print(f"  [{s['pid']}] {s['title'] or '(no title)'} — {', '.join(s['missing'])}")
+        else:
+            reasons = Counter(reason for s in skipped for reason in s["missing"])
+            for reason, count in sorted(reasons.items()):
+                print(f"  {count} — {reason}")
     else:
         print("No papers excluded from assignment.")
 
@@ -653,6 +665,10 @@ def shortage_report(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--data", default=DEFAULT_DATA, help="path to the HotCRP paper export JSON")
+    parser.add_argument(
+        "--paper-policy", choices=PAPER_POLICIES, default="registered",
+        help="paper selection policy (default: registered)",
+    )
     parser.add_argument("--csv", default=DEFAULT_CSV, help="path to the reviewer CSV")
     parser.add_argument(
         "--fingerprint-cache", default=DEFAULT_FINGERPRINT_CACHE, help="path to the reviewer fingerprint cache"
@@ -739,7 +755,9 @@ def main() -> int:
             )
             return 1
 
-    papers, skipped_papers = load_papers(args.data, with_skipped=True)
+    papers, skipped_papers = load_papers(
+        args.data, paper_policy=args.paper_policy, with_skipped=True
+    )
     if not papers:
         print(f"No papers found in {args.data}", file=sys.stderr)
         return 1
@@ -927,6 +945,7 @@ def main() -> int:
     n_excluded, n_relaxed = relaxation_report(
         skipped_papers, papers, paper_held, paper_target, assigned_via,
         goodness, score_lookup, reviewers_by_email, seniority,
+        itemize_excluded=args.paper_policy != "submitted",
     )
 
     print(
@@ -940,6 +959,12 @@ def main() -> int:
         f"{total_missing} reviewer-slot(s) unfilled — see shortage report above).",
         file=sys.stderr,
     )
+    if args.paper_policy == "submitted" and total_missing:
+        print(
+            "ERROR: submitted-paper assignment is incomplete; refusing a partial result",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

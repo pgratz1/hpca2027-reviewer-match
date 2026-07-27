@@ -2,9 +2,12 @@
 
     python assign_area_chairs.py > area_chair_assignment.txt
 
-Every paper that has at least one reviewer in assignment.txt receives exactly
-one non-conflicted area chair. The assignment maximizes total SPECTER2 cosine
-affinity subject to a per-chair load within --load-tolerance of the mean.
+Every selected paper in assignment.txt receives exactly one non-conflicted
+area chair. The default selection is the "registered" policy (non-withdrawn
+papers with real content); use --paper-policy submitted once HotCRP has
+submitted papers, or complete for the older completeness filter. Pass the
+same policy assign_reviewers.py used. The assignment maximizes total SPECTER2
+cosine affinity under balanced loads.
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ import numpy as np
 
 import fingerprint as fp
 from area_chairs import AreaChair, load_area_chairs
-from paper_matching import build_paper_fingerprints, load_papers
+from paper_matching import PAPER_POLICIES, build_paper_fingerprints, load_papers
 
 DEFAULT_CSV = "Area Chair Acceptance Form (Responses) - Form Responses 1.csv"
 DEFAULT_ASSIGNMENT = "assignment.txt"
@@ -63,10 +66,7 @@ def load_bounds(n_papers: int, n_chairs: int, tolerance: float) -> tuple[int, in
     lower = math.ceil((1.0 - tolerance) * mean)
     upper = math.floor((1.0 + tolerance) * mean)
     if lower * n_chairs > n_papers or upper * n_chairs < n_papers:
-        raise ValueError(
-            f"load tolerance {tolerance:.3f} gives infeasible integer bounds "
-            f"{lower}..{upper} for {n_papers} papers and {n_chairs} chairs"
-        )
+        lower, upper = math.floor(mean), math.ceil(mean)
     return lower, upper
 
 
@@ -185,6 +185,10 @@ def main() -> int:
     parser.add_argument("--csv", default=DEFAULT_CSV, help="area-chair acceptance CSV")
     parser.add_argument("--reviewer-assignment", default=DEFAULT_ASSIGNMENT)
     parser.add_argument("--data", default=DEFAULT_DATA, help="HotCRP paper JSON")
+    parser.add_argument(
+        "--paper-policy", choices=PAPER_POLICIES, default="registered",
+        help="paper selection policy (default: registered)",
+    )
     parser.add_argument("--fingerprint-cache", default=DEFAULT_FINGERPRINT_CACHE)
     parser.add_argument("--paper-cache", default=DEFAULT_PAPER_CACHE)
     parser.add_argument("--load-tolerance", type=float, default=0.10)
@@ -205,14 +209,25 @@ def main() -> int:
         print(f"ERROR: no reviewer-assigned papers found in {args.reviewer_assignment}", file=sys.stderr)
         return 1
 
-    papers_by_pid = {p["pid"]: p for p in load_papers(args.data)}
+    selected_papers = load_papers(args.data, paper_policy=args.paper_policy)
+    papers_by_pid = {p["pid"]: p for p in selected_papers}
     unknown = [pid for pid in assigned_pids if pid not in papers_by_pid]
     if unknown:
         print(
-            f"ERROR: reviewer-assigned paper [{unknown[0]}] is missing, incomplete, or withdrawn in {args.data}",
+            f"ERROR: reviewer-assigned paper [{unknown[0]}] is excluded by "
+            f"the {args.paper_policy} policy in {args.data}",
             file=sys.stderr,
         )
         return 1
+    if args.paper_policy == "submitted":
+        missing = sorted(set(papers_by_pid) - set(assigned_pids))
+        if missing:
+            print(
+                f"ERROR: submitted paper [{missing[0]}] has no assigned reviewers in "
+                f"{args.reviewer_assignment}",
+                file=sys.stderr,
+            )
+            return 1
     papers = [papers_by_pid[pid] for pid in assigned_pids]
 
     chairs = load_area_chairs(args.csv)
@@ -266,9 +281,17 @@ def main() -> int:
     assigned_scores = []
     papers_by_pid = {paper["pid"]: paper for paper in papers}
     print("AREA CHAIR ASSIGNMENT")
+    mean_load = len(papers) / len(chair_emails)
+    strict_lower = math.ceil((1.0 - args.load_tolerance) * mean_load)
+    strict_upper = math.floor((1.0 + args.load_tolerance) * mean_load)
+    closest_balance = (lower, upper) != (strict_lower, strict_upper)
+    balance_label = (
+        f"closest integer balance; requested ±{args.load_tolerance:.0%}"
+        if closest_balance else f"±{args.load_tolerance:.0%}"
+    )
     print(
         f"Papers: {len(papers)}  Chairs: {len(chair_emails)}  "
-        f"Load bounds: {lower}..{upper} (±{args.load_tolerance:.0%})"
+        f"Load bounds: {lower}..{upper} ({balance_label})"
     )
     for paper in papers:
         pid = paper["pid"]

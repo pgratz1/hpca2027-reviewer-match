@@ -29,7 +29,7 @@ import sys
 import numpy as np
 
 import fingerprint as fp
-from paper_matching import build_paper_fingerprints, eligible_scores, load_papers
+from paper_matching import PAPER_POLICIES, build_paper_fingerprints, eligible_scores, load_papers
 from reviewers import load_reviewers
 
 DEFAULT_CSV = "HPCA'27 PC Member Acceptance Form (Responses) - Form Responses 1.csv"
@@ -41,6 +41,10 @@ DEFAULT_PAPER_CACHE = "paper_fingerprints.json"
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--data", default=DEFAULT_DATA, help="path to the HotCRP paper export JSON")
+    parser.add_argument(
+        "--paper-policy", choices=PAPER_POLICIES, default="registered",
+        help="paper selection policy (default: registered)",
+    )
     parser.add_argument("--csv", default=DEFAULT_CSV, help="path to the reviewer CSV")
     parser.add_argument(
         "--fingerprint-cache", default=DEFAULT_FINGERPRINT_CACHE, help="path to the reviewer fingerprint cache"
@@ -69,7 +73,7 @@ def main() -> int:
     if args.area_weight <= 0:
         parser.error("--area-weight must be greater than 0")
 
-    papers = load_papers(args.data)
+    papers = load_papers(args.data, paper_policy=args.paper_policy)
     if args.pid is not None:
         papers = [p for p in papers if p["pid"] == args.pid]
         if not papers:

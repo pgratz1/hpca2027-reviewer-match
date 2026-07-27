@@ -19,9 +19,13 @@ import area_chairs
 import build_fingerprints
 import classify_reviewers
 import compare_abstract_rankings
+import dblp
 import enrich_publications
+import estimate_reserve_need
+import extract_reserve_reviewers
 import paper_matching
 import fingerprint
+import resolve_trc_members
 import score_abstract_evaluation
 from reviewers import Reviewer, _parse_override_cap
 
@@ -189,6 +193,9 @@ class AreaChairAssignmentTests(unittest.TestCase):
     def test_load_bounds_round_inward(self):
         self.assertEqual((30, 35), assign_area_chairs.load_bounds(486, 15, 0.10))
 
+    def test_load_bounds_use_closest_integer_balance_when_tolerance_is_infeasible(self):
+        self.assertEqual((3, 4), assign_area_chairs.load_bounds(56, 15, 0.10))
+
 
 class FingerprintCacheTests(unittest.TestCase):
     def test_publication_exclusions_are_normalized_and_person_specific(self):
@@ -323,6 +330,7 @@ class PaperCompletenessTests(unittest.TestCase):
     COMPLETE = {
         "pid": 1, "title": "A complete paper", "abstract": "Abstract",
         "topics": ["Memory"], "authors": [{"email": "a@example.com"}],
+        "status": "submitted",
     }
 
     def test_each_gap_is_detected(self):
@@ -338,21 +346,106 @@ class PaperCompletenessTests(unittest.TestCase):
             gaps = paper_matching.completeness_gaps({**self.COMPLETE, **override})
             self.assertEqual([expected], gaps)
 
-    def test_load_papers_reports_skipped(self):
+    REGISTERED = {
+        "pid": 1, "title": "A registered paper", "topics": ["Memory"],
+        "abstract": "We build a thing. It goes fast.",
+        "authors": [{"email": "a@example.com"}], "status": "draft",
+    }
+
+    def test_each_registration_gap_is_detected(self):
+        self.assertEqual([], paper_matching.registration_gaps(self.REGISTERED))
+        cases = {
+            "no title": {"title": "   "},
+            "placeholder title": {"title": " Test "},
+            "abstract under 2 sentences": {"abstract": "One sentence only."},
+            "no authors": {"authors": []},
+            "withdrawn": {"withdrawn": True},
+        }
+        for expected, override in cases.items():
+            gaps = paper_matching.registration_gaps({**self.REGISTERED, **override})
+            self.assertEqual([expected], gaps)
+
+    def test_registration_keeps_short_titles_and_topicless_drafts(self):
+        for override in ({"title": "Saturo"}, {"topics": []}, {"title": "Test TRC"}):
+            with self.subTest(override=override):
+                self.assertEqual(
+                    [], paper_matching.registration_gaps({**self.REGISTERED, **override})
+                )
+
+    def test_registration_abstract_sentence_count_ignores_non_prose(self):
+        for abstract in ("TBD", "1. 2. 3.", "Abstract goes here", ""):
+            with self.subTest(abstract=abstract):
+                self.assertEqual(
+                    [f"abstract under {paper_matching.MIN_ABSTRACT_SENTENCES} sentences"],
+                    paper_matching.registration_gaps({**self.REGISTERED, "abstract": abstract}),
+                )
+
+    def test_registered_policy_is_the_default(self):
         papers = [
-            self.COMPLETE,
-            {"pid": 2, "title": "Placeholder", "abstract": "", "topics": [], "authors": []},
-            {**self.COMPLETE, "pid": 3, "withdrawn": True},
+            self.REGISTERED,
+            {**self.REGISTERED, "pid": 2, "status": "withdrawn", "withdrawn": True},
+            {**self.REGISTERED, "pid": 3, "title": "test", "abstract": "TBD"},
+            {**self.REGISTERED, "pid": 4, "status": "submitted"},
         ]
         with tempfile.TemporaryDirectory() as td:
             path = str(Path(td) / "papers.json")
             Path(path).write_text(json.dumps(papers))
             with contextlib.redirect_stderr(io.StringIO()):
-                self.assertEqual([1], [p["pid"] for p in paper_matching.load_papers(path)])
-                complete, skipped = paper_matching.load_papers(path, with_skipped=True)
-        self.assertEqual([1], [p["pid"] for p in complete])
+                selected, skipped = paper_matching.load_papers(path, with_skipped=True)
+        self.assertEqual([1, 4], [p["pid"] for p in selected])
         self.assertEqual(
-            [(2, ["title under 3 words", "no abstract", "no topics", "no authors"]), (3, ["withdrawn"])],
+            [
+                (2, ["withdrawn"]),
+                (3, ["placeholder title", "abstract under 2 sentences"]),
+            ],
+            [(s["pid"], s["missing"]) for s in skipped],
+        )
+
+    def test_submitted_policy_uses_status_only(self):
+        papers = [
+            self.COMPLETE,
+            {
+                "pid": 2, "title": "", "abstract": "", "topics": [], "authors": [],
+                "status": "submitted", "withdrawn": True,
+            },
+            {**self.COMPLETE, "pid": 3, "status": "draft"},
+            {**self.COMPLETE, "pid": 4, "status": "withdrawn", "withdrawn": True},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            path = str(Path(td) / "papers.json")
+            Path(path).write_text(json.dumps(papers))
+            with contextlib.redirect_stderr(io.StringIO()):
+                selected, skipped = paper_matching.load_papers(
+                    path, paper_policy="submitted", with_skipped=True
+                )
+        self.assertEqual([1, 2], [p["pid"] for p in selected])
+        self.assertEqual(
+            [(3, ["status draft"]), (4, ["status withdrawn"])],
+            [(s["pid"], s["missing"]) for s in skipped],
+        )
+
+    def test_complete_policy_retains_legacy_checks(self):
+        papers = [
+            self.COMPLETE,
+            {
+                "pid": 2, "title": "Placeholder", "abstract": "", "topics": [],
+                "authors": [], "status": "submitted",
+            },
+            {**self.COMPLETE, "pid": 3, "status": "draft", "withdrawn": True},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            path = str(Path(td) / "papers.json")
+            Path(path).write_text(json.dumps(papers))
+            with contextlib.redirect_stderr(io.StringIO()):
+                selected, skipped = paper_matching.load_papers(
+                    path, paper_policy="complete", with_skipped=True
+                )
+        self.assertEqual([1], [p["pid"] for p in selected])
+        self.assertEqual(
+            [
+                (2, ["title under 3 words", "no abstract", "no topics", "no authors"]),
+                (3, ["withdrawn"]),
+            ],
             [(s["pid"], s["missing"]) for s in skipped],
         )
 
@@ -522,6 +615,601 @@ class PCDBOverrideTests(unittest.TestCase):
         self.assertEqual(("typical", ""), apply("typical", score=5.5))
         self.assertEqual(("junior", ""), apply("junior", score=1.5))
         self.assertEqual(("senior", ""), apply("senior", chair=1, score=10.0, toppicks=True))
+
+
+class ReserveNeedTests(unittest.TestCase):
+    def test_reserve_count_rounds_up(self):
+        self.assertEqual(909, estimate_reserve_need.reserves_needed(3635, 4))
+        self.assertEqual(1, estimate_reserve_need.reserves_needed(1, 4))
+        self.assertEqual(3635, estimate_reserve_need.reserves_needed(3635, 1))
+        self.assertEqual(0, estimate_reserve_need.reserves_needed(0, 4))
+
+    def test_capacity_honors_the_per_reviewer_override(self):
+        light = Reviewer(
+            email="l@x.org", first="L", last="One", dblp_url="", pid=None, affiliation="",
+            primary="Memory", secondary="", tertiary="", keywords="", tier="light",
+            override_cap=None,
+        )
+        capped = Reviewer(**{**light.__dict__, "email": "c@x.org", "override_cap": 2})
+        full = Reviewer(**{**light.__dict__, "email": "f@x.org", "tier": "full"})
+        caps = [assign_reviewers.reviewer_paper_cap(r, 7, 15) for r in (light, capped, full)]
+        self.assertEqual([7, 2, 15], caps)
+
+
+class ReserveExtractionTests(unittest.TestCase):
+    def paper(self, pid, reserve, authors, dblp=None):
+        return {"pid": pid, "reserve_reviewer": reserve, "authors": authors, "dblp": dblp}
+
+    AUTHORS = [
+        {"given_name": "Xiangfeng", "family_name": "Sun", "email": "xsunbv@connect.ust.hk",
+         "affiliation": "HKUST"},
+        {"given_name": "Ceyu", "family_name": "Xu", "email": "eeentropy@ust.hk",
+         "affiliation": "HKUST"},
+        {"given_name": "Yuan", "family_name": "Xie", "email": "yuanxie@ust.hk",
+         "affiliation": "HKUST"},
+    ]
+    DBLP = ("https://dblp.org/pid/345/0608.html; None; "
+            "https://dblp.org/pid/x/YuanXie.html")
+
+    def test_email_nomination_takes_the_authors_record_and_positional_pid(self):
+        papers = [self.paper(1, "Yuan Xie / HKUST / yuanxie@ust.hk", self.AUTHORS, self.DBLP)]
+        candidates, stats = extract_reserve_reviewers.collect_candidates(papers)
+        self.assertEqual(1, stats["nominations"])
+        candidate = candidates["yuanxie@ust.hk"]
+        self.assertEqual(("Yuan Xie", "HKUST"), (candidate.name, candidate.affiliation))
+        self.assertEqual({"x/YuanXie": 1}, dict(candidate.positional_pids))
+
+    def test_typoed_email_still_yields_a_person_but_no_positional_pid(self):
+        # The real data has "eentropy@ust.hk" (one 'e' short) for eeentropy@.
+        papers = [
+            self.paper(1, "Ceyu Xu / HKUST / eentropy@ust.hk", self.AUTHORS, self.DBLP)
+        ]
+        candidates, _ = extract_reserve_reviewers.collect_candidates(papers)
+        candidate = candidates["eentropy@ust.hk"]
+        self.assertEqual(("Ceyu Xu", "HKUST"), (candidate.name, candidate.affiliation))
+        self.assertEqual({}, dict(candidate.positional_pids))
+
+    def test_exemptions_and_multi_person_fields_name_nobody(self):
+        for reserve in (
+            "exempt", "Exempt", "N/A", "not applicable",
+            "exempt (Jiayi Huang is already on the main PC)",
+            "At least one senior author is already on the main or light program committee.",
+            "Chenxu Wang, Fengwei Zhang",
+            "Natalie Enright Jerger; Jiechen Zhao",
+        ):
+            with self.subTest(reserve=reserve):
+                candidates, stats = extract_reserve_reviewers.collect_candidates(
+                    [self.paper(1, reserve, self.AUTHORS, self.DBLP)]
+                )
+                self.assertEqual({}, candidates)
+                self.assertEqual(1, stats["unparseable"])
+
+    def test_bare_name_matches_one_author_and_recovers_their_email(self):
+        papers = [self.paper(1, "Ceyu Xu", self.AUTHORS, self.DBLP)]
+        candidates, _ = extract_reserve_reviewers.collect_candidates(papers)
+        self.assertEqual(["eeentropy@ust.hk"], list(candidates))
+        # The same field with name matching off names nobody.
+        candidates, stats = extract_reserve_reviewers.collect_candidates(
+            papers, allow_name_match=False
+        )
+        self.assertEqual(({}, 1), (candidates, stats["unparseable"]))
+
+    def test_a_name_matching_two_authors_is_dropped(self):
+        twins = [
+            {"given_name": "Yang", "family_name": "Wang", "email": "a@x.org"},
+            {"given_name": "Wang", "family_name": "Yang", "email": "b@x.org"},
+        ]
+        candidates, stats = extract_reserve_reviewers.collect_candidates(
+            [self.paper(1, "Yang Wang", twins, "1/A; 2/B")]
+        )
+        self.assertEqual(({}, 1), (candidates, stats["unparseable"]))
+
+    def test_blank_fields_are_counted_not_nominations(self):
+        papers = [self.paper(1, "", self.AUTHORS), self.paper(2, None, self.AUTHORS)]
+        candidates, stats = extract_reserve_reviewers.collect_candidates(papers)
+        self.assertEqual(({}, 2, 0), (candidates, stats["blank"], stats["nominations"]))
+
+
+class ReserveDblpResolutionTests(unittest.TestCase):
+    def test_field_splits_on_either_delimiter_and_keeps_alignment(self):
+        split = extract_reserve_reviewers.split_dblp_field
+        self.assertEqual(
+            ["https://dblp.org/pid/345/0608.html", "", "https://dblp.org/pid/x/YuanXie.html"],
+            split("https://dblp.org/pid/345/0608.html; None; https://dblp.org/pid/x/YuanXie.html"),
+        )
+        self.assertEqual(
+            ["https://dblp.org/pid/345/0608.html", "https://dblp.org/pid/x/YuanXie.html"],
+            split("https://dblp.org/pid/345/0608.html,\nhttps://dblp.org/pid/x/YuanXie.html"),
+        )
+        # A trailing delimiter is punctuation, not a fourth author.
+        self.assertEqual(["", "58/292", "", "r/WonWooRo"], split("None; 58/292; N/A; r/WonWooRo;"))
+        self.assertEqual([], split(None))
+
+    def test_positional_pid_is_refused_when_the_lengths_disagree(self):
+        authors = [
+            {"given_name": "A", "family_name": "One", "email": "a@x.org"},
+            {"given_name": "B", "family_name": "Two", "email": "b@x.org"},
+            {"given_name": "C", "family_name": "Three", "email": "c@x.org"},
+        ]
+        papers = [{
+            "pid": 1, "reserve_reviewer": "c@x.org", "authors": authors,
+            "dblp": "1/A; 2/B",  # two entries, three authors
+        }]
+        candidates, _ = extract_reserve_reviewers.collect_candidates(papers)
+        candidate = candidates["c@x.org"]
+        self.assertEqual({}, dict(candidate.positional_pids))
+        # Every listed PID stays available as a probe suspect.
+        self.assertEqual(["1/A", "2/B"], extract_reserve_reviewers.probe_pool(candidate))
+
+    def test_name_tokens_fold_suffixes_initials_accents_and_order(self):
+        tokens = extract_reserve_reviewers.name_tokens
+        self.assertEqual(tokens("Yang Wang 0089"), tokens("Yang Wang"))
+        self.assertEqual(tokens("Matthew D. Sinclair"), tokens("Matthew Sinclair"))
+        self.assertEqual(tokens("José Renau"), tokens("Jose Renau"))
+        self.assertEqual(tokens("Won Woo Ro"), tokens("Ro Won Woo"))
+        self.assertNotEqual(tokens("Zhe Jiang"), tokens("Hugo Jiang"))
+
+    def test_pid_homonym_variants_are_distinct_and_left_ambiguous(self):
+        candidate = extract_reserve_reviewers.Candidate(email="x@x.org")
+        candidate.names["Libo Huang"] = 2
+        candidate.positional_pids.update(["48/4863", "48/4863-2", "48/4863-2"])
+        pool = extract_reserve_reviewers.probe_pool(candidate)
+        self.assertEqual(["48/4863", "48/4863-2"], pool)
+        # Both DBLP records carry the same name, so the probe can't choose.
+        both = {"48/4863": ["Libo Huang"], "48/4863-2": ["Libo Huang 0002"]}
+        self.assertIsNone(extract_reserve_reviewers.probe_match(candidate, pool, both))
+        # One matching record resolves it.
+        one = {"48/4863": ["Libo Huang"], "48/4863-2": ["Bo Huang"]}
+        self.assertEqual("48/4863", extract_reserve_reviewers.probe_match(candidate, pool, one))
+
+    def test_rows_sharing_a_pid_merge_onto_the_most_nominated_address(self):
+        rows = [
+            {"name": "Ceyu Xu", "email": "eeentropy@ust.hk", "affiliation": "HKUST",
+             "dblp": "d", "pid": "314/7085", "nominating_pids": "1863",
+             "resolution": "positional"},
+            {"name": "Ceyu Xu", "email": "eentropy@ust.hk", "affiliation": "HKUST",
+             "dblp": "d", "pid": "314/7085", "nominating_pids": "1 109 263",
+             "resolution": "dblp-name-probe"},
+            {"name": "Solo", "email": "s@x.org", "affiliation": "", "dblp": "d",
+             "pid": "1/Solo", "nominating_pids": "7", "resolution": "positional"},
+        ]
+        merged, groups = extract_reserve_reviewers.merge_by_pid(rows)
+        self.assertEqual(2, len(merged))
+        self.assertEqual(1, len(groups))
+        person = next(r for r in merged if r["pid"] == "314/7085")
+        # The typo'd address carried three nominations, so it is the survivor,
+        # and every nominating paper is pooled and numerically sorted.
+        self.assertEqual("eentropy@ust.hk", person["email"])
+        self.assertEqual("1 109 263 1863", person["nominating_pids"])
+        self.assertEqual("dblp-name-probe+merged", person["resolution"])
+        self.assertEqual(rows[2], next(r for r in merged if r["pid"] == "1/Solo"))
+
+    def test_probe_pool_is_empty_once_the_positional_read_agrees(self):
+        candidate = extract_reserve_reviewers.Candidate(email="x@x.org")
+        candidate.positional_pids.update(["x/YuanXie", "x/YuanXie"])
+        self.assertEqual([], extract_reserve_reviewers.probe_pool(candidate))
+
+    def test_person_names_read_the_person_record_not_the_coauthors(self):
+        xml = (
+            b'<dblpperson name="Yang Wang 0089" pid="181/2842-89">'
+            b'<person key="homepages/181/2842-89">'
+            b'<author pid="181/2842-89">Yang Wang 0089</author>'
+            b'<author pid="181/2842-89">Y. Wang</author></person>'
+            b'<r><inproceedings><author>A Coauthor</author>'
+            b'<title>A paper</title><year>2025</year></inproceedings></r>'
+            b'</dblpperson>'
+        )
+        session = mock.Mock()
+        session.get.return_value = mock.Mock(status_code=200, content=xml)
+        cache = {}
+        names, source = dblp.fetch_person_names("181/2842-89", session=session, write_cache=cache)
+        self.assertEqual(["Yang Wang 0089", "Y. Wang"], names)
+        self.assertEqual("live", source)
+        self.assertEqual({"181/2842-89": ["Yang Wang 0089", "Y. Wang"]}, cache)
+        # Second call is served from the cache without touching the network.
+        session.get.reset_mock()
+        self.assertEqual((["Yang Wang 0089", "Y. Wang"], "cache"),
+                         dblp.fetch_person_names("181/2842-89", session=session, write_cache=cache))
+        session.get.assert_not_called()
+
+
+class FakeDblp:
+    """Stand-in for resolve_trc_members.Dblp with no network behind it."""
+
+    def __init__(self, profiles=None, searches=None):
+        self.profiles = profiles or {}
+        self.searches = searches or {}
+        self.fetched = []
+
+    def profile(self, pid):
+        self.fetched.append(pid)
+        return self.profiles.get(pid)
+
+    def search(self, query):
+        return self.searches.get(query, [])
+
+
+def dblp_profile(names, coauthors=(), pubs=1, affiliations=()):
+    return {
+        "names": list(names), "affiliations": list(affiliations),
+        "coauthors": dict(coauthors), "pubs": pubs,
+    }
+
+
+class TrcRosterTests(unittest.TestCase):
+    def test_profile_parse_keeps_coauthor_pids_and_skips_homepages(self):
+        xml = (
+            b'<dblpperson name="Hwayong Nam" pid="331/8145">'
+            b'<person key="homepages/331/8145">'
+            b'<author pid="331/8145">Hwayong Nam</author>'
+            b'<note type="affiliation">Seoul National University</note></person>'
+            b'<r><www><title>Home Page</title><year>2024</year></www></r>'
+            b'<r><inproceedings><author pid="331/8145">Hwayong Nam</author>'
+            b'<author pid="10/1/JungHoAhn">Jung Ho Ahn</author>'
+            b'<title>A paper</title><year>2026</year></inproceedings></r>'
+            b'</dblpperson>'
+        )
+        profile = resolve_trc_members.parse_profile(xml)
+        self.assertEqual(["Hwayong Nam"], profile["names"])
+        self.assertEqual(["Seoul National University"], profile["affiliations"])
+        self.assertEqual({"331/8145": "Hwayong Nam", "10/1/JungHoAhn": "Jung Ho Ahn"},
+                         profile["coauthors"])
+        # The www record is a homepage, not a publication.
+        self.assertEqual(1, profile["pubs"])
+
+    def test_search_parse_handles_dblps_collapsed_single_element_lists(self):
+        payload = {"result": {"hits": {"hit": {
+            "info": {
+                "author": "Mingu Kang 0001",
+                "url": "https://dblp.org/pid/12/3456-1",
+                "aliases": {"alias": "M. Kang"},
+                "notes": {"note": [
+                    {"@type": "affiliation", "text": "University of California San Diego"},
+                    {"@type": "award", "text": "not an affiliation"},
+                ]},
+            }}}}}
+        self.assertEqual(
+            [{"name": "Mingu Kang 0001", "pid": "12/3456-1", "aliases": ["M. Kang"],
+              "affiliations": ["University of California San Diego"]}],
+            resolve_trc_members.parse_search(payload),
+        )
+
+    def test_search_rejects_the_endpoints_near_misses(self):
+        # DBLP's author search is a similarity search: asked for "Cheng Chen"
+        # it volunteers people who are not called that at all.
+        dblp_stub = FakeDblp(searches={"Cheng Chen": [
+            {"name": "Fu-Chen Cheng 0001", "pid": "241/4667-1", "aliases": [], "affiliations": []},
+            {"name": "Cheng-Zhong Xu 0001", "pid": "181/2765-1", "aliases": [], "affiliations": []},
+            {"name": "Cheng Chen 0012", "pid": "9/9999", "aliases": [], "affiliations": []},
+        ]})
+        hits = resolve_trc_members.search_candidates(dblp_stub, "Cheng Chen")
+        self.assertEqual(["9/9999"], [h["pid"] for h in hits])
+
+    def test_search_falls_back_to_splitting_a_camel_cased_name(self):
+        dblp_stub = FakeDblp(searches={
+            "SeyyedHossein SeyyedAghaeiRezaei": [],
+            "Seyyed Hossein Seyyed Aghaei Rezaei": [
+                {"name": "SeyyedHossein SeyyedAghaeiRezaei", "pid": "342/4454",
+                 "aliases": [], "affiliations": []},
+            ],
+        })
+        hits = resolve_trc_members.search_candidates(
+            dblp_stub, "SeyyedHossein SeyyedAghaeiRezaei"
+        )
+        self.assertEqual(["342/4454"], [h["pid"] for h in hits])
+
+    def test_self_declared_pids_ignore_a_misaligned_dblp_field(self):
+        aligned = {
+            "authors": [{"email": "S@x.org"}, {"email": "advisor@x.org"}],
+            "dblp": "https://dblp.org/pid/1/Student.html; https://dblp.org/pid/2/Advisor.html",
+        }
+        misaligned = {
+            "authors": [{"email": "s@x.org"}, {"email": "other@x.org"}, {"email": "z@x.org"}],
+            "dblp": "1/Wrong; 2/AlsoWrong",
+        }
+        index = resolve_trc_members.index_self_declared_pids([aligned, misaligned])
+        self.assertEqual({"1/Student": 1}, dict(index["s@x.org"]))
+        self.assertEqual({"2/Advisor": 1}, dict(index["advisor@x.org"]))
+        self.assertNotIn("z@x.org", index)
+
+    def test_advisor_email_prefers_the_pc_form_over_the_author_list(self):
+        pc_index = {frozenset({"mingu", "kang"}): {"m7kang@ucsd.edu": "UC San Diego"}}
+        author_index = {frozenset({"mingu", "kang"}): {"mingu@ucsd.edu": Counter({"UCSD": 16})}}
+        self.assertEqual(
+            ("m7kang@ucsd.edu", "pc-form"),
+            resolve_trc_members.resolve_advisor_email(
+                "Mingu Kang", "University of California San Diego", pc_index, author_index
+            ),
+        )
+
+    def test_two_researchers_sharing_a_name_are_split_by_affiliation(self):
+        author_index = {frozenset({"rakesh", "kumar"}): {
+            "rakesh.kumar@ntnu.no": Counter({"Norwegian University of Science and Technology": 8}),
+            "rakeshk@illinois.edu": Counter({"University of Illinois": 6}),
+        }}
+        self.assertEqual(
+            ("rakesh.kumar@ntnu.no", "hotcrp-author+affiliation"),
+            resolve_trc_members.resolve_advisor_email(
+                "Rakesh Kumar", "Norwegian University of Science and Technology", {}, author_index
+            ),
+        )
+        # With no affiliation to go on, guessing between them is not allowed.
+        email, resolution = resolve_trc_members.resolve_advisor_email(
+            "Rakesh Kumar", "", {}, author_index
+        )
+        self.assertIsNone(email)
+        self.assertEqual("ambiguous-hotcrp-author(2)", resolution)
+
+    def test_one_person_with_two_addresses_resolves_to_the_one_they_use(self):
+        author_index = {frozenset({"jiayi", "huang"}): {
+            "hjy@hkust-gz.edu.cn": Counter({"HKUST(GZ)": 21}),
+            "jiayihuang2022@163.com": Counter({"HKUST (GZ)": 4}),
+        }}
+        self.assertEqual(
+            ("hjy@hkust-gz.edu.cn", "hotcrp-author+most-used"),
+            resolve_trc_members.resolve_advisor_email(
+                "Jiayi Huang", "HKUST(GZ)", {}, author_index
+            ),
+        )
+
+    def test_student_confirmed_when_both_routes_agree(self):
+        dblp_stub = FakeDblp(
+            profiles={
+                "9/Advisor": dblp_profile(["An Advisor"], {"9/Student": "A Student"}),
+                "9/Student": dblp_profile(["A Student"], {"9/Advisor": "An Advisor"}, pubs=4),
+            },
+            searches={"A Student": [
+                {"name": "A Student", "pid": "9/Student", "aliases": [], "affiliations": []},
+            ]},
+        )
+        pid, resolution, _ = resolve_trc_members.resolve_student_pid(
+            dblp_stub, "A Student", "Example University", "s@x.org", ["9/Advisor"],
+            {"s@x.org": Counter({"9/Student": 1})}, 100, 8,
+        )
+        self.assertEqual("9/Student", pid)
+        self.assertEqual("confirmed", resolution)
+
+    def test_dblp_homonym_bucket_is_never_accepted(self):
+        # DBLP's bare "Cheng Chen" page collects 725 papers by many people; the
+        # advisor really has published with it, so co-authorship alone would
+        # accept it.
+        dblp_stub = FakeDblp(
+            profiles={
+                "9/Advisor": dblp_profile(["Hai Jin"], {"10/217": "Cheng Chen"}),
+                "10/217": dblp_profile(["Cheng Chen"], {"9/Advisor": "Hai Jin"}, pubs=725),
+            },
+            searches={"Cheng Chen": []},
+        )
+        pid, resolution, notes = resolve_trc_members.resolve_student_pid(
+            dblp_stub, "Cheng Chen", "HUST", "c@x.org", ["9/Advisor"], {}, 100, 8,
+        )
+        self.assertIsNone(pid)
+        self.assertEqual("unverified", resolution)
+        self.assertIn("725 publications", " ".join(notes))
+
+    def test_a_crowd_of_same_named_people_is_left_unresolved_without_fetching(self):
+        hits = [
+            {"name": f"Yi Zhang {i:04d}", "pid": f"9/{i}", "aliases": [], "affiliations": []}
+            for i in range(1, 21)
+        ]
+        dblp_stub = FakeDblp(searches={"Yi Zhang": hits})
+        pid, resolution, notes = resolve_trc_members.resolve_student_pid(
+            dblp_stub, "Yi Zhang", "HUST", "y@x.org", [], {}, 100, 8,
+        )
+        self.assertIsNone(pid)
+        self.assertEqual("ambiguous", resolution)
+        self.assertEqual([], dblp_stub.fetched)
+        self.assertIn("20 DBLP people share this name", " ".join(notes))
+
+    def test_self_declared_page_carries_a_student_with_no_joint_paper_yet(self):
+        dblp_stub = FakeDblp(
+            profiles={
+                "9/Advisor": dblp_profile(["An Advisor"]),
+                "9/New": dblp_profile(["New Student"], pubs=1),
+            },
+            searches={"New Student": []},
+        )
+        pid, resolution, notes = resolve_trc_members.resolve_student_pid(
+            dblp_stub, "New Student", "Example University", "n@x.org", ["9/Advisor"],
+            {"n@x.org": Counter({"9/New": 2})}, 100, 8,
+        )
+        self.assertEqual("9/New", pid)
+        self.assertEqual("self-declared", resolution)
+        self.assertIn("no joint publication with the advisor", " ".join(notes))
+
+    def test_a_self_declared_page_belonging_to_someone_else_is_rejected(self):
+        # The submission's dblp field was pasted in a different order, so the
+        # positional read lands on a co-author's page.
+        dblp_stub = FakeDblp(
+            profiles={"9/Coauthor": dblp_profile(["Someone Else"], pubs=3)},
+            searches={"New Student": []},
+        )
+        pid, resolution, _ = resolve_trc_members.resolve_student_pid(
+            dblp_stub, "New Student", "Example University", "n@x.org", [],
+            {"n@x.org": Counter({"9/Coauthor": 1})}, 100, 8,
+        )
+        self.assertIsNone(pid)
+        self.assertEqual("unverified", resolution)
+
+    def test_a_partial_name_match_needs_the_advisor_to_confirm_it(self):
+        # "Nam Kim" against DBLP's "Nam Sung Kim": one name is contained in the
+        # other, which is suggestive but not an identity.
+        profiles = {"9/Student": dblp_profile(["Nam Sung Kim"], pubs=6)}
+        alone = FakeDblp(profiles=profiles, searches={"Nam Kim": [
+            {"name": "Nam Sung Kim", "pid": "9/Student", "aliases": [], "affiliations": []},
+        ]})
+        pid, resolution, _ = resolve_trc_members.resolve_student_pid(
+            alone, "Nam Kim", "Example University", "n@x.org", [], {}, 100, 8,
+        )
+        self.assertIsNone(pid)
+        self.assertEqual("unverified", resolution)
+
+        confirmed = FakeDblp(
+            profiles={
+                "9/Advisor": dblp_profile(["An Advisor"], {"9/Student": "Nam Sung Kim"}),
+                "9/Student": dblp_profile(["Nam Sung Kim"], {"9/Advisor": "An Advisor"}, pubs=6),
+            },
+            searches={"Nam Kim": []},
+        )
+        pid, resolution, notes = resolve_trc_members.resolve_student_pid(
+            confirmed, "Nam Kim", "Example University", "n@x.org", ["9/Advisor"], {}, 100, 8,
+        )
+        self.assertEqual("9/Student", pid)
+        self.assertEqual("confirmed-coauthor", resolution)
+        self.assertIn("spells the name differently", " ".join(notes))
+
+    def test_a_transliterated_name_survives_when_two_facts_back_it(self):
+        # DBLP's spelling shares no word with the roster's, so no name test can
+        # match — but the student named this page on their own submission and
+        # their advisor has published with it.
+        dblp_stub = FakeDblp(
+            profiles={
+                "9/Advisor": dblp_profile(
+                    ["Lieven Eeckhout"], {"342/4454": "SeyyedHossein SeyyedAghaeiRezaei"}
+                ),
+                "342/4454": dblp_profile(
+                    ["SeyyedHossein SeyyedAghaeiRezaei"], {"9/Advisor": "Lieven Eeckhout"}, pubs=6
+                ),
+            },
+            searches={"Hossein SeyyedAghaei": [], "Hossein Seyyed Aghaei": []},
+        )
+        pid, resolution, notes = resolve_trc_members.resolve_student_pid(
+            dblp_stub, "Hossein SeyyedAghaei", "Ghent University", "h@x.org", ["9/Advisor"],
+            {"h@x.org": Counter({"342/4454": 2})}, 100, 8,
+        )
+        self.assertEqual("342/4454", pid)
+        # Proposed by the student's own submission, confirmed by co-authorship.
+        self.assertEqual("confirmed-self-declared", resolution)
+        self.assertIn("spells the name differently", " ".join(notes))
+
+        # Self-declared alone, with a name nobody can check, is not enough.
+        unbacked = FakeDblp(
+            profiles={"342/4454": dblp_profile(["SeyyedHossein SeyyedAghaeiRezaei"], pubs=6)},
+            searches={"Hossein SeyyedAghaei": [], "Hossein Seyyed Aghaei": []},
+        )
+        pid, resolution, notes = resolve_trc_members.resolve_student_pid(
+            unbacked, "Hossein SeyyedAghaei", "Ghent University", "h@x.org", [],
+            {"h@x.org": Counter({"342/4454": 2})}, 100, 8,
+        )
+        self.assertIsNone(pid)
+        self.assertEqual("unverified", resolution)
+        # The page it looked at is named, so a human can finish in one click.
+        self.assertIn("342/4454", " ".join(notes))
+
+    def test_one_name_transliterated_two_ways_still_needs_confirming(self):
+        compatible = resolve_trc_members.tokens_compatible
+        tokens = extract_reserve_reviewers.name_tokens
+        self.assertEqual("partial", compatible(tokens("Maryam Elgamal"), tokens("Mariam Elgamal")))
+        # One shared token is required, so unrelated short names stay apart.
+        self.assertIsNone(compatible(tokens("Jing Li"), tokens("Jung Lee")))
+        self.assertIsNone(compatible(tokens("Yi Zhang"), tokens("Yu Huang")))
+        # A dropped or added leading consonant is a different given name, not
+        # a respelling — "Heng Chen" is not "Cheng Chen", however close the
+        # strings score, and both really do co-author with the same advisor.
+        self.assertIsNone(compatible(tokens("Cheng Chen"), tokens("Heng Chen")))
+        self.assertIsNone(compatible(tokens("Jing Zhao"), tokens("Jin Zhao")))
+        self.assertIsNone(compatible(tokens("Yong Kim"), tokens("Yang Kim")))
+
+        dblp_stub = FakeDblp(
+            profiles={
+                "9/Advisor": dblp_profile(["David Brooks"], {"9/Student": "Mariam Elgamal"}),
+                "9/Student": dblp_profile(["Mariam Elgamal"], {"9/Advisor": "David Brooks"}, pubs=5),
+            },
+            searches={"Maryam Elgamal": []},
+        )
+        pid, resolution, _ = resolve_trc_members.resolve_student_pid(
+            dblp_stub, "Maryam Elgamal", "Harvard", "m@x.org", ["9/Advisor"], {}, 100, 8,
+        )
+        self.assertEqual("9/Student", pid)
+        self.assertEqual("confirmed-coauthor", resolution)
+
+    def test_namesakes_of_one_advisor_are_split_by_dblps_affiliation(self):
+        # DBLP has three "Zihan Xia" pages and Mingu Kang has published with
+        # more than one of them; only one of the three is at UCSD.
+        dblp_stub = FakeDblp(profiles={
+            "9/Advisor": dblp_profile(["Mingu Kang"], {
+                "244/0846": "Zihan Xia", "244/0846-2": "Zihan Xia 0002",
+                "244/0846-5": "Zihan Xia 0005",
+            }),
+            "244/0846": dblp_profile(["Zihan Xia"], pubs=7),
+            "244/0846-2": dblp_profile(
+                ["Zihan Xia 0002"], pubs=16,
+                affiliations=["University of Electronic Science and Technology of China"],
+            ),
+            "244/0846-5": dblp_profile(
+                ["Zihan Xia 0005"], pubs=1,
+                affiliations=["University of California, San Diego, CA, USA"],
+            ),
+        }, searches={"Zihan Xia": []})
+        pid, resolution, notes = resolve_trc_members.resolve_student_pid(
+            dblp_stub, "Zihan Xia", "University of California San Diego", "z@x.org",
+            ["9/Advisor"], {}, 100, 8,
+        )
+        self.assertEqual("244/0846-5", pid)
+        self.assertEqual("confirmed-coauthor", resolution)
+        self.assertIn("recorded affiliation", " ".join(notes))
+
+        # With no affiliation to go on, all three stay in contention.
+        pid, resolution, _ = resolve_trc_members.resolve_student_pid(
+            dblp_stub, "Zihan Xia", "", "z@x.org", ["9/Advisor"], {}, 100, 8,
+        )
+        self.assertIsNone(pid)
+        self.assertEqual("ambiguous", resolution)
+
+    def test_a_declined_pc_member_is_found_by_their_address_alone(self):
+        # Declining the invitation leaves every column blank but the address,
+        # which is still the HotCRP account a conflict needs.
+        unnamed = [("hanjun@yonsei.ac.kr", "")]
+        self.assertEqual(
+            ("hanjun@yonsei.ac.kr", "pc-form-address"),
+            resolve_trc_members.resolve_advisor_email(
+                "Hanjun Kim", "Yonsei University", {}, {}, unnamed
+            ),
+        )
+        # The domain has to be their institution too.
+        self.assertEqual(
+            (None, "not-found"),
+            resolve_trc_members.resolve_advisor_email(
+                "Hanjun Kim", "Seoul National University", {}, {}, unnamed
+            ),
+        )
+        # A bare surname names half a department, so it names nobody.
+        self.assertEqual(
+            (None, "not-found"),
+            resolve_trc_members.resolve_advisor_email(
+                "Hanjun Kim", "Yonsei University", {}, {}, [("kim@yonsei.ac.kr", "")]
+            ),
+        )
+
+    def test_too_many_matching_pages_are_left_for_a_human(self):
+        coauthors = {f"9/{i}": "Wei Wang" for i in range(12)}
+        dblp_stub = FakeDblp(
+            profiles={"9/Advisor": dblp_profile(["An Advisor"], coauthors)},
+            searches={"Wei Wang": []},
+        )
+        pid, resolution, notes = resolve_trc_members.resolve_student_pid(
+            dblp_stub, "Wei Wang", "Example University", "w@x.org", ["9/Advisor"], {}, 100, 8,
+        )
+        self.assertIsNone(pid)
+        self.assertEqual("ambiguous", resolution)
+        # Bailing out before fetching twelve pages that cannot be told apart.
+        self.assertEqual(["9/Advisor"], dblp_stub.fetched)
+        self.assertIn("too many to tell apart", " ".join(notes))
+
+    def test_affiliation_tokens_drop_the_words_every_institution_shares(self):
+        tokens = resolve_trc_members.affiliation_tokens
+        self.assertEqual(frozenset({"california", "san", "diego"}),
+                         tokens("University of California San Diego"))
+        # A title prefixed to the cell must not become the institution.
+        self.assertEqual(tokens("National University of Singapore"),
+                         tokens("Professor, National University of Singapore"))
+        self.assertFalse(tokens("University") & tokens("Institute of Technology"))
+
+    def test_co_advised_students_name_both_advisors(self):
+        self.assertEqual(["Xiaofei Liao", "Hai Jin"],
+                         resolve_trc_members.split_advisor_names("Xiaofei Liao (or Hai Jin)"))
+        self.assertEqual(["Solo Advisor"],
+                         resolve_trc_members.split_advisor_names("Solo Advisor"))
 
 
 if __name__ == "__main__":

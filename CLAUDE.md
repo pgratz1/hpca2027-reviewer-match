@@ -23,17 +23,25 @@ contains spaces and parentheses — always quote it in shell commands).
   adapters, numpy). `make` defaults to it; `requirements.txt` is
   documentation, not a reproducible installer.
 - `make` runs the whole pipeline (classify → abstract enrichment →
-  fingerprints → `assignment.txt`)
+  fingerprints → submitted-only `assignment.txt`)
   and rebuilds only what's stale. Prefer it over invoking scripts by hand.
 - `make area-chairs` is deliberately separate: it requires `assignment.txt`,
   builds 10-year chair fingerprints, and writes a chair-grouped
-  `area_chair_assignment.txt` under hard COIs and ±10% loads.
+  `area_chair_assignment.txt` under hard COIs and the closest feasible loads.
+- `make reserve-reviewers` is also separate and independent of the assignment:
+  it sizes the review-slot shortfall and turns HotCRP's free-text
+  `reserve_reviewer` nominations into a DBLP-resolved `reserve_reviewers.csv`.
+  No GPU, no fingerprints — only HotCRP-field parsing and DBLP person lookups.
+- `make complete-papers` and `make area-chairs-complete` retain the former
+  completeness filter in separate `*-complete.txt` artifacts.
 - Library modules (imported, never run): `reviewers.py`, `dblp.py`,
   `paper_matching.py`, `fingerprint.py`, `specter2_model.py`. Runnable
   scripts: `classify_reviewers.py`, `build_fingerprints.py`,
   `enrich_publications.py`, `assign_reviewers.py`, `score_papers.py`,
   `nearest_neighbors.py`, `compare_abstract_rankings.py`,
-  `score_abstract_evaluation.py`, `assign_area_chairs.py`, `main.py`.
+  `score_abstract_evaluation.py`, `assign_area_chairs.py`,
+  `estimate_reserve_need.py`, `extract_reserve_reviewers.py`,
+  `resolve_trc_members.py`, `main.py`.
 
 ## Architecture (filter-then-rank, then constrained assignment)
 
@@ -64,9 +72,18 @@ contains spaces and parentheses — always quote it in shell commands).
    exclusion report, and self-checks (over-cap, blocking pairs,
    junior/out-of-area policy) that must all be 0.
 
-**Policy:** every paper-side tool ignores incomplete or withdrawn papers
-(title under 3 words; missing abstract, topics, or authors; withdrawn flag) —
-enforced centrally in `paper_matching.load_papers` / `completeness_gaps`.
+**Policy:** every paper-side tool defaults to `--paper-policy registered`:
+every non-withdrawn record with ≥1 author, a title of ≥1 word that isn't just
+"test", and an abstract of more than one sentence (topics not required).
+HotCRP `status` stays `draft` until the submission deadline, so content, not
+status, distinguishes a real registration from a placeholder. `--paper-policy
+submitted` selects exactly `status == "submitted"` regardless of any other
+field — switch to it (`make PAPER_POLICY=submitted`) once submissions are in;
+only under that policy must reviewer assignments be full and area-chair
+assignments cover the same paper set. `--paper-policy complete` retains the
+former pre-registration completeness checks in `*-complete.txt` artifacts.
+The registered set (~1400 papers) far exceeds total PC review capacity, so
+large shortage/relaxation reports are expected, not a bug.
 
 ## Data, caches, and PII
 
@@ -86,7 +103,9 @@ enforced centrally in `paper_matching.load_papers` / `completeness_gaps`.
   retryable. The DBLP caches (`dblp_cache.json`, `dblp_venue_cache.json`,
   `reviewer_publications.json`, read-only `dblp_pubs_cache.json`) are expensive to refill — live DBLP fetches are
   rate-limited (~3s jittered delay, 429 backoff ≥15s). Never delete them;
-  `make clean-fingerprints` deliberately spares them.
+  `make clean-fingerprints` deliberately spares them. `dblp_person_cache.json`
+  (PID → DBLP's canonical name and aliases) is the same kind of cache, filled
+  by `extract_reserve_reviewers.py`'s name probe.
 - `.env` may hold an optional `S2_API_KEY`; it and editor backup
   variants are ignored. Never print, inspect, or commit secret values.
 - `publication_exclusions.csv` is the hand-maintained, per-email DOI exclusion
