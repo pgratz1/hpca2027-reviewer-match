@@ -12,7 +12,7 @@ email address", so it is authoritative even for those who declined) and the
 author/contact lists of the submissions themselves. Where a name matches
 several accounts, the roster's advisor-affiliation cell breaks the tie; where
 it still doesn't, the row is left blank and reported rather than guessed --
-"Rakesh Kumar" is two different researchers in this data.
+a single spelling can be two different researchers in this data.
 
 **Student -> DBLP** is a name-matching problem that a name search alone cannot
 solve: DBLP lists dozens of researchers called "Cheng Chen", and keeps an
@@ -250,7 +250,7 @@ def match_by_address(
     """The one PC-form address that names this person, if exactly one does.
 
     Last resort for a respondent who declined and so filled in nothing but
-    their address: "hanjun@yonsei.ac.kr" against "Hanjun Kim" of Yonsei
+    their address: "rosalind@blue.ac.kr" against "Rosalind Ng" of Blue
     University. Two independent things have to line up — the local part has to
     be part of their name, and the domain has to be their institution — and
     the local part has to be long enough to be a name rather than an initial
