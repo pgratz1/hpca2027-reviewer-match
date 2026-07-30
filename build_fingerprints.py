@@ -36,13 +36,17 @@ import torch
 
 import fingerprint as fp
 import specter2_model
-from area_chairs import load_area_chairs
-from dblp import fetch_titles_for_pids, load_cache, load_colleague_cache, normalise_doi
-from reviewers import load_reviewers
+from reserve_reviewers import DEFAULT_DATA
+from roster import load_roster, role_label
+from dblp import (
+    fetch_titles_for_pids, load_cache, load_colleague_cache, normalise_doi,
+    snapshot_gaps,
+)
 
 DEFAULT_CSV = "HPCA'27 PC Member Acceptance Form (Responses) - Form Responses 1.csv"
 DEFAULT_CACHE = "dblp_cache.json"
 DEFAULT_COLLEAGUE_CACHE = "dblp_pubs_cache.json"
+DEFAULT_SNAPSHOT_CACHE = "dblp_snapshot_cache.json"
 DEFAULT_FINGERPRINT_CACHE = "fingerprints.json"
 DEFAULT_METADATA_CACHE = "reviewer_publications.json"
 DEFAULT_ABSTRACT_CACHE = "publication_abstracts.json"
@@ -117,15 +121,24 @@ def fingerprint_key(r, publications, *, years, max_titles, area_weight) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--csv", default=DEFAULT_CSV, help="path to the reviewer CSV")
+    parser.add_argument("--csv", default=None, help=f"path to the roster (default: {DEFAULT_CSV}; per --role otherwise)")
     parser.add_argument(
-        "--role", choices=("reviewer", "area-chair"), default="reviewer",
+        "--data", default=DEFAULT_DATA,
+        help=f"HotCRP paper export, for --role reserve area derivation (default: {DEFAULT_DATA})",
+    )
+    parser.add_argument(
+        "--role", choices=("reviewer", "area-chair", "reserve"), default="reviewer",
         help="acceptance-form schema to load (default: reviewer)",
     )
     parser.add_argument("--cache", default=DEFAULT_CACHE, help="path to the writable DBLP title cache")
     parser.add_argument(
         "--colleague-cache", default=DEFAULT_COLLEAGUE_CACHE,
         help="path to the colleague's read-only pre-built DBLP cache"
+    )
+    parser.add_argument(
+        "--snapshot-cache", default=DEFAULT_SNAPSHOT_CACHE,
+        help=f"local DBLP dump cache, used only for PIDs the other caches lack "
+             f"(default: {DEFAULT_SNAPSHOT_CACHE})"
     )
     parser.add_argument(
         "--fingerprint-cache", default=DEFAULT_FINGERPRINT_CACHE,
@@ -180,11 +193,8 @@ def main() -> int:
         print("WARN: cuda requested but not available, falling back to cpu", file=sys.stderr)
         args.device = "cpu"
 
-    reviewers = (
-        load_area_chairs(args.csv) if args.role == "area-chair"
-        else load_reviewers(args.csv)
-    )
-    role_label = "area chairs" if args.role == "area-chair" else "reviewers"
+    reviewers = load_roster(args.role, args.csv, args.data)
+    role = role_label(args.role)
     if args.limit is not None:
         reviewers = reviewers[: args.limit]
 
@@ -201,6 +211,17 @@ def main() -> int:
     # participate in the content key.
     write_cache = load_cache(args.cache)
     readonly_cache = load_colleague_cache(args.colleague_cache)
+    # The local DBLP dump backs up both caches for anyone they don't cover, so
+    # a full roster no longer needs the network. load_colleague_cache reads the
+    # snapshot's rich format and normalises it exactly as it does the
+    # colleague's.
+    snapshot = snapshot_gaps(
+        load_colleague_cache(args.snapshot_cache), readonly_cache, write_cache
+    )
+    if snapshot:
+        print(f"Snapshot supplies {len(snapshot)} PID(s) neither cache has "
+              f"({args.snapshot_cache})", file=sys.stderr)
+        readonly_cache = {**snapshot, **readonly_cache}
     titles_by_pid: dict[str, list[tuple[int, str]]] = {}
     failed_pids: set[str] = set()
     fetch_errors = 0
@@ -288,7 +309,7 @@ def main() -> int:
             pending.append(r)
 
     print(
-        f"Loaded {len(reviewers)} accepted {role_label}; {len(pending)} need fingerprints "
+        f"Loaded {len(reviewers)} accepted {role}; {len(pending)} need fingerprints "
         f"({len(reviewers) - len(pending)} already cached).",
         file=sys.stderr,
     )
@@ -296,6 +317,7 @@ def main() -> int:
     # --- 2. Load SPECTER2 once, build every pending reviewer's input docs,
     #        encode in one batched pass, then pool per reviewer ---------------
     area_only = 0
+    no_content: list = []
     if pending:
         print(f"Loading SPECTER2 on {args.device}...", file=sys.stderr)
         tokenizer, model = specter2_model.load_model(device=args.device)
@@ -314,9 +336,14 @@ def main() -> int:
                 flat_owner.append(i)
                 per_reviewer_weights[i].append(1.0)
 
-            flat_texts.append(fp.area_profile_text(tokenizer, r))
-            flat_owner.append(i)
-            per_reviewer_weights[i].append(args.area_weight)
+            # Only when there is something to say. A reviewer with no declared
+            # areas and no keywords would otherwise contribute a bare separator
+            # at full --area-weight: the identical meaningless vector for every
+            # such person, pulling their fingerprints toward a common point.
+            if r.primary or r.secondary or r.tertiary or r.keywords:
+                flat_texts.append(fp.area_profile_text(tokenizer, r))
+                flat_owner.append(i)
+                per_reviewer_weights[i].append(args.area_weight)
 
         print(f"Encoding {len(flat_texts)} documents for {len(pending)} reviewers...", file=sys.stderr)
         vectors = specter2_model.encode_texts(flat_texts, tokenizer, model)
@@ -330,6 +357,12 @@ def main() -> int:
         for i, r in enumerate(pending):
             reviewer_vectors = vectors[offsets[i] : offsets[i + 1]]
             reviewer_weights = per_reviewer_weights[i]
+            # No publications and nothing declared: there is no such thing as a
+            # fingerprint for this person. Leave them out rather than caching a
+            # zero vector that would silently score against every paper.
+            if not reviewer_weights:
+                no_content.append(r)
+                continue
             fingerprint_vec = fp.pool(reviewer_vectors, reviewer_weights)
             if n_titles_used[i] == 0:
                 area_only += 1
@@ -356,6 +389,13 @@ def main() -> int:
         f"publications_excluded={sum(len(matched_exclusions[r.email]) for r in reviewers)}",
         file=sys.stderr,
     )
+    if no_content:
+        names = ", ".join(f"{r.name} <{r.email}>" for r in no_content)
+        print(
+            f"WARNING: {len(no_content)} with neither publications nor declared "
+            f"areas have no fingerprint and cannot be matched to any paper: {names}",
+            file=sys.stderr,
+        )
 
     # --- 4. Sanity check: nearest neighbors for spot-check reviewers --------
     email_to_reviewer = {r.email: r for r in reviewers}

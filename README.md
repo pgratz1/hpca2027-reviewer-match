@@ -89,7 +89,9 @@ make area-chairs-complete     # area_chair_assignment-complete.txt
 The PC is smaller than the submission volume needs, so `make reserve-need`
 sizes the shortfall: how many reserve reviewers have to be recruited to cover
 it. It touches neither the assignment nor the fingerprint caches and can be run
-at any time. Recruiting the reserves themselves is done outside this repo.
+at any time. Recruiting the reserves themselves is done outside this repo; once
+they are added to HotCRP, `make reserve-info` resolves their DBLP identities
+into `reserve_reviewer_info.csv`.
 
 Make notes: `make PYTHON=python3` overrides the interpreter (the default is
 the venv above); `make clean-fingerprints` forces a full re-embed but never
@@ -292,6 +294,204 @@ several per-reserve loads so the one driving assumption is visible.
 ~/envs/hpca-matching/bin/python3 estimate_reserve_need.py --reviews-per-reserve 3
 ```
 
+### `build_reserve_reviewer_info.py` — reserve-reviewer identities
+
+Joins the two half-rosters the recruited reserves arrive as: HotCRP's upload
+(`reserve_reviewer_upload.csv` — account email and name, no DBLP column) and the
+vetting workbook (`reserve_reviewers_vetting_final.xlsx` — DBLP links, but also
+covering candidates who were never added). The join is on email, and the result
+is `reserve_reviewer_info.csv` (`email,name,dblp`): the reserve-side identity
+layer, the counterpart to `dblp_overrides.csv` for the PC. The workbook is read
+with a small stdlib unzip-and-parse (there is no openpyxl in the venv), so no
+conversion step is needed.
+
+A DBLP link belonging to the wrong person is worse than no link — it silently
+fingerprints a stranger — so only rows that survive every check reach the
+roster. The rest go to `reserve_reviewer_unresolved.csv` with the reason, which
+is the to-do list for hand resolution: `no_dblp_url`, `not_in_vetting`,
+`unparseable`, `annotated` (a note trailing the link, e.g. "（disambiguation
+page）", which `parse_pid` would otherwise swallow), `name_mismatch` (the PID's
+own name is somebody else's), and `shared_pid` (two uploaded emails claim one
+PID — either one is wrong, or one person holds two HotCRP accounts and would
+draw double the reviews). Both files are sorted by email, so re-running against
+a grown HotCRP export gives a readable diff.
+
+Offline, `name_mismatch` can only be checked for the named PID form
+(`z/HaoZhang2`); a numeric PID (`26/1737`) carries no name, and numeric is what
+most of them are. **`--verify` is what makes the roster trustworthy**: it reads
+each PID's own DBLP record, reusing `resolve_trc_members.py`'s cached,
+rate-limited client. On the first run over the 243 recruited reserves it moved
+the roster from 225 to 186 — 40 links named somebody else, a 17% error rate that
+no offline check could see. Any row left without a usable PID is then searched
+for by name and the hits go in the `detail` column as candidates — proposed,
+never adopted.
+
+Two practical notes. A plain run after a verified one **overwrites the verified
+roster with the weaker offline result**, so prefer `VERIFY=--verify` once the
+cache is warm (it is now: a re-run costs 0 fetches and finishes instantly). And
+DBLP throttles the *author-search* endpoint far harder than person records —
+`get_with_retry` backs off 15→30→60→120→240s per 429, so the search pass over a
+few dozen unresolved names can take an hour even when every profile is cached.
+```bash
+~/envs/hpca-matching/bin/python3 build_reserve_reviewer_info.py
+~/envs/hpca-matching/bin/python3 build_reserve_reviewer_info.py --verify
+make reserve-info VERIFY=--verify
+```
+
+### `resolve_reserve_pids.py` — repair the reserves' DBLP identities
+
+`--verify` proves the workbook's links are wrong but cannot say what is right.
+This proposes replacements from the place the reserve reviewers came from: the
+submissions. Three routes propose a PID — **self-declared** (the person is an
+author, and that submission's positionally-aligned `dblp` field names their
+page), **coauthor** (a page listing one of their own submission's co-authors),
+and **search** (DBLP author search) — and every surviving candidate is fetched
+and checked against its own record before acceptance.
+
+Self-declared is *not* independent evidence: the workbook was largely built from
+that same field, so where the alignment slipped the two are wrong together and
+agreement proves nothing. That is why a name check is applied to every route.
+
+Output is `reserve_dblp_overrides.csv` (`email,dblp,note`) — the hand-maintained
+identity layer for reserves, which `build_reserve_reviewer_info.py` reads *ahead
+of* the workbook, exactly as `dblp_overrides.csv` outranks the acceptance form.
+Rows it could not resolve are written with an **empty `dblp` cell**, so the file
+doubles as the to-do list: paste a link in, re-run `make reserve-info
+VERIFY=--verify`, and that person joins the roster. A blank cell never masks the
+workbook's own value. The `note` column records which pages were considered and
+why each was rejected, so a human can finish by eye.
+```bash
+~/envs/hpca-matching/bin/python3 resolve_reserve_pids.py
+~/envs/hpca-matching/bin/python3 resolve_reserve_pids.py --no-network
+```
+
+### `build_dblp_snapshot_cache.py` — publications from a local DBLP dump
+
+Asking dblp.org for ~700 person records is more than it will serve politely:
+doing it has produced an outright IP block (connections reset), read timeouts,
+and 503s. DBLP publishes the whole database as one XML file, and everything this
+pipeline asks the network for is in it. This reads that dump once, offline, and
+writes the answers to a cache the existing loaders already understand.
+
+The dump has no `pid` attribute anywhere — publications name their authors as
+strings. The link comes from the person records, `<www key="homepages/PID">`,
+which list the name strings belonging to each PID. So it runs two streaming
+passes: the first learns which names belong to the PIDs the rosters want, the
+second collects every publication written under one of those names. Matching is
+exact rather than fuzzy, because DBLP guarantees a name string identifies one
+person — that is what the `0001`/`0049` suffixes are for. Aliases are honoured,
+so a paper filed under "F. Alpha" still reaches "François Alpha".
+
+The dump declares a DTD it does not ship and uses named HTML entities, so a
+stock parse dies on the first `&ccedil;`; the parser's entity table is seeded
+from `html.entities` instead.
+
+Output is `dblp_snapshot_cache.json` in the same rich format the colleague cache
+uses, so `dblp.load_rich_cache` reads it directly and `dblp.load_colleague_cache`
+normalises the very same file to the `[[year, title]]` form
+`build_fingerprints.py` wants — no consumer needs to know where it came from.
+
+It is consulted **only for PIDs the existing caches lack** (`dblp.snapshot_gaps`).
+That is deliberate: a fingerprint's cache key includes its publication list, so
+re-sourcing an already-cached person would invalidate their fingerprint and
+re-embed them for nothing. Gap-filling keeps existing artifacts byte-identical.
+```bash
+make dblp-snapshot                    # or: --snapshot <dump.xml>
+make dblp-snapshot DBLP_SNAPSHOT=dblp-2027-01-01.xml
+```
+A snapshot is a fixed point in time: anyone added to a roster after it was taken
+is absent and is **reported by PID at the end**, not silently left without
+publications. Those still need the live path, which remains the fallback.
+
+### `reserve_reviewers.py` — the reserve roster as Reviewer records
+
+Reserve reviewers are recruited from the submissions' `reserve_reviewer`
+nominations and added to HotCRP directly, so unlike the PC and the area chairs
+they never filled in an acceptance form: `reserve_reviewer_info.csv` gives an
+email, a name and a DBLP page, and nothing else.
+
+Areas matter anyway, because the area gate intersects a reviewer's
+primary/secondary with a paper's topics and someone holding neither matches no
+paper at all. They are derived here from the HotCRP topics of the submissions
+the person authored (falling back to the papers that nominated them), taking the
+three most frequent with ties broken alphabetically so the result — and every
+fingerprint built from it — is reproducible. Those topics come from HotCRP's own
+topic list, so they are already in the gate's vocabulary, with none of the
+free-text drift the acceptance form's areas need `build_canonical_area_map` for.
+In practice this gives reserves the same reach as the PC: a median of 421
+gate-eligible papers against the PC's 450, with nobody reaching zero.
+
+Records come back as real `Reviewer` objects carrying `tier="reserve"`, so
+`enrich_publications.py`, `build_fingerprints.py` and `classify_reviewers.py`
+all take a reserve unchanged via `--role reserve` (see `roster.py`, which holds
+the role-to-loader mapping). `make reserves` runs all three:
+```bash
+make reserves          # enrich -> fingerprints -> classify
+```
+It writes `reserve_fingerprints.json` and `reserve_seniority.csv` and leaves the
+PC's own `fingerprints.json` and `reviewer_seniority.csv` untouched — deliberate,
+since `classify_reviewers.py` rewrites its whole output CSV and sharing one would
+drop every reserve row on any run that didn't also load them.
+
+Seniority uses the identical thresholds and the identical `classify()` as the
+PC, including the promote-only PCDB service overrides, so a reserve's
+senior/typical/junior/out-of-area class means exactly what a PC member's does.
+`assign_reviewers.py` knows `tier == "reserve"` takes `--reserve-cap` papers
+(default 4, matching `estimate_reserve_need.py`); reserves are not yet loaded
+into the assignment itself.
+
+### `make_smoke_dataset.py` + `make smoke` — rehearse a full assignment
+
+Registration is open, so the export holds far more papers than will ever need
+reviewing — about 1,414 pass the `registered` policy against a pool that can
+cover roughly 1,070. Assigning against all of them only measures the shortfall.
+
+`make_smoke_dataset.py` writes `hpca2027-data-smoke.json`, a copy with a seeded
+random `--fraction` (default **0.30**) of the selectable papers *marked
+withdrawn* — not deleted, so `paper_matching`'s own `_is_withdrawn` drops them
+through the same path a real withdrawal takes. The seed is fixed, so two runs
+compare against an unmoving paper set; change `--fraction` to 0.25 for a tighter
+case.
+
+`make smoke` then runs the assignment over that set with **both** rosters
+(`--include-reserves`), reserves capped at 6 papers, writing
+`assignment-smoke.txt`.
+```bash
+make smoke                       # 30% withdrawn, reserves at 6
+make smoke SMOKE_WITHDRAWN=0.25  # tighter
+```
+**Read the self-checks, not the shortage count.** Over-cap, blocking pairs and
+the junior/out-of-area policy counts must all be 0 — those are the pass/fail. A
+shortage is a statement about capacity, not about the matcher.
+
+### `audit_reserve_identities.py` — cross-check the reserves' DBLP pages
+
+A name check cannot tell two people apart when they share a name — a computer
+architect and a queuing theorist can be spelled identically — so both `--verify` and the recruiting workbook can be
+confidently wrong about the same person. This asks questions a namesake fails,
+from four sources that know nothing about each other:
+
+- **co-authors** — the people they wrote HotCRP submissions with should appear
+  on their DBLP page. This is the only signal that *positively identifies*
+  rather than merely failing to contradict, and two researchers publishing
+  together is not something a shared name can fake.
+- **affiliation** — HotCRP's institution vs DBLP's recorded one
+- **declared** — the DBLP link their own submission gives for them
+- **volume** — a page with a handful of papers is unlikely to belong to someone
+  invited onto a review committee
+
+A signal only counts when it can speak (a page with no recorded affiliation
+neither confirms nor denies). Output is `reserve_identity_audit.csv`, ranked
+most-doubtful first; `confirmed` means a co-author corroborated it. Nothing here
+is a verdict — it is a list of people worth opening by hand.
+```bash
+~/envs/hpca-matching/bin/python3 audit_reserve_identities.py
+```
+Beware DBLP's **undisambiguated bucket pages** when acting on it: a page with no
+homonym suffix and hundreds of papers (`26/6190` "Hui Yu", 363 papers) is a
+holding pen for everyone of that name, not a person, and will score well on
+co-author overlap for the wrong reason.
+
 ### `resolve_trc_members.py` — Training Review Committee roster
 
 Fills two columns into the TRC roster CSV (`hpca2027-trc - hpca2027-trc.csv`),
@@ -405,16 +605,25 @@ exports — real names and emails, treat as sensitive), `hpca2027-data.json`
 cache), and `PCDB_with_emails.csv` (PC-service history with emails — also
 sensitive). `hpca2027-trc - hpca2027-trc.csv` is the Training Review Committee
 roster: an input that `resolve_trc_members.py` writes its two resolved columns
-back into, so it is also hand-maintained.
+back into, so it is also hand-maintained. `reserve_reviewer_upload.csv` (the
+HotCRP reserve-reviewer upload) and `reserve_reviewers_vetting_final.xlsx` (the
+recruiting workbook holding their DBLP links) are the inputs to
+`build_reserve_reviewer_info.py` — also sensitive.
 
-**Hand-maintained:** `dblp_overrides.csv`, `publication_exclusions.csv`.
+**Hand-maintained:** `dblp_overrides.csv`, `publication_exclusions.csv`, and
+`reserve_dblp_overrides.csv` — the reserve identity layer written by
+`resolve_reserve_pids.py` and finished by hand. Filling in one of its blank
+`dblp` cells and re-running `make reserve-info VERIFY=--verify` is how a row
+leaves `reserve_reviewer_unresolved.csv`; correcting
+`reserve_reviewers_vetting_final.xlsx` works too, but the override file wins.
 
 **Generated** (safe to delete; rebuilt incrementally): `dblp_cache.json`,
 `dblp_venue_cache.json`, `fingerprints.json`,
 `area_chair_fingerprints.json`, `paper_fingerprints.json`,
 `reviewer_publications.json`, `publication_abstracts.json`,
 `dblp_profile_cache.json`, `dblp_author_search_cache.json`,
-`reviewer_seniority.csv`, `assignment.txt`, `area_chair_assignment.txt`, and
+`reviewer_seniority.csv`, `assignment.txt`, `area_chair_assignment.txt`,
+`reserve_reviewer_info.csv`, `reserve_reviewer_unresolved.csv`, and
 experimental fingerprint caches such as `fingerprints-title-only.json`. The
 enrichment caches are rebuildable but expensive because live DBLP retrieval
 is rate-limited.

@@ -32,20 +32,70 @@ contains spaces and parentheses — always quote it in shell commands).
   sizes the review-slot shortfall, i.e. how many reserve reviewers have to be
   recruited. No GPU, no fingerprints, no network — pure arithmetic. Recruiting
   the reserves themselves happens outside this repo.
+- `make reserve-info` joins the HotCRP reserve upload
+  (`reserve_reviewer_upload.csv`) to the DBLP links in
+  `reserve_reviewers_vetting_final.xlsx` and writes `reserve_reviewer_info.csv`
+  — the reserve-side identity layer. Also independent of the assignment. Rows
+  that fail a check are held back in `reserve_reviewer_unresolved.csv` rather
+  than fingerprinting the wrong person. **Always run it as
+  `make reserve-info VERIFY=--verify`**: offline, a PID is only name-checked
+  when the PID itself spells a name, and verifying the rest against DBLP caught
+  40 links naming the wrong person out of 243 (roster 225 → 186). A plain run
+  overwrites that verified roster with the weaker offline result. The profile
+  cache is warm, so a verified re-run costs 0 fetches.
+- `make dblp-snapshot` is the **preferred source of publications**: it reads a
+  local DBLP dump (`DBLP_SNAPSHOT`, default `dblp-2026-07-01.xml`, 5.2 GB,
+  gitignored) and writes `dblp_snapshot_cache.json` for every roster PID —
+  offline, ~4 min, no rate limit. Run it before `make`, `make area-chairs` or
+  `make reserves` and those need no network for DBLP at all. The dump has no
+  `pid` attributes, so `build_dblp_snapshot_cache.py` joins PID → name strings
+  (from `<www key="homepages/PID">` records, aliases included) → publications by
+  exact name match; DBLP guarantees a name string identifies one person. The
+  cache is consulted **only for PIDs the existing caches lack**
+  (`dblp.snapshot_gaps`) — re-sourcing a cached person would change their
+  publication list, which is part of the fingerprint key, and re-embed them for
+  nothing. PIDs absent from the snapshot (anyone added after it was taken) are
+  reported and still use the live path.
+- `make reserves` puts the reserve roster through the same three stages as the
+  PC (enrich → fingerprints → classify) via `--role reserve`, writing
+  `reserve_fingerprints.json` and `reserve_seniority.csv`. Reserves never filled
+  in a form, so `reserve_reviewers.py` derives their areas from the HotCRP
+  topics of the submissions they authored — without areas the area gate matches
+  them to nothing. `roster.py` maps role → loader for all three scripts.
+- `make smoke` rehearses a full assignment over **both** rosters:
+  `make_smoke_dataset.py` writes `hpca2027-data-smoke.json` (a seeded 30% of the
+  registered papers *marked withdrawn*, standing in for those never submitted),
+  then `assign_reviewers.py --include-reserves --reserve-cap 6` runs over it. The
+  self-checks — over cap, blocking pairs, junior/out-of-area — are the pass/fail;
+  the shortage count is a capacity statement, not a verdict.
+- **COI is a floor, not a full picture.** `paper_matching.own_paper_conflicts`
+  treats authors, contacts, and `reserve_reviewer` nominees as conflicted, because
+  authors have not yet been asked to declare conflicts against recently promoted
+  PC and reserve reviewers. Coverage is uneven (reserves: median 1 declared
+  conflict per paper vs 7–8 for the PC), which `assign_reviewers.py` now prints,
+  and it makes any reserve-heavy result optimistic until the sweep runs.
 - `make complete-papers` and `make area-chairs-complete` retain the former
   completeness filter in separate `*-complete.txt` artifacts.
 - Library modules (imported, never run): `reviewers.py`, `dblp.py`,
-  `paper_matching.py`, `fingerprint.py`, `specter2_model.py`. Runnable
+  `paper_matching.py`, `fingerprint.py`, `specter2_model.py`,
+  `reserve_reviewers.py`, `roster.py`. Runnable
   scripts: `classify_reviewers.py`, `build_fingerprints.py`,
   `enrich_publications.py`, `assign_reviewers.py`, `score_papers.py`,
   `nearest_neighbors.py`, `compare_abstract_rankings.py`,
   `score_abstract_evaluation.py`, `assign_area_chairs.py`,
-  `estimate_reserve_need.py`, `resolve_trc_members.py`, `main.py`.
+  `estimate_reserve_need.py`, `build_reserve_reviewer_info.py`, `make_smoke_dataset.py`,
+  `resolve_reserve_pids.py`, `build_dblp_snapshot_cache.py`,
+  `resolve_trc_members.py`, `main.py`.
 
 ## Architecture (filter-then-rank, then constrained assignment)
 
 1. **Identity**: `dblp_overrides.csv` (email-keyed, hand-maintained) is the
-   single identity layer; a filled `dblp` cell wins over the form's DBLP
+   single identity layer for the PC. Reserve reviewers, who never filled in the
+   acceptance form, get theirs from `reserve_reviewer_info.csv`, built from the
+   vetting workbook but overridden per-email by `reserve_dblp_overrides.csv`
+   (written by `resolve_reserve_pids.py`, finished by hand; a blank `dblp` cell
+   is a to-do marker, not a decision, and never masks the workbook).
+   A filled `dblp` cell wins over the form's DBLP
    column. `classify_reviewers.py` auto-appends blank stub rows for reviewers
    it can't resolve — the file doubles as the to-do list.
 2. **Seniority**: `classify_reviewers.py` → `reviewer_seniority.csv`
@@ -101,7 +151,15 @@ large shortage/relaxation reports are expected, not a bug.
   abstracts, model, and embedding flags. Transient DBLP/API failures remain
   retryable. The DBLP caches (`dblp_cache.json`, `dblp_venue_cache.json`,
   `reviewer_publications.json`, read-only `dblp_pubs_cache.json`) are expensive to refill — live DBLP fetches are
-  rate-limited (~3s jittered delay, 429 backoff ≥15s). Never delete them;
+  rate-limited (~3s jittered delay; on a 429 or a dropped connection,
+  `dblp.get_with_retry` backs off from ≥15s, doubling with jitter, capped at
+  `MAX_BACKOFF`, honouring `Retry-After` up to the same cap). The backoff index
+  is per-call, so it never ratchets up across a run. **DBLP resets the
+  connection outright once it has blocked an IP** — retrying cannot clear that,
+  only waiting can — so the batch loops stop after `MAX_CONSECUTIVE_FAILURES`
+  and keep what they cached instead of grinding for hours and leaving reviewers
+  looking publication-less. If a run dies that way, wait and re-run; the caches
+  resume. Prefer a larger `--delay` for big first-time fetches. Never delete them;
   `make clean-fingerprints` deliberately spares them. `dblp_profile_cache.json`
   and `dblp_author_search_cache.json`, filled by `resolve_trc_members.py`, are
   the same kind of cache.

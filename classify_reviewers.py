@@ -57,12 +57,17 @@ from collections import Counter
 from dataclasses import dataclass
 
 import dblp
+from reserve_reviewers import load_reserve_reviewers
 from reviewers import DEFAULT_OVERRIDES, Reviewer, load_reviewers
 
 DEFAULT_CSV = "HPCA'27 PC Member Acceptance Form (Responses) - Form Responses 1.csv"
 DEFAULT_COLLEAGUE_CACHE = "dblp_pubs_cache.json"
 DEFAULT_VENUE_CACHE = "dblp_venue_cache.json"
+DEFAULT_SNAPSHOT_CACHE = "dblp_snapshot_cache.json"
 DEFAULT_OUT = "reviewer_seniority.csv"
+DEFAULT_RESERVE_OUT = "reserve_seniority.csv"
+DEFAULT_RESERVE_INFO = "reserve_reviewer_info.csv"
+DEFAULT_DATA = "hpca2027-data.json"
 DEFAULT_PCDB = "PCDB_with_emails.csv"
 DEFAULT_PCDB_SENIOR_SCORE = 6.0
 DEFAULT_PCDB_TYPICAL_SCORE = 2.0
@@ -332,9 +337,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--csv", default=DEFAULT_CSV, help="acceptance-form CSV (default: %(default)s)")
+    parser.add_argument("--csv", default=None, help=f"acceptance-form CSV (default: {DEFAULT_CSV}; for --role reserve, {DEFAULT_RESERVE_INFO})")
+    parser.add_argument(
+        "--role", choices=("reviewer", "reserve"), default="reviewer",
+        help="which roster to classify (default: reviewer)",
+    )
+    parser.add_argument("--data", default=DEFAULT_DATA, help="HotCRP paper export, for --role reserve area derivation (default: %(default)s)")
     parser.add_argument("--overrides", default=DEFAULT_OVERRIDES, help="hand-maintained DBLP override CSV; unknowns are appended here as blank stubs (default: %(default)s)")
-    parser.add_argument("--out", default=DEFAULT_OUT, help="output CSV (default: %(default)s)")
+    parser.add_argument("--out", default=None, help=f"output CSV (default: {DEFAULT_OUT}; for --role reserve, {DEFAULT_RESERVE_OUT})")
     parser.add_argument("--pcdb", default=DEFAULT_PCDB, help="PC-service database CSV whose chair/PC/ERC history overrides the publication classes (default: %(default)s)")
     parser.add_argument("--no-pcdb", action="store_true", help="skip the PCDB service overrides entirely")
     parser.add_argument("--pcdb-senior-score", type=float, default=DEFAULT_PCDB_SENIOR_SCORE, help="#PC + 0.5*#ERC score at or above which a PCDB-matched reviewer is senior (default: %(default)s)")
@@ -346,6 +356,7 @@ def main() -> int:
     parser.add_argument("--current-year", type=int, default=datetime.date.today().year, help="last year of the window, inclusive (default: this year)")
     parser.add_argument("--venue-cache", default=DEFAULT_VENUE_CACHE, help="writable rich DBLP cache (default: %(default)s)")
     parser.add_argument("--colleague-cache", default=DEFAULT_COLLEAGUE_CACHE, help="read-only rich DBLP cache (default: %(default)s)")
+    parser.add_argument("--snapshot-cache", default=DEFAULT_SNAPSHOT_CACHE, help="local DBLP dump cache, used only for PIDs the other caches lack (default: %(default)s)")
     parser.add_argument("--delay", type=float, default=3.0, help="seconds between live DBLP fetches, jittered ±50%% (default: %(default)s)")
     args = parser.parse_args()
 
@@ -360,6 +371,9 @@ def main() -> int:
     if args.delay < 0:
         parser.error("--delay must be non-negative")
 
+    if args.out is None:
+        args.out = DEFAULT_RESERVE_OUT if args.role == "reserve" else DEFAULT_OUT
+
     pcdb: dict[str, PCDBRecord] = {}
     if not args.no_pcdb:
         try:
@@ -367,9 +381,24 @@ def main() -> int:
         except FileNotFoundError:
             parser.error(f"PCDB file not found: {args.pcdb} — fix --pcdb or pass --no-pcdb")
 
-    reviewers = load_reviewers(args.csv, overrides_path=args.overrides)
+    if args.role == "reserve":
+        reviewers = load_reserve_reviewers(
+            args.csv or DEFAULT_RESERVE_INFO, args.data
+        )
+    else:
+        reviewers = load_reviewers(args.csv or DEFAULT_CSV, overrides_path=args.overrides)
     venue_cache = dblp.load_rich_cache(args.venue_cache)
     colleague_cache = dblp.load_rich_cache(args.colleague_cache)
+    # Local DBLP dump, for anyone neither cache covers. Restricted to genuine
+    # gaps so an already-classified reviewer's records — and so their row in the
+    # output — do not change underneath them.
+    snapshot = dblp.snapshot_gaps(
+        dblp.load_rich_cache(args.snapshot_cache), colleague_cache, venue_cache
+    )
+    if snapshot:
+        print(f"Snapshot supplies {len(snapshot)} PID(s) neither cache has "
+              f"({args.snapshot_cache})", file=sys.stderr)
+        colleague_cache = {**snapshot, **colleague_cache}
 
     resolved = [(r, *resolve_pid(r)) for r in reviewers]
 
@@ -485,7 +514,10 @@ def main() -> int:
         print("Unknown reasons:", file=sys.stderr)
         for why, n in unknown_reasons.most_common():
             print(f"  {n:3d}  {why}", file=sys.stderr)
-    n_stubs = populate_override_stubs(
+    # Reserves are identified through reserve_dblp_overrides.csv, not this file,
+    # and every one already carries a PID; appending stubs here would pollute the
+    # PC's identity layer with people who are not on the PC.
+    n_stubs = 0 if args.role == "reserve" else populate_override_stubs(
         args.overrides, unresolved_identity_rows(rows)
     )
     if n_stubs:

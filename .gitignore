@@ -18,7 +18,17 @@ dblp_venue_cache.json
 dblp_person_cache.json
 dblp_profile_cache.json
 dblp_author_search_cache.json
-reserve_reviewers.csv
+dblp_snapshot_cache.json
+# The DBLP dump itself — 5.2 GB, never committable
+dblp-*.xml
+dblp-*.xml.gz
+dblp-*.dtd
+reserve_reviewer*.csv
+reserve_reviewer*.xlsx
+reserve_dblp_overrides.csv
+reserve_identity_audit.csv
+reserve_seniority.csv
+reserve_fingerprints.json
 reviewer_publications.json
 publication_abstracts.json
 reviewer_seniority.csv
@@ -27,6 +37,8 @@ publication_exclusions.csv
 assignment.txt
 area_chair_assignment.txt
 assignment-complete.txt
+assignment-smoke*.txt
+hpca2027-data-smoke*.json
 area_chair_assignment-complete.txt
 abstract-evaluation*.csv
 

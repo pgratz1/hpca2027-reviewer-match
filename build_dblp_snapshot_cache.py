@@ -1,0 +1,250 @@
+"""Build a publication cache for every roster PID from a local DBLP dump.
+
+    python build_dblp_snapshot_cache.py
+    python build_dblp_snapshot_cache.py --snapshot dblp-2026-07-01.xml
+    python build_dblp_snapshot_cache.py --role reserve     # one roster only
+
+Asking dblp.org for ~700 person records is more than it will serve politely:
+doing it has produced an outright IP block (connections reset), read timeouts,
+and 503s. DBLP publishes the whole database as one XML dump, and everything the
+pipeline asks the network for is in it. This reads that dump once and writes the
+answers to a cache the existing loaders already understand.
+
+The dump does not link publications to PIDs. There is no `pid` attribute
+anywhere in it; publications name their authors as strings. The link comes from
+the person records — `<www key="homepages/PID">` — which list the name strings
+belonging to each PID. So this runs two passes: the first learns which names
+belong to the PIDs we want, the second collects every publication written under
+one of those names. Matching is exact, not fuzzy: DBLP guarantees a name string
+identifies one person, which is what the "0001"/"0049" suffixes are for.
+
+Output is `{pid: [{title, year, venue, type, doi}, ...]}` — the same shape the
+colleague cache uses, so `dblp.load_rich_cache` reads it directly and
+`dblp.load_colleague_cache` normalises the very same file to the [[year, title]]
+form build_fingerprints.py wants. No consumer needs to know where it came from.
+
+A snapshot is a fixed point in time: anyone added to a roster after it was taken
+is absent, and is reported at the end rather than silently left with no
+publications. Those still need the live path.
+"""
+
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import sys
+import xml.etree.ElementTree as ET
+from collections import defaultdict
+from pathlib import Path
+
+from dblp import normalise_doi, save_cache
+from roster import ROLES, load_roster
+
+DEFAULT_SNAPSHOT = "dblp-2026-07-01.xml"
+DEFAULT_OUT = "dblp_snapshot_cache.json"
+
+# Person records live under this key prefix; everything else in <www> is a
+# stray web page, not a human.
+_HOMEPAGE_PREFIX = "homepages/"
+
+# Publication elements carry the author's name as text. `www` is excluded
+# because a person record lists its own owner as an author and would otherwise
+# read as a publication of theirs, exactly as the live path excludes it.
+_SKIP_TAGS = frozenset({"www"})
+
+
+def entity_aware_parser() -> ET.XMLParser:
+    """An XMLParser that knows DBLP's HTML entities.
+
+    The dump declares a DTD that is not distributed with it and uses named HTML
+    entities (`&ccedil;`, `&AElig;`, ...). Without the DTD a stock parse dies on
+    the first one with "undefined entity", so the table is seeded from Python's
+    own copy instead of shipping a DTD alongside the data.
+    """
+    parser = ET.XMLParser()
+    for name, value in html.entities.entitydefs.items():
+        parser.entity[name] = value
+    return parser
+
+
+def top_level_records(path: str):
+    """Yield each direct child of <dblp>, complete, then release it.
+
+    Depth has to be tracked rather than clearing on every `end` event: a record's
+    own <author> and <title> children close before it does, so clearing eagerly
+    empties the very element about to be handed over. Releasing only at depth 1,
+    after the record is complete, is what keeps a 5 GB file from becoming a 5 GB
+    tree in memory.
+    """
+    depth = 0
+    root = None
+    for event, elem in ET.iterparse(path, events=("start", "end"),
+                                    parser=entity_aware_parser()):
+        if event == "start":
+            if root is None:
+                root = elem
+            depth += 1
+            continue
+        depth -= 1
+        if depth != 1:
+            continue
+        yield elem
+        elem.clear()
+        while root is not None and len(root):
+            del root[0]
+
+
+def _title_text(pub) -> str | None:
+    """Full title text, flattening the markup DBLP puts inside titles."""
+    title_el = pub.find("title")
+    if title_el is None:
+        return None
+    text = "".join(title_el.itertext()).strip()
+    return text or None
+
+
+def _publication_doi(pub) -> str:
+    """Normalised DOI from the record's <ee> links, or "" if none is one."""
+    for ee in pub.findall("ee"):
+        doi = normalise_doi((ee.text or "").strip())
+        if doi:
+            return doi
+    return ""
+
+
+def collect_names(path: str, wanted: set[str]) -> dict[str, list[str]]:
+    """Pass 1: {pid: [name strings]} for the PIDs in `wanted`."""
+    names: dict[str, list[str]] = {}
+    for elem in top_level_records(path):
+        if elem.tag != "www":
+            continue
+        key = elem.get("key") or ""
+        if not key.startswith(_HOMEPAGE_PREFIX):
+            continue
+        pid = key[len(_HOMEPAGE_PREFIX):]
+        if pid in wanted:
+            found = ["".join(a.itertext()).strip() for a in elem.findall("author")]
+            names[pid] = [n for n in found if n]
+    return names
+
+
+def collect_publications(
+    path: str, pid_by_name: dict[str, str]
+) -> dict[str, list[dict]]:
+    """Pass 2: {pid: [record]} for every publication written under a known name.
+
+    Records are built exactly as dblp._fetch_all_records_from_dblp builds them,
+    so a cached entry is indistinguishable from a live one.
+    """
+    records: dict[str, list[dict]] = defaultdict(list)
+    for elem in top_level_records(path):
+        if elem.tag in _SKIP_TAGS:
+            continue
+
+        owners = {
+            pid_by_name[name]
+            for name in ("".join(a.itertext()).strip() for a in elem.findall("author"))
+            if name in pid_by_name
+        }
+        if not owners:
+            continue
+
+        title = _title_text(elem)
+        year_el = elem.find("year")
+        if title is None or year_el is None or not (year_el.text or "").strip():
+            continue
+        try:
+            year = int(year_el.text.strip())
+        except ValueError:
+            continue
+
+        venue_el = elem.find("booktitle")
+        if venue_el is None:
+            venue_el = elem.find("journal")
+        venue = (venue_el.text or "").strip() if venue_el is not None else ""
+        record = {
+            "title": title, "year": year, "venue": venue,
+            "type": elem.tag, "doi": _publication_doi(elem),
+        }
+        for pid in owners:
+            records[pid].append(record)
+
+    for pubs in records.values():
+        pubs.sort(key=lambda r: r["year"], reverse=True)
+    return dict(records)
+
+
+def wanted_pids(roles: list[str]) -> dict[str, str]:
+    """{pid: display name} over the requested rosters."""
+    wanted: dict[str, str] = {}
+    for role in roles:
+        for person in load_roster(role):
+            if person.pid:
+                wanted.setdefault(person.pid, person.name)
+    return wanted
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("--snapshot", default=DEFAULT_SNAPSHOT,
+                        help=f"DBLP XML dump (default: {DEFAULT_SNAPSHOT})")
+    parser.add_argument("--out", default=DEFAULT_OUT,
+                        help=f"publication cache to write (default: {DEFAULT_OUT})")
+    parser.add_argument("--role", action="append", choices=ROLES, default=None,
+                        help="roster to cover; repeatable (default: all three)")
+    args = parser.parse_args()
+
+    if not Path(args.snapshot).exists():
+        raise SystemExit(f"{args.snapshot}: not found")
+
+    roles = args.role or list(ROLES)
+    wanted = wanted_pids(roles)
+    print(f"{len(wanted)} PID(s) wanted across {', '.join(roles)}", file=sys.stderr)
+
+    print(f"Pass 1/2: reading person records from {args.snapshot} ...", file=sys.stderr)
+    names = collect_names(args.snapshot, set(wanted))
+    print(f"  matched {len(names)} of {len(wanted)} PID(s) to a person record",
+          file=sys.stderr)
+
+    pid_by_name: dict[str, str] = {}
+    for pid, spellings in names.items():
+        for name in spellings:
+            # A name string belongs to one person in DBLP; if the dump ever
+            # disagrees, keep the first and say so rather than silently
+            # reassigning someone's publications.
+            if name in pid_by_name and pid_by_name[name] != pid:
+                print(f"  WARNING: {name!r} claimed by {pid_by_name[name]} and "
+                      f"{pid}; keeping the first", file=sys.stderr)
+                continue
+            pid_by_name[name] = pid
+    print(f"  {len(pid_by_name)} name spelling(s) to match on", file=sys.stderr)
+
+    print("Pass 2/2: collecting publications ...", file=sys.stderr)
+    records = collect_publications(args.snapshot, pid_by_name)
+
+    # A PID with a person record but no publications is a real answer (an empty
+    # list), not a gap; only PIDs the dump never mentioned are missing.
+    for pid in names:
+        records.setdefault(pid, [])
+    save_cache(records, args.out)
+
+    total = sum(len(v) for v in records.values())
+    print(f"\nWrote {len(records)} PID(s), {total} publication(s) -> {args.out}",
+          file=sys.stderr)
+    missing = sorted(set(wanted) - set(records))
+    if missing:
+        print(
+            f"\n{len(missing)} PID(s) are not in this snapshot and still need a "
+            f"live fetch — expected for anyone added to a roster after it was "
+            f"taken:", file=sys.stderr,
+        )
+        for pid in missing:
+            print(f"    {pid:<16} {wanted[pid]}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -2,6 +2,11 @@
 #
 #   make                  rebuild whatever is stale; final output: assignment.txt
 #   make reserve-need     size the reserve-reviewer shortfall
+#   make reserve-info     resolve the recruited reserves' DBLP identities
+#   make reserve-pids     propose DBLP pages for the ones it held back
+#   make dblp-snapshot    cache publications from the local DBLP dump (offline)
+#   make reserves         enrich + fingerprint + classify the reserve reviewers
+#   make smoke            rehearse a full assignment: PC + reserves, 30%% withdrawn
 #   make complete-papers   retain the pre-registration completeness filter
 #   make clean             remove assignment outputs
 #   make clean-fingerprints  force a full re-embed (e.g. after changing
@@ -22,6 +27,9 @@ PAPER_POLICY ?= registered
 export S2_API_KEY
 
 CSV = HPCA'27 PC Member Acceptance Form (Responses) - Form Responses 1.csv
+DATA = hpca2027-data.json
+RESERVE_INFO = reserve_reviewer_info.csv
+DBLP_SNAPSHOT = dblp-2026-07-01.xml
 AREA_CHAIR_CSV = Area Chair Acceptance Form (Responses) - Form Responses 1.csv
 AREA_CHAIR_YEARS = 10
 # make splits prerequisite lists on spaces, so dependencies use this
@@ -32,7 +40,7 @@ REVIEWER_LIBS = reviewers.py dblp.py
 EMBED_LIBS = fingerprint.py specter2_model.py
 
 .DELETE_ON_ERROR:
-.PHONY: all enrich area-chairs reserve-need complete-papers area-chairs-complete clean clean-fingerprints
+.PHONY: all enrich area-chairs reserve-need reserve-info reserve-pids reserves dblp-snapshot smoke complete-papers area-chairs-complete clean clean-fingerprints
 
 all: reviewer_seniority.csv enrich fingerprints.json
 	$(PYTHON) build_fingerprints.py --csv "$(CSV)" --fingerprint-cache fingerprints.json
@@ -56,6 +64,68 @@ area-chairs:
 # run at any point.
 reserve-need:
 	$(PYTHON) estimate_reserve_need.py --paper-policy $(PAPER_POLICY) --csv "$(CSV)"
+
+# Join the HotCRP reserve-reviewer upload to the vetting workbook's DBLP links,
+# giving the reserves the identity everything downstream is built from. Also
+# separate from all: it depends on neither the papers nor the fingerprints, and
+# `make reserve-info VERIFY=--verify` checks every PID against DBLP over the
+# network (rate-limited, cached in dblp_profile_cache.json).
+reserve-info:
+	$(PYTHON) build_reserve_reviewer_info.py $(VERIFY)
+
+# Propose DBLP pages for the reserves build_reserve_reviewer_info.py had to hold
+# back, from the submissions they authored. Writes reserve_dblp_overrides.csv,
+# whose blank rows are the chair's to-do list; re-run reserve-info afterwards.
+reserve-pids:
+	$(PYTHON) resolve_reserve_pids.py
+
+# Publications for every roster PID, read out of the local DBLP dump instead of
+# asking dblp.org ~700 times (which has produced IP blocks, timeouts and 503s).
+# Two streaming passes over 5.2 GB: minutes, offline, and run once. The cache it
+# writes is consulted only for PIDs the existing caches lack, so no fingerprint
+# already computed is invalidated.
+dblp-snapshot:
+	@test -f $(DBLP_SNAPSHOT) || { echo "ERROR: $(DBLP_SNAPSHOT) not found; set DBLP_SNAPSHOT=<dump.xml>" >&2; exit 1; }
+	$(PYTHON) build_dblp_snapshot_cache.py --snapshot $(DBLP_SNAPSHOT)
+
+# Put the reserve reviewers through the same three stages a PC member goes
+# through: publication metadata, SPECTER2 fingerprints, seniority class. Their
+# areas are derived from the topics of the submissions they authored, since they
+# never filled in an acceptance form. Separate from all, like area-chairs: it
+# needs the GPU and does not feed assignment.txt yet. Run dblp-snapshot first
+# and it needs no network either.
+reserves:
+	@test -f $(RESERVE_INFO) || { echo "ERROR: $(RESERVE_INFO) not found; run make reserve-info first" >&2; exit 1; }
+	$(PYTHON) enrich_publications.py --role reserve --csv $(RESERVE_INFO) --data $(DATA)
+	$(PYTHON) build_fingerprints.py --role reserve --csv $(RESERVE_INFO) --data $(DATA) \
+		--fingerprint-cache reserve_fingerprints.json
+	$(PYTHON) classify_reviewers.py --role reserve --csv $(RESERVE_INFO) --data $(DATA) \
+		--out reserve_seniority.csv
+
+# End-to-end rehearsal: every paper against the PC *and* the reserves. Uses a
+# copy of the export with SMOKE_WITHDRAWN of the registered papers marked
+# withdrawn, standing in for the ones that never get submitted — assigning
+# against all 1,414 only ever measures the shortfall. The self-checks in the
+# output (over cap, blocking pairs, junior/out-of-area) are the pass/fail; the
+# shortage count is a result, not a verdict.
+SMOKE_WITHDRAWN = 0.30
+SMOKE_RESERVE_CAP = 6
+# The withdrawal fraction is part of the filename, not just of the recipe: make
+# compares timestamps, so a shared name would let `make smoke
+# SMOKE_WITHDRAWN=0.25` quietly reuse the 0.30 draw and report it as a 25% run.
+# Tagging also lets two fractions sit side by side for comparison.
+SMOKE_DATA = hpca2027-data-smoke-$(SMOKE_WITHDRAWN).json
+SMOKE_OUT = assignment-smoke-$(SMOKE_WITHDRAWN).txt
+
+$(SMOKE_DATA): make_smoke_dataset.py paper_matching.py $(DATA)
+	$(PYTHON) make_smoke_dataset.py --data $(DATA) --out $@ --fraction $(SMOKE_WITHDRAWN)
+
+smoke: $(SMOKE_DATA)
+	@test -f reserve_fingerprints.json || { echo "ERROR: reserve_fingerprints.json not found; run make reserves first" >&2; exit 1; }
+	$(PYTHON) assign_reviewers.py --data $(SMOKE_DATA) --csv "$(CSV)" \
+		--include-reserves --reserve-cap $(SMOKE_RESERVE_CAP) \
+		> $(SMOKE_OUT)
+	@echo "wrote $(SMOKE_OUT)" >&2
 
 complete-papers: assignment-complete.txt
 

@@ -16,6 +16,7 @@ import datetime
 import json
 import random
 import re
+import sys
 import time
 import unicodedata
 import xml.etree.ElementTree as ET
@@ -42,6 +43,35 @@ _USER_AGENT = (
 )
 
 _DOI_RE = re.compile(r"10\.\d{4,9}/[^\s?#]+", re.IGNORECASE)
+
+# Ceiling on any single wait, including one a server asked for via Retry-After.
+# Past this the run is not making progress and should say so rather than sleep.
+MAX_BACKOFF = 300.0
+
+# Server-side statuses that mean "not now" rather than "never". DBLP answers 503
+# when it is shedding load, which is the same signal as a 429 and has to back
+# off the same way — raising immediately instead burns a whole batch in seconds
+# without ever pausing, which is the opposite of what the server asked for.
+RETRY_STATUSES = frozenset({500, 502, 503, 504})
+
+# Consecutive live-fetch failures after which a batch loop gives up. DBLP drops
+# connections when it has blocked an IP, and no amount of retrying clears that
+# — only waiting does. Stopping keeps the partial cache and lets a later run
+# resume, instead of grinding for hours and filling the roster with reviewers
+# who look publication-less.
+MAX_CONSECUTIVE_FAILURES = 5
+
+
+def _backoff_delay(floor: float, attempt: int) -> float:
+    """Exponential backoff with jitter, capped at MAX_BACKOFF.
+
+    `attempt` is always the index within a single call, so the sequence starts
+    over for each new request rather than ratcheting upward across a run.
+    """
+    delay = floor * (2 ** attempt) * random.uniform(0.75, 1.25)
+    # Cap after jittering, not before, or the jitter reintroduces the overshoot
+    # the cap exists to prevent.
+    return min(max(floor, delay), MAX_BACKOFF)
 
 # A submission's dblp field lists one entry per author. Its entries are
 # separated by ';', ',', or a newline — and often by ',\n' or ';\n' together,
@@ -195,6 +225,21 @@ def load_rich_cache(path: str) -> dict:
     return {}
 
 
+def snapshot_gaps(snapshot: dict, *already_cached: dict) -> dict:
+    """The snapshot entries for PIDs none of the existing caches has.
+
+    The snapshot is a fallback, not a replacement. A PID whose publications are
+    already cached keeps them, because a fingerprint's cache key includes its
+    publication list: re-sourcing an already-cached person would invalidate
+    their fingerprint and re-embed them for no benefit. Restricting the merge to
+    genuine gaps is what lets the existing artifacts stay byte-identical.
+    """
+    return {
+        pid: pubs for pid, pubs in snapshot.items()
+        if not any(pid in cache for cache in already_cached)
+    }
+
+
 # ---------------------------------------------------------------------------
 # Title utilities
 # ---------------------------------------------------------------------------
@@ -291,26 +336,51 @@ def get_with_retry(
     timeout: int = 30,
     backoff_floor: float = 15,
 ) -> requests.Response:
-    """GET `url`, retrying on a 429 with exponential backoff.
+    """GET `url`, retrying on a 429 or a dropped connection with backoff.
 
     Waits at least `backoff_floor` seconds (or whatever Retry-After says),
     doubling each attempt. DBLP needs an aggressive floor or it'll block the
     IP temporarily; `backoff_floor` exists so a gentler API can pass a much
     shorter one at the call site.
+
+    The doubling restarts at every call — `attempt` is local — so a slow
+    endpoint does not ratchet the delay up across the run. Two things bound it
+    anyway: `Retry-After` is honoured but capped at `MAX_BACKOFF`, since a
+    server is free to name an hour and a silent hour is indistinguishable from
+    a hang, and every wait is announced on stderr for the same reason.
+
+    A connection *reset* is reported separately from a timeout. DBLP drops the
+    connection outright when it has blocked the caller's IP, and that is worth
+    telling apart from a slow network: retrying through it cannot succeed, and
+    the loop callers use it to stop early rather than grind.
     """
     for attempt in range(max_retries):
         try:
             resp = session.get(url, params=params, timeout=timeout, headers=headers)
-        except (requests.ConnectionError, requests.Timeout):
+        except (requests.ConnectionError, requests.Timeout) as exc:
             if attempt == max_retries - 1:
                 raise
-            time.sleep(max(backoff_floor, backoff_floor * (2 ** attempt)))
+            wait = _backoff_delay(backoff_floor, attempt)
+            print(
+                f"    connection failed ({type(exc).__name__}); retrying in "
+                f"{wait:.0f}s (attempt {attempt + 1}/{max_retries})",
+                file=sys.stderr,
+            )
+            time.sleep(wait)
             continue
-        if resp.status_code == 429:
+        if resp.status_code == 429 or resp.status_code in RETRY_STATUSES:
             retry_after = resp.headers.get("Retry-After")
-            wait = (
-                int(retry_after) if retry_after and retry_after.isdigit()
-                else max(backoff_floor, backoff_floor * (2 ** attempt))
+            if retry_after and retry_after.isdigit():
+                wait = min(int(retry_after), MAX_BACKOFF)
+            else:
+                wait = _backoff_delay(backoff_floor, attempt)
+            if attempt == max_retries - 1:
+                break
+            label = "rate-limited" if resp.status_code == 429 else "server busy"
+            print(
+                f"    {label} ({resp.status_code}); waiting {wait:.0f}s "
+                f"(attempt {attempt + 1}/{max_retries})",
+                file=sys.stderr,
             )
             time.sleep(wait)
             continue
@@ -535,6 +605,7 @@ def fetch_titles_for_pids(
     session = session or requests.Session()
     results: dict[str, tuple[list[tuple[int, str]], str]] = {}
     last_was_live = False
+    consecutive_failures = 0
 
     for pid in pids:
         if last_was_live and delay:
@@ -551,11 +622,26 @@ def fetch_titles_for_pids(
                 fallback_when_thin=fallback_when_thin,
             )
         except Exception as exc:  # noqa: BLE001
-            last_was_live = False
+            # A failure means the last thing we did was hit the network and get
+            # nowhere, so the next PID must still be paced. Clearing the flag
+            # here — as this once did — sent the next request out with no delay
+            # at exactly the moment the server had proved it wanted fewer.
+            last_was_live = True
+            consecutive_failures += 1
             if on_error is not None:
                 on_error(pid, exc)
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                raise RuntimeError(
+                    f"{consecutive_failures} consecutive DBLP fetches failed "
+                    f"(last: {pid}). DBLP blocks an IP that asks too fast, and "
+                    f"retrying cannot clear that — only waiting can. "
+                    f"{len(results)} PID(s) succeeded in this pass and "
+                    f"{len(write_cache) if write_cache is not None else 0} are "
+                    f"in the cache overall; re-run later to continue from there."
+                ) from exc
             continue
 
+        consecutive_failures = 0
         last_was_live = source == "live"
         if last_was_live and write_cache is not None and cache_path is not None:
             save_cache(write_cache, cache_path)
@@ -618,6 +704,7 @@ def fetch_records_for_pids(
     session = session or requests.Session()
     results: dict[str, tuple[list[dict], str]] = {}
     last_was_live = False
+    consecutive_failures = 0
 
     for pid in pids:
         if last_was_live and delay:
@@ -632,11 +719,23 @@ def fetch_records_for_pids(
                 readonly_cache=readonly_cache,
             )
         except Exception as exc:  # noqa: BLE001
-            last_was_live = False
+            # Keep pacing after a failure; see fetch_titles_for_pids.
+            last_was_live = True
+            consecutive_failures += 1
             if on_error is not None:
                 on_error(pid, exc)
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                raise RuntimeError(
+                    f"{consecutive_failures} consecutive DBLP fetches failed "
+                    f"(last: {pid}). DBLP blocks an IP that asks too fast, and "
+                    f"retrying cannot clear that — only waiting can. "
+                    f"{len(results)} PID(s) succeeded in this pass and "
+                    f"{len(write_cache) if write_cache is not None else 0} are "
+                    f"in the cache overall; re-run later to continue from there."
+                ) from exc
             continue
 
+        consecutive_failures = 0
         last_was_live = source == "live"
         if last_was_live and write_cache is not None and cache_path is not None:
             save_cache(write_cache, cache_path)

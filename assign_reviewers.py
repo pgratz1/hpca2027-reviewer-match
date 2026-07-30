@@ -79,12 +79,19 @@ from paper_matching import (
     eligible_scores,
     load_papers,
 )
+from reserve_reviewers import DEFAULT_DATA as DEFAULT_RESERVE_DATA
+from reserve_reviewers import DEFAULT_INFO as DEFAULT_RESERVE_INFO
+from reserve_reviewers import load_reserve_reviewers
 from reviewers import load_reviewers
 
 DEFAULT_CSV = "HPCA'27 PC Member Acceptance Form (Responses) - Form Responses 1.csv"
 DEFAULT_DATA = "hpca2027-data.json"
 DEFAULT_FINGERPRINT_CACHE = "fingerprints.json"
 DEFAULT_PAPER_CACHE = "paper_fingerprints.json"
+
+# Reviews a reserve reviewer takes, matching estimate_reserve_need.py's
+# --reviews-per-reserve, which is what the cohort was sized against.
+DEFAULT_RESERVE_CAP = 4
 
 
 def deferred_acceptance(
@@ -249,11 +256,23 @@ def count_blocking_pairs(
     return blocking
 
 
-def reviewer_paper_cap(r, light_cap: int, full_cap: int) -> int:
-    """Per-reviewer paper cap: the CSV's override, if set, else the tier default."""
+def reviewer_paper_cap(
+    r, light_cap: int, full_cap: int, reserve_cap: int = DEFAULT_RESERVE_CAP
+) -> int:
+    """Per-reviewer paper cap: the CSV's override, if set, else the tier default.
+
+    Reserve reviewers agreed to a handful of reviews, not a PC member's load, so
+    their tier is named explicitly. Without that they would fall through to
+    `full_cap` the moment they entered the pool — a silent fifteen-paper
+    assignment for someone who signed up for four.
+    """
     if r.override_cap is not None:
         return r.override_cap
-    return light_cap if r.tier == "light" else full_cap
+    if r.tier == "light":
+        return light_cap
+    if r.tier == "reserve":
+        return reserve_cap
+    return full_cap
 
 
 @dataclass(frozen=True)
@@ -589,8 +608,49 @@ def build_canonical_area_map(reviewers_by_email: dict) -> dict[str, str]:
     return m
 
 
+def report_conflict_coverage(papers: list[dict], reviewers_by_email: dict) -> None:
+    """Print how thoroughly conflicts are declared, per reviewer tier.
+
+    A reviewer nobody has declared a conflict against looks universally
+    available, and the matcher will use them accordingly. Authors have not yet
+    been asked to declare conflicts against recently promoted PC and reserve
+    reviewers, so coverage is uneven — and an assignment that leans on the
+    under-covered tier is more feasible on paper than in life. Printing the
+    asymmetry is what stops the result being read as a clean bill of health.
+    """
+    by_tier: dict[str, list[int]] = defaultdict(list)
+    emails_by_tier: dict[str, set[str]] = defaultdict(set)
+    for email, r in reviewers_by_email.items():
+        emails_by_tier[r.tier].add(email)
+
+    zero_cover: dict[str, int] = defaultdict(int)
+    for paper in papers:
+        declared = {e.lower() for e in (paper.get("pc_conflicts") or {})}
+        for tier, emails in emails_by_tier.items():
+            n = len(declared & emails)
+            by_tier[tier].append(n)
+            if n == 0:
+                zero_cover[tier] += 1
+
+    print("\n=== Declared-conflict coverage ===")
+    print(f"{'tier':<9} {'reviewers':>9} {'mean/paper':>11} {'median':>7} {'papers with none':>18}")
+    for tier in sorted(by_tier):
+        counts = sorted(by_tier[tier])
+        mean = sum(counts) / len(counts) if counts else 0.0
+        median = counts[len(counts) // 2] if counts else 0
+        share = 100 * zero_cover[tier] / len(papers) if papers else 0
+        print(f"{tier:<9} {len(emails_by_tier[tier]):>9} {mean:>11.1f} {median:>7} "
+              f"{zero_cover[tier]:>10} ({share:.0f}%)")
+    print(
+        "Uneven coverage means the thinner tier looks more available than it is; "
+        "conflicts against recently added reviewers have not been collected yet.",
+        file=sys.stderr,
+    )
+
+
 def area_pool_stats(
-    candidate_emails: list[str], reviewers_by_email: dict, light_cap: int, full_cap: int
+    candidate_emails: list[str], reviewers_by_email: dict, light_cap: int, full_cap: int,
+    reserve_cap: int = DEFAULT_RESERVE_CAP,
 ) -> dict[str, dict]:
     """Reviewer-pool size and total capacity per area, counting primary/secondary only
     (matching the area gate's own rule — tertiary doesn't count there either).
@@ -602,11 +662,13 @@ def area_pool_stats(
     stats: dict[str, dict] = {}
     for email in candidate_emails:
         r = reviewers_by_email[email]
-        cap = reviewer_paper_cap(r, light_cap, full_cap)
+        cap = reviewer_paper_cap(r, light_cap, full_cap, reserve_cap)
         for area in {r.primary, r.secondary} - {""}:
-            s = stats.setdefault(area, {"reviewers": 0, "light": 0, "full": 0, "capacity": 0})
+            s = stats.setdefault(
+                area, {"reviewers": 0, "light": 0, "full": 0, "reserve": 0, "capacity": 0}
+            )
             s["reviewers"] += 1
-            s[r.tier] += 1
+            s[r.tier] = s.get(r.tier, 0) + 1
             s["capacity"] += cap
     return stats
 
@@ -681,6 +743,26 @@ def main() -> int:
     )
     parser.add_argument("--light-cap", type=int, default=7, help="max papers per light PC member (default: 7)")
     parser.add_argument("--full-cap", type=int, default=15, help="max papers per full PC member (default: 15)")
+    parser.add_argument(
+        "--include-reserves", action="store_true",
+        help="add the reserve reviewers to the pool (roster, fingerprints and seniority)"
+    )
+    parser.add_argument(
+        "--reserve-cap", type=int, default=DEFAULT_RESERVE_CAP,
+        help=f"max papers per reserve reviewer (default: {DEFAULT_RESERVE_CAP})"
+    )
+    parser.add_argument(
+        "--reserve-info", default=DEFAULT_RESERVE_INFO,
+        help=f"reserve roster for --include-reserves (default: {DEFAULT_RESERVE_INFO})"
+    )
+    parser.add_argument(
+        "--reserve-fingerprint-cache", default="reserve_fingerprints.json",
+        help="reserve fingerprint cache for --include-reserves (default: %(default)s)"
+    )
+    parser.add_argument(
+        "--reserve-seniority", default="reserve_seniority.csv",
+        help="reserve seniority CSV for --include-reserves (default: %(default)s)"
+    )
     parser.add_argument(
         "--area-weight", type=float, default=1.0,
         help="weight of the topics document relative to the title+abstract document (default: 1.0)"
@@ -769,6 +851,41 @@ def main() -> int:
 
     reviewer_fp = fp.load_fingerprint_cache(args.fingerprint_cache)
     reviewers_by_email = {r.email: r for r in load_reviewers(args.csv)}
+
+    if args.include_reserves:
+        reserves = load_reserve_reviewers(args.reserve_info, args.data)
+        reserve_fp = fp.load_fingerprint_cache(args.reserve_fingerprint_cache)
+        reserve_seniority = (
+            {} if seniority is None else load_seniority(args.reserve_seniority)
+        )
+        # A reserve with no fingerprint cannot be scored and one with no
+        # seniority row cannot fill a senior slot. Either way they would simply
+        # be absent from the pool, which is indistinguishable from having none —
+        # so say so rather than let the roster silently shrink.
+        no_fp = [r.email for r in reserves if r.email not in reserve_fp]
+        no_sen = [
+            r.email for r in reserves
+            if seniority is not None and r.email not in reserve_seniority
+        ]
+        if no_fp:
+            print(f"WARNING: {len(no_fp)} reserve(s) have no fingerprint in "
+                  f"{args.reserve_fingerprint_cache} and cannot be assigned: "
+                  f"{', '.join(no_fp[:5])}{' ...' if len(no_fp) > 5 else ''} — "
+                  f"run `make reserves`", file=sys.stderr)
+        if no_sen:
+            print(f"WARNING: {len(no_sen)} reserve(s) have no row in "
+                  f"{args.reserve_seniority}; they can fill slots but never a "
+                  f"senior one: {', '.join(no_sen[:5])}"
+                  f"{' ...' if len(no_sen) > 5 else ''}", file=sys.stderr)
+
+        reviewers_by_email.update({r.email: r for r in reserves})
+        reviewer_fp.update(reserve_fp)
+        if seniority is not None:
+            seniority.update(reserve_seniority)
+        print(f"Reserve reviewers included: {len(reserves)} roster, "
+              f"{len(reserve_fp)} fingerprinted, {len(reserve_seniority)} classified "
+              f"(cap {args.reserve_cap} papers each)", file=sys.stderr)
+
     candidate_emails = [e for e in reviewer_fp if e in reviewers_by_email]
     candidate_matrix = np.array([reviewer_fp[e]["vector"] for e in candidate_emails], dtype=np.float32)
 
@@ -791,7 +908,11 @@ def main() -> int:
         )
         for email, score in pairs_all:
             score_lookup[(email, pid)] = score
-            reviewer_cap[email] = reviewer_paper_cap(reviewers_by_email[email], args.light_cap, args.full_cap)
+            reviewer_cap[email] = reviewer_paper_cap(
+                reviewers_by_email[email], args.light_cap, args.full_cap, args.reserve_cap
+            )
+
+    report_conflict_coverage(papers, reviewers_by_email)
 
     pids = [p["pid"] for p in papers]
     paper_target = {pid: args.reviewers_per_paper for pid in pids}
@@ -901,18 +1022,20 @@ def main() -> int:
             reviewer_load[email] += 1
 
     total_pairs = sum(len(v) for v in paper_held.values())
-    light_over = sum(
-        1
-        for e, n in reviewer_load.items()
-        if reviewers_by_email[e].tier == "light" and n > reviewer_paper_cap(reviewers_by_email[e], args.light_cap, args.full_cap)
-    )
-    full_over = sum(
-        1
-        for e, n in reviewer_load.items()
-        if reviewers_by_email[e].tier == "full" and n > reviewer_paper_cap(reviewers_by_email[e], args.light_cap, args.full_cap)
-    )
+    # Counted per tier rather than by naming 'light' and 'full': a tier the
+    # check doesn't know about would otherwise be exempt from it, which is
+    # exactly how a reserve reviewer could quietly draw a full PC load.
+    over_by_tier: Counter = Counter()
+    for e, n in reviewer_load.items():
+        r = reviewers_by_email[e]
+        if n > reviewer_paper_cap(r, args.light_cap, args.full_cap, args.reserve_cap):
+            over_by_tier[r.tier] += 1
+    light_over = over_by_tier["light"]
+    full_over = over_by_tier["full"]
     canonical_areas = build_canonical_area_map(reviewers_by_email)
-    area_stats = area_pool_stats(candidate_emails, reviewers_by_email, args.light_cap, args.full_cap)
+    area_stats = area_pool_stats(
+        candidate_emails, reviewers_by_email, args.light_cap, args.full_cap, args.reserve_cap
+    )
     total_missing = shortage_report(papers, paper_held, paper_target, area_stats, canonical_areas)
 
     seniority_summary = ""
@@ -951,8 +1074,11 @@ def main() -> int:
     print(
         f"\nDone. {total_pairs} reviewer-paper pairs assigned across {len(papers)} papers, "
         f"{len(reviewer_load)} distinct reviewers used "
-        f"(light cap {args.light_cap}, full cap {args.full_cap}; "
-        f"{light_over} light and {full_over} full over cap — should always be 0; "
+        f"(light cap {args.light_cap}, full cap {args.full_cap}"
+        f"{f', reserve cap {args.reserve_cap}' if args.include_reserves else ''}; "
+        f"{sum(over_by_tier.values())} over cap"
+        f"{' (' + ', '.join(f'{n} {t}' for t, n in sorted(over_by_tier.items())) + ')' if over_by_tier else ''}"
+        f" — should always be 0; "
         f"{blocking} {blocking_label} — should always be 0; "
         f"{seniority_summary}"
         f"{n_excluded} papers excluded and {n_relaxed} relaxed — see relaxation report above; "

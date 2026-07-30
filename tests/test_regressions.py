@@ -6,6 +6,7 @@ import random
 import sys
 import tempfile
 import unittest
+import zipfile
 from collections import Counter
 from pathlib import Path
 from unittest import mock
@@ -17,11 +18,16 @@ import assign_reviewers
 import assign_area_chairs
 import area_chairs
 import build_fingerprints
+import build_dblp_snapshot_cache
+import build_reserve_reviewer_info
+import reserve_reviewers
+import resolve_reserve_pids
 import classify_reviewers
 import compare_abstract_rankings
 import dblp
 import enrich_publications
 import estimate_reserve_need
+import make_smoke_dataset
 import paper_matching
 import fingerprint
 import resolve_trc_members
@@ -274,7 +280,7 @@ class FingerprintCacheTests(unittest.TestCase):
                 return np.ones((len(texts), 768), dtype=np.float32)
 
             common = [
-                mock.patch.object(build_fingerprints, "load_reviewers", return_value=[r]),
+                mock.patch.object(build_fingerprints, "load_roster", return_value=[r]),
                 mock.patch.object(build_fingerprints, "load_cache", return_value={}),
                 mock.patch.object(build_fingerprints, "load_colleague_cache", return_value={}),
                 mock.patch.object(build_fingerprints.specter2_model, "load_model", return_value=(FakeTokenizer(), object())),
@@ -305,7 +311,7 @@ class FingerprintCacheTests(unittest.TestCase):
             self.assertEqual(recovered[r.email]["n_titles"], 1)
 
             with contextlib.ExitStack() as stack:
-                stack.enter_context(mock.patch.object(build_fingerprints, "load_reviewers", return_value=[r]))
+                stack.enter_context(mock.patch.object(build_fingerprints, "load_roster", return_value=[r]))
                 stack.enter_context(mock.patch.object(build_fingerprints, "load_cache", return_value={}))
                 stack.enter_context(mock.patch.object(build_fingerprints, "load_colleague_cache", return_value={}))
                 stack.enter_context(mock.patch.object(build_fingerprints, "fetch_titles_for_pids", side_effect=succeed_fetch))
@@ -687,20 +693,20 @@ def dblp_profile(names, coauthors=(), pubs=1, affiliations=()):
 class TrcRosterTests(unittest.TestCase):
     def test_profile_parse_keeps_coauthor_pids_and_skips_homepages(self):
         xml = (
-            b'<dblpperson name="Hwayong Nam" pid="331/8145">'
-            b'<person key="homepages/331/8145">'
-            b'<author pid="331/8145">Hwayong Nam</author>'
-            b'<note type="affiliation">Seoul National University</note></person>'
+            b'<dblpperson name="Rin Alder" pid="331/0100">'
+            b'<person key="homepages/331/0100">'
+            b'<author pid="331/0100">Rin Alder</author>'
+            b'<note type="affiliation">Northern National University</note></person>'
             b'<r><www><title>Home Page</title><year>2024</year></www></r>'
-            b'<r><inproceedings><author pid="331/8145">Hwayong Nam</author>'
-            b'<author pid="10/1/JungHoAhn">Jung Ho Ahn</author>'
+            b'<r><inproceedings><author pid="331/0100">Rin Alder</author>'
+            b'<author pid="10/1/DanaHaywood">Dana Haywood</author>'
             b'<title>A paper</title><year>2026</year></inproceedings></r>'
             b'</dblpperson>'
         )
         profile = resolve_trc_members.parse_profile(xml)
-        self.assertEqual(["Hwayong Nam"], profile["names"])
-        self.assertEqual(["Seoul National University"], profile["affiliations"])
-        self.assertEqual({"331/8145": "Hwayong Nam", "10/1/JungHoAhn": "Jung Ho Ahn"},
+        self.assertEqual(["Rin Alder"], profile["names"])
+        self.assertEqual(["Northern National University"], profile["affiliations"])
+        self.assertEqual({"331/0100": "Rin Alder", "10/1/DanaHaywood": "Dana Haywood"},
                          profile["coauthors"])
         # The www record is a homepage, not a publication.
         self.assertEqual(1, profile["pubs"])
@@ -708,17 +714,17 @@ class TrcRosterTests(unittest.TestCase):
     def test_search_parse_handles_dblps_collapsed_single_element_lists(self):
         payload = {"result": {"hits": {"hit": {
             "info": {
-                "author": "Mingu Kang 0001",
+                "author": "Rea Diaz 0001",
                 "url": "https://dblp.org/pid/12/3456-1",
-                "aliases": {"alias": "M. Kang"},
+                "aliases": {"alias": "R. Diaz"},
                 "notes": {"note": [
-                    {"@type": "affiliation", "text": "University of California San Diego"},
+                    {"@type": "affiliation", "text": "University of the West Coast"},
                     {"@type": "award", "text": "not an affiliation"},
                 ]},
             }}}}}
         self.assertEqual(
-            [{"name": "Mingu Kang 0001", "pid": "12/3456-1", "aliases": ["M. Kang"],
-              "affiliations": ["University of California San Diego"]}],
+            [{"name": "Rea Diaz 0001", "pid": "12/3456-1", "aliases": ["R. Diaz"],
+              "affiliations": ["University of the West Coast"]}],
             resolve_trc_members.parse_search(payload),
         )
 
@@ -726,8 +732,8 @@ class TrcRosterTests(unittest.TestCase):
         # DBLP's author search is a similarity search: asked for "Cheng Chen"
         # it volunteers people who are not called that at all.
         dblp_stub = FakeDblp(searches={"Cheng Chen": [
-            {"name": "Fu-Chen Cheng 0001", "pid": "241/4667-1", "aliases": [], "affiliations": []},
-            {"name": "Cheng-Zhong Xu 0001", "pid": "181/2765-1", "aliases": [], "affiliations": []},
+            {"name": "Fu-Chen Cheng 0001", "pid": "241/0100-1", "aliases": [], "affiliations": []},
+            {"name": "Cheng-Zhong Wu 0001", "pid": "181/0100-1", "aliases": [], "affiliations": []},
             {"name": "Cheng Chen 0012", "pid": "9/9999", "aliases": [], "affiliations": []},
         ]})
         hits = resolve_trc_members.search_candidates(dblp_stub, "Cheng Chen")
@@ -735,16 +741,16 @@ class TrcRosterTests(unittest.TestCase):
 
     def test_search_falls_back_to_splitting_a_camel_cased_name(self):
         dblp_stub = FakeDblp(searches={
-            "SeyyedHossein SeyyedAghaeiRezaei": [],
-            "Seyyed Hossein Seyyed Aghaei Rezaei": [
-                {"name": "SeyyedHossein SeyyedAghaeiRezaei", "pid": "342/4454",
+            "AliReza MohammadiFarNejad": [],
+            "Ali Reza Mohammadi Far Nejad": [
+                {"name": "AliReza MohammadiFarNejad", "pid": "342/0100",
                  "aliases": [], "affiliations": []},
             ],
         })
         hits = resolve_trc_members.search_candidates(
-            dblp_stub, "SeyyedHossein SeyyedAghaeiRezaei"
+            dblp_stub, "AliReza MohammadiFarNejad"
         )
-        self.assertEqual(["342/4454"], [h["pid"] for h in hits])
+        self.assertEqual(["342/0100"], [h["pid"] for h in hits])
 
     def test_self_declared_pids_ignore_a_misaligned_dblp_field(self):
         aligned = {
@@ -761,42 +767,42 @@ class TrcRosterTests(unittest.TestCase):
         self.assertNotIn("z@x.org", index)
 
     def test_advisor_email_prefers_the_pc_form_over_the_author_list(self):
-        pc_index = {frozenset({"mingu", "kang"}): {"m7kang@ucsd.edu": "UC San Diego"}}
-        author_index = {frozenset({"mingu", "kang"}): {"mingu@ucsd.edu": Counter({"UCSD": 16})}}
+        pc_index = {frozenset({"rea", "diaz"}): {"rdiaz@westcoast.edu": "West Coast U"}}
+        author_index = {frozenset({"rea", "diaz"}): {"rea@westcoast.edu": Counter({"UWC": 16})}}
         self.assertEqual(
-            ("m7kang@ucsd.edu", "pc-form"),
+            ("rdiaz@westcoast.edu", "pc-form"),
             resolve_trc_members.resolve_advisor_email(
-                "Mingu Kang", "University of California San Diego", pc_index, author_index
+                "Rea Diaz", "University of the West Coast", pc_index, author_index
             ),
         )
 
     def test_two_researchers_sharing_a_name_are_split_by_affiliation(self):
-        author_index = {frozenset({"rakesh", "kumar"}): {
-            "rakesh.kumar@ntnu.no": Counter({"Norwegian University of Science and Technology": 8}),
-            "rakeshk@illinois.edu": Counter({"University of Illinois": 6}),
+        author_index = {frozenset({"sam", "oyelaran"}): {
+            "sam.oyelaran@inst-north.no": Counter({"Northern Institute of Science and Technology": 8}),
+            "soyelaran@univ-west.edu": Counter({"University of the West": 6}),
         }}
         self.assertEqual(
-            ("rakesh.kumar@ntnu.no", "hotcrp-author+affiliation"),
+            ("sam.oyelaran@inst-north.no", "hotcrp-author+affiliation"),
             resolve_trc_members.resolve_advisor_email(
-                "Rakesh Kumar", "Norwegian University of Science and Technology", {}, author_index
+                "Sam Oyelaran", "Northern Institute of Science and Technology", {}, author_index
             ),
         )
         # With no affiliation to go on, guessing between them is not allowed.
         email, resolution = resolve_trc_members.resolve_advisor_email(
-            "Rakesh Kumar", "", {}, author_index
+            "Sam Oyelaran", "", {}, author_index
         )
         self.assertIsNone(email)
         self.assertEqual("ambiguous-hotcrp-author(2)", resolution)
 
     def test_one_person_with_two_addresses_resolves_to_the_one_they_use(self):
-        author_index = {frozenset({"jiayi", "huang"}): {
-            "hjy@hkust-gz.edu.cn": Counter({"HKUST(GZ)": 21}),
-            "jiayihuang2022@163.com": Counter({"HKUST (GZ)": 4}),
+        author_index = {frozenset({"nia", "okafor"}): {
+            "nok@univ-east.edu.cn": Counter({"UnivEast(GZ)": 21}),
+            "niaokafor2022@mailhost.com": Counter({"UnivEast (GZ)": 4}),
         }}
         self.assertEqual(
-            ("hjy@hkust-gz.edu.cn", "hotcrp-author+most-used"),
+            ("nok@univ-east.edu.cn", "hotcrp-author+most-used"),
             resolve_trc_members.resolve_advisor_email(
-                "Jiayi Huang", "HKUST(GZ)", {}, author_index
+                "Nia Okafor", "UnivEast(GZ)", {}, author_index
             ),
         )
 
@@ -818,18 +824,18 @@ class TrcRosterTests(unittest.TestCase):
         self.assertEqual("confirmed", resolution)
 
     def test_dblp_homonym_bucket_is_never_accepted(self):
-        # DBLP's bare "Cheng Chen" page collects 725 papers by many people; the
+        # DBLP's bare "Robin Ross" page collects 725 papers by many people; the
         # advisor really has published with it, so co-authorship alone would
         # accept it.
         dblp_stub = FakeDblp(
             profiles={
-                "9/Advisor": dblp_profile(["Hai Jin"], {"10/217": "Cheng Chen"}),
-                "10/217": dblp_profile(["Cheng Chen"], {"9/Advisor": "Hai Jin"}, pubs=725),
+                "9/Advisor": dblp_profile(["Hai Jin"], {"10/217": "Robin Ross"}),
+                "10/217": dblp_profile(["Robin Ross"], {"9/Advisor": "Hai Jin"}, pubs=725),
             },
-            searches={"Cheng Chen": []},
+            searches={"Robin Ross": []},
         )
         pid, resolution, notes = resolve_trc_members.resolve_student_pid(
-            dblp_stub, "Cheng Chen", "HUST", "c@x.org", ["9/Advisor"], {}, 100, 8,
+            dblp_stub, "Robin Ross", "HUST", "c@x.org", ["9/Advisor"], {}, 100, 8,
         )
         self.assertIsNone(pid)
         self.assertEqual("unverified", resolution)
@@ -913,93 +919,93 @@ class TrcRosterTests(unittest.TestCase):
         dblp_stub = FakeDblp(
             profiles={
                 "9/Advisor": dblp_profile(
-                    ["Lieven Eeckhout"], {"342/4454": "SeyyedHossein SeyyedAghaeiRezaei"}
+                    ["Lieven Eeckhout"], {"342/0100": "AliReza MohammadiFarNejad"}
                 ),
-                "342/4454": dblp_profile(
-                    ["SeyyedHossein SeyyedAghaeiRezaei"], {"9/Advisor": "Lieven Eeckhout"}, pubs=6
+                "342/0100": dblp_profile(
+                    ["AliReza MohammadiFarNejad"], {"9/Advisor": "Lieven Eeckhout"}, pubs=6
                 ),
             },
-            searches={"Hossein SeyyedAghaei": [], "Hossein Seyyed Aghaei": []},
+            searches={"Reza MohammadiFar": [], "Reza Mohammadi Far": []},
         )
         pid, resolution, notes = resolve_trc_members.resolve_student_pid(
-            dblp_stub, "Hossein SeyyedAghaei", "Ghent University", "h@x.org", ["9/Advisor"],
-            {"h@x.org": Counter({"342/4454": 2})}, 100, 8,
+            dblp_stub, "Reza MohammadiFar", "Riverside University", "h@x.org", ["9/Advisor"],
+            {"h@x.org": Counter({"342/0100": 2})}, 100, 8,
         )
-        self.assertEqual("342/4454", pid)
+        self.assertEqual("342/0100", pid)
         # Proposed by the student's own submission, confirmed by co-authorship.
         self.assertEqual("confirmed-self-declared", resolution)
         self.assertIn("spells the name differently", " ".join(notes))
 
         # Self-declared alone, with a name nobody can check, is not enough.
         unbacked = FakeDblp(
-            profiles={"342/4454": dblp_profile(["SeyyedHossein SeyyedAghaeiRezaei"], pubs=6)},
-            searches={"Hossein SeyyedAghaei": [], "Hossein Seyyed Aghaei": []},
+            profiles={"342/0100": dblp_profile(["AliReza MohammadiFarNejad"], pubs=6)},
+            searches={"Reza MohammadiFar": [], "Reza Mohammadi Far": []},
         )
         pid, resolution, notes = resolve_trc_members.resolve_student_pid(
-            unbacked, "Hossein SeyyedAghaei", "Ghent University", "h@x.org", [],
-            {"h@x.org": Counter({"342/4454": 2})}, 100, 8,
+            unbacked, "Reza MohammadiFar", "Riverside University", "h@x.org", [],
+            {"h@x.org": Counter({"342/0100": 2})}, 100, 8,
         )
         self.assertIsNone(pid)
         self.assertEqual("unverified", resolution)
         # The page it looked at is named, so a human can finish in one click.
-        self.assertIn("342/4454", " ".join(notes))
+        self.assertIn("342/0100", " ".join(notes))
 
     def test_one_name_transliterated_two_ways_still_needs_confirming(self):
         compatible = resolve_trc_members.tokens_compatible
         tokens = dblp.name_tokens
-        self.assertEqual("partial", compatible(tokens("Maryam Elgamal"), tokens("Mariam Elgamal")))
+        self.assertEqual("partial", compatible(tokens("Nadya Serrano"), tokens("Nadia Serrano")))
         # One shared token is required, so unrelated short names stay apart.
         self.assertIsNone(compatible(tokens("Jing Li"), tokens("Jung Lee")))
         self.assertIsNone(compatible(tokens("Yi Zhang"), tokens("Yu Huang")))
         # A dropped or added leading consonant is a different given name, not
         # a respelling — "Heng Chen" is not "Cheng Chen", however close the
-        # strings score, and both really do co-author with the same advisor.
+        # strings score, and both may co-author with the same advisor.
         self.assertIsNone(compatible(tokens("Cheng Chen"), tokens("Heng Chen")))
         self.assertIsNone(compatible(tokens("Jing Zhao"), tokens("Jin Zhao")))
         self.assertIsNone(compatible(tokens("Yong Kim"), tokens("Yang Kim")))
 
         dblp_stub = FakeDblp(
             profiles={
-                "9/Advisor": dblp_profile(["David Brooks"], {"9/Student": "Mariam Elgamal"}),
-                "9/Student": dblp_profile(["Mariam Elgamal"], {"9/Advisor": "David Brooks"}, pubs=5),
+                "9/Advisor": dblp_profile(["Noel Frame"], {"9/Student": "Nadia Serrano"}),
+                "9/Student": dblp_profile(["Nadia Serrano"], {"9/Advisor": "Noel Frame"}, pubs=5),
             },
-            searches={"Maryam Elgamal": []},
+            searches={"Nadya Serrano": []},
         )
         pid, resolution, _ = resolve_trc_members.resolve_student_pid(
-            dblp_stub, "Maryam Elgamal", "Harvard", "m@x.org", ["9/Advisor"], {}, 100, 8,
+            dblp_stub, "Nadya Serrano", "Eastwood", "m@x.org", ["9/Advisor"], {}, 100, 8,
         )
         self.assertEqual("9/Student", pid)
         self.assertEqual("confirmed-coauthor", resolution)
 
     def test_namesakes_of_one_advisor_are_split_by_dblps_affiliation(self):
-        # DBLP has three "Zihan Xia" pages and Mingu Kang has published with
-        # more than one of them; only one of the three is at UCSD.
+        # DBLP has three "Lior Bem" pages and Rea Diaz has published with
+        # more than one of them; only one of the three is at UWC.
         dblp_stub = FakeDblp(profiles={
-            "9/Advisor": dblp_profile(["Mingu Kang"], {
-                "244/0846": "Zihan Xia", "244/0846-2": "Zihan Xia 0002",
-                "244/0846-5": "Zihan Xia 0005",
+            "9/Advisor": dblp_profile(["Rea Diaz"], {
+                "244/0100": "Lior Bem", "244/0100-2": "Lior Bem 0002",
+                "244/0100-5": "Lior Bem 0005",
             }),
-            "244/0846": dblp_profile(["Zihan Xia"], pubs=7),
-            "244/0846-2": dblp_profile(
-                ["Zihan Xia 0002"], pubs=16,
-                affiliations=["University of Electronic Science and Technology of China"],
+            "244/0100": dblp_profile(["Lior Bem"], pubs=7),
+            "244/0100-2": dblp_profile(
+                ["Lior Bem 0002"], pubs=16,
+                affiliations=["Institute of Electronic Science and Technology"],
             ),
-            "244/0846-5": dblp_profile(
-                ["Zihan Xia 0005"], pubs=1,
-                affiliations=["University of California, San Diego, CA, USA"],
+            "244/0100-5": dblp_profile(
+                ["Lior Bem 0005"], pubs=1,
+                affiliations=["University of the West Coast, Bayview, CA, USA"],
             ),
-        }, searches={"Zihan Xia": []})
+        }, searches={"Lior Bem": []})
         pid, resolution, notes = resolve_trc_members.resolve_student_pid(
-            dblp_stub, "Zihan Xia", "University of California San Diego", "z@x.org",
+            dblp_stub, "Lior Bem", "University of the West Coast", "z@x.org",
             ["9/Advisor"], {}, 100, 8,
         )
-        self.assertEqual("244/0846-5", pid)
+        self.assertEqual("244/0100-5", pid)
         self.assertEqual("confirmed-coauthor", resolution)
         self.assertIn("recorded affiliation", " ".join(notes))
 
         # With no affiliation to go on, all three stay in contention.
         pid, resolution, _ = resolve_trc_members.resolve_student_pid(
-            dblp_stub, "Zihan Xia", "", "z@x.org", ["9/Advisor"], {}, 100, 8,
+            dblp_stub, "Lior Bem", "", "z@x.org", ["9/Advisor"], {}, 100, 8,
         )
         self.assertIsNone(pid)
         self.assertEqual("ambiguous", resolution)
@@ -1007,36 +1013,36 @@ class TrcRosterTests(unittest.TestCase):
     def test_a_declined_pc_member_is_found_by_their_address_alone(self):
         # Declining the invitation leaves every column blank but the address,
         # which is still the HotCRP account a conflict needs.
-        unnamed = [("hanjun@yonsei.ac.kr", "")]
+        unnamed = [("rosalind@blue.ac.kr", "")]
         self.assertEqual(
-            ("hanjun@yonsei.ac.kr", "pc-form-address"),
+            ("rosalind@blue.ac.kr", "pc-form-address"),
             resolve_trc_members.resolve_advisor_email(
-                "Hanjun Kim", "Yonsei University", {}, {}, unnamed
+                "Rosalind Ng", "Blue University", {}, {}, unnamed
             ),
         )
         # The domain has to be their institution too.
         self.assertEqual(
             (None, "not-found"),
             resolve_trc_members.resolve_advisor_email(
-                "Hanjun Kim", "Seoul National University", {}, {}, unnamed
+                "Rosalind Ng", "Green University", {}, {}, unnamed
             ),
         )
         # A bare surname names half a department, so it names nobody.
         self.assertEqual(
             (None, "not-found"),
             resolve_trc_members.resolve_advisor_email(
-                "Hanjun Kim", "Yonsei University", {}, {}, [("kim@yonsei.ac.kr", "")]
+                "Rosalind Ng", "Blue University", {}, {}, [("ng@blue.ac.kr", "")]
             ),
         )
 
     def test_too_many_matching_pages_are_left_for_a_human(self):
-        coauthors = {f"9/{i}": "Wei Wang" for i in range(12)}
+        coauthors = {f"9/{i}": "Lee Park" for i in range(12)}
         dblp_stub = FakeDblp(
             profiles={"9/Advisor": dblp_profile(["An Advisor"], coauthors)},
-            searches={"Wei Wang": []},
+            searches={"Lee Park": []},
         )
         pid, resolution, notes = resolve_trc_members.resolve_student_pid(
-            dblp_stub, "Wei Wang", "Example University", "w@x.org", ["9/Advisor"], {}, 100, 8,
+            dblp_stub, "Lee Park", "Example University", "w@x.org", ["9/Advisor"], {}, 100, 8,
         )
         self.assertIsNone(pid)
         self.assertEqual("ambiguous", resolution)
@@ -1046,8 +1052,8 @@ class TrcRosterTests(unittest.TestCase):
 
     def test_affiliation_tokens_drop_the_words_every_institution_shares(self):
         tokens = resolve_trc_members.affiliation_tokens
-        self.assertEqual(frozenset({"california", "san", "diego"}),
-                         tokens("University of California San Diego"))
+        self.assertEqual(frozenset({"west", "coast"}),
+                         tokens("University of the West Coast"))
         # A title prefixed to the cell must not become the institution.
         self.assertEqual(tokens("National University of Singapore"),
                          tokens("Professor, National University of Singapore"))
@@ -1058,6 +1064,705 @@ class TrcRosterTests(unittest.TestCase):
                          resolve_trc_members.split_advisor_names("Xiaofei Liao (or Hai Jin)"))
         self.assertEqual(["Solo Advisor"],
                          resolve_trc_members.split_advisor_names("Solo Advisor"))
+
+
+SNAPSHOT_FIXTURE = """<?xml version="1.0" encoding="ISO-8859-1"?>
+<!DOCTYPE dblp SYSTEM "dblp-2023-06-28.dtd">
+<dblp>
+<www key="homepages/1/Alpha">
+<author>Fran&ccedil;ois Alpha</author>
+<author>F. Alpha</author>
+<title>Home Page</title>
+</www>
+<www key="homepages/2/Beta">
+<author>Mei Lam 0001</author>
+<title>Home Page</title>
+</www>
+<www key="homepages/9/Other">
+<author>Nobody Wanted</author>
+<title>Home Page</title>
+</www>
+<inproceedings key="conf/isca/A1">
+<author>Fran&ccedil;ois Alpha</author>
+<author>Mei Lam 0001</author>
+<title>A <i>conference</i> paper.</title>
+<booktitle>ISCA</booktitle>
+<year>2025</year>
+<ee>https://doi.org/10.1145/1234567.8901234</ee>
+</inproceedings>
+<article key="journals/tc/A2">
+<author>F. Alpha</author>
+<title>A journal paper.</title>
+<journal>IEEE Trans. Computers</journal>
+<year>2023</year>
+</article>
+<inproceedings key="conf/x/Z9">
+<author>Nobody Wanted</author>
+<title>Not ours.</title>
+<booktitle>NOPE</booktitle>
+<year>2024</year>
+</inproceedings>
+<article key="journals/x/NoYear">
+<author>Mei Lam 0001</author>
+<title>Undated.</title>
+<journal>J</journal>
+</article>
+</dblp>
+"""
+
+
+class DblpSnapshotTests(unittest.TestCase):
+    """build_dblp_snapshot_cache.py: serving publications from the local dump."""
+
+    def setUp(self):
+        self.path = str(Path(tempfile.mkdtemp()) / "dblp.xml")
+        Path(self.path).write_text(SNAPSHOT_FIXTURE, encoding="utf-8")
+
+    def extract(self, wanted):
+        names = build_dblp_snapshot_cache.collect_names(self.path, set(wanted))
+        by_name = {n: pid for pid, spellings in names.items() for n in spellings}
+        return names, build_dblp_snapshot_cache.collect_publications(self.path, by_name)
+
+    def test_person_records_decode_entities_and_list_every_spelling(self):
+        # The dump declares a DTD it does not ship and uses named HTML
+        # entities; a stock parse dies on the first one.
+        names, _ = self.extract({"1/Alpha", "2/Beta"})
+        self.assertEqual(["François Alpha", "F. Alpha"], names["1/Alpha"])
+        self.assertEqual(["Mei Lam 0001"], names["2/Beta"])
+        self.assertNotIn("9/Other", names)
+
+    def test_every_spelling_of_a_name_collects_that_persons_papers(self):
+        # DBLP records some papers under an alias. Matching only the canonical
+        # spelling would silently lose them.
+        _, pubs = self.extract({"1/Alpha"})
+        self.assertEqual({"A conference paper.", "A journal paper."},
+                         {p["title"] for p in pubs["1/Alpha"]})
+
+    def test_records_match_the_shape_the_live_fetch_returns(self):
+        _, pubs = self.extract({"1/Alpha", "2/Beta"})
+        conference = next(p for p in pubs["1/Alpha"] if p["venue"] == "ISCA")
+        self.assertEqual(
+            {"title": "A conference paper.", "year": 2025, "venue": "ISCA",
+             "type": "inproceedings", "doi": "10.1145/1234567.8901234"},
+            conference,
+        )
+        # Venue is the booktitle for a conference and the journal for an
+        # article, exactly as _fetch_all_records_from_dblp decides it.
+        journal = next(p for p in pubs["1/Alpha"] if p["type"] == "article")
+        self.assertEqual("IEEE Trans. Computers", journal["venue"])
+        self.assertEqual("", journal["doi"])
+        # A co-authored paper belongs to both of them.
+        self.assertIn("A conference paper.", {p["title"] for p in pubs["2/Beta"]})
+        # Year-descending, as the live path sorts.
+        years = [p["year"] for p in pubs["1/Alpha"]]
+        self.assertEqual(sorted(years, reverse=True), years)
+
+    def test_unwanted_people_undated_records_and_home_pages_are_skipped(self):
+        _, pubs = self.extract({"1/Alpha", "2/Beta"})
+        self.assertNotIn("9/Other", pubs)
+        # A record with no year cannot be windowed, so it is dropped.
+        self.assertNotIn("Undated.", {p["title"] for p in pubs["2/Beta"]})
+        # A person record lists its owner as an author; it is not a publication.
+        self.assertNotIn("Home Page", {p["title"] for p in pubs["2/Beta"]})
+
+    def test_snapshot_only_fills_gaps_it_never_replaces_a_cached_pid(self):
+        # The fingerprint key includes the publication list, so re-sourcing an
+        # already-cached person would invalidate and re-embed them.
+        snapshot = {"a": ["snap"], "b": ["snap"], "c": ["snap"]}
+        gaps = dblp.snapshot_gaps(snapshot, {"a": ["colleague"]}, {"b": ["ours"]})
+        self.assertEqual({"c": ["snap"]}, gaps)
+        merged = {**gaps, **{"a": ["colleague"]}}
+        self.assertEqual(["colleague"], merged["a"])
+
+
+class BackoffTests(unittest.TestCase):
+    """dblp.py's retry and pacing behaviour under a hostile server."""
+
+    def test_backoff_restarts_each_call_and_is_capped(self):
+        # The doubling is indexed by attempt-within-a-call, so it cannot ratchet
+        # upward across a run; and the cap has to survive the jitter, which is
+        # applied after it.
+        first = [dblp._backoff_delay(15, 0) for _ in range(50)]
+        self.assertTrue(all(15 <= d <= 15 * 1.25 for d in first))
+        for attempt in range(10):
+            delays = [dblp._backoff_delay(15, attempt) for _ in range(50)]
+            self.assertTrue(all(15 <= d <= dblp.MAX_BACKOFF for d in delays),
+                            f"attempt {attempt} escaped [floor, MAX_BACKOFF]")
+
+    def test_retry_after_is_honoured_but_capped(self):
+        # A server may name any delay it likes. An uncapped one is a silent hour
+        # that looks exactly like a hang.
+        session = mock.Mock()
+        limited = mock.Mock(status_code=429, headers={"Retry-After": "86400"})
+        ok = mock.Mock(status_code=200, headers={})
+        ok.raise_for_status = mock.Mock()
+        session.get.side_effect = [limited, ok]
+        with mock.patch.object(dblp.time, "sleep") as slept, \
+                contextlib.redirect_stderr(io.StringIO()):
+            dblp.get_with_retry(session, "https://dblp.org/pid/1/A.xml")
+        self.assertEqual(1, slept.call_count)
+        self.assertEqual(dblp.MAX_BACKOFF, slept.call_args[0][0])
+
+    def test_server_busy_statuses_back_off_instead_of_raising(self):
+        # DBLP answers 503 when shedding load. Raising on it immediately meant a
+        # batch burned its whole consecutive-failure budget in seconds without
+        # ever pausing -- the opposite of what the server asked for.
+        session = mock.Mock()
+        busy = mock.Mock(status_code=503, headers={})
+        ok = mock.Mock(status_code=200, headers={})
+        ok.raise_for_status = mock.Mock()
+        session.get.side_effect = [busy, busy, ok]
+        with mock.patch.object(dblp.time, "sleep") as slept, \
+                contextlib.redirect_stderr(io.StringIO()):
+            got = dblp.get_with_retry(session, "https://dblp.org/pid/1/A.xml")
+        self.assertIs(ok, got)
+        self.assertEqual(2, slept.call_count)
+        self.assertTrue(all(c[0][0] >= 15 for c in slept.call_args_list))
+
+    def test_a_failed_fetch_still_paces_the_next_one(self):
+        # The bug this guards: clearing the "last request was live" flag on
+        # failure sent the very next request out with no delay, at exactly the
+        # moment the server had demonstrated it wanted fewer of them.
+        calls = []
+
+        def fetch(pid, **kwargs):
+            calls.append(pid)
+            if pid == "1/A":
+                raise requests.ConnectionError("reset by peer")
+            return [(2026, "A title")], "live"
+
+        with mock.patch.object(dblp, "fetch_titles", side_effect=fetch), \
+                mock.patch.object(dblp.time, "sleep") as slept:
+            dblp.fetch_titles_for_pids(["1/A", "2/B"], delay=3.0, on_error=lambda p, e: None)
+        self.assertEqual(["1/A", "2/B"], calls)
+        self.assertTrue(slept.called, "no pacing delay before the PID after a failure")
+
+    def test_repeated_failures_stop_rather_than_grind(self):
+        # DBLP drops connections when it has blocked an IP; retrying cannot
+        # clear that, so the loop must give up and keep what it cached.
+        def always_fail(pid, **kwargs):
+            raise requests.ConnectionError("reset by peer")
+
+        errors = []
+        with mock.patch.object(dblp, "fetch_titles", side_effect=always_fail), \
+                mock.patch.object(dblp.time, "sleep"):
+            with self.assertRaises(RuntimeError) as caught:
+                dblp.fetch_titles_for_pids(
+                    [f"{i}/X" for i in range(50)], delay=3.0,
+                    on_error=lambda p, e: errors.append(p),
+                )
+        self.assertIn("consecutive", str(caught.exception))
+        self.assertEqual(dblp.MAX_CONSECUTIVE_FAILURES, len(errors))
+
+    def test_an_intermittent_failure_does_not_stop_the_run(self):
+        # Only *consecutive* failures mean a block; a success resets the count.
+        def flaky(pid, **kwargs):
+            if pid.startswith(("0", "2", "4")):
+                raise requests.ConnectionError("blip")
+            return [(2026, "A title")], "live"
+
+        with mock.patch.object(dblp, "fetch_titles", side_effect=flaky), \
+                mock.patch.object(dblp.time, "sleep"):
+            results = dblp.fetch_titles_for_pids(
+                [f"{i}/X" for i in range(10)], delay=3.0, on_error=lambda p, e: None,
+            )
+        # 0, 2 and 4 fail; the other seven get through.
+        self.assertEqual(7, len(results))
+
+
+class ReserveReviewerLoaderTests(unittest.TestCase):
+    """reserve_reviewers.py: a roster with no acceptance form behind it."""
+
+    def load(self, roster, papers):
+        tmp = Path(tempfile.mkdtemp())
+        info, data = tmp / "info.csv", tmp / "papers.json"
+        with info.open("w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["email", "name", "dblp"])
+            w.writeheader()
+            for email, name, link in roster:
+                w.writerow({"email": email, "name": name, "dblp": link})
+        data.write_text(json.dumps(papers), encoding="utf-8")
+        return reserve_reviewers.load_reserve_reviewers(str(info), str(data))
+
+    def paper(self, topics, authors=(), nominates=""):
+        return {"pid": 1, "topics": list(topics), "reserve_reviewer": nominates,
+                "authors": [{"email": e, "given_name": "A", "family_name": "B",
+                             "affiliation": "Somewhere"} for e in authors],
+                "contacts": []}
+
+    def test_reserve_tier_gets_its_own_cap_not_the_full_one(self):
+        # reviewer_paper_cap returned full_cap for any tier that wasn't 'light',
+        # so a reserve entering the pool would silently be handed a PC load.
+        def rv(tier, override=None):
+            return Reviewer(
+                email="e@x.edu", first="A", last="B", dblp_url="", pid=None,
+                affiliation="", primary="", secondary="", tertiary="", keywords="",
+                tier=tier, override_cap=override,
+            )
+
+        cap = assign_reviewers.reviewer_paper_cap
+        self.assertEqual(15, cap(rv("full"), 7, 15))
+        self.assertEqual(7, cap(rv("light"), 7, 15))
+        self.assertEqual(assign_reviewers.DEFAULT_RESERVE_CAP, cap(rv("reserve"), 7, 15))
+        self.assertEqual(2, cap(rv("reserve"), 7, 15, 2))
+        # An explicit per-person override still wins over the tier default.
+        self.assertEqual(9, cap(rv("reserve", 9), 7, 15))
+
+    def test_areas_come_from_the_papers_they_authored(self):
+        # The gate reads primary and secondary, so the two most frequent topics
+        # have to land there -- and in frequency order, not paper order.
+        reserves = self.load(
+            [("a@x.edu", "Ada Lovelace", "https://dblp.org/pid/1/A.html")],
+            [self.paper(["Memory Systems", "GPUs"], ["a@x.edu"]),
+             self.paper(["Memory Systems"], ["a@x.edu"]),
+             self.paper(["Memory Systems", "GPUs"], ["a@x.edu"]),
+             self.paper(["Security"], ["someone.else@x.edu"])],
+        )
+        self.assertEqual(1, len(reserves))
+        r = reserves[0]
+        self.assertEqual("Memory Systems", r.primary)
+        self.assertEqual("GPUs", r.secondary)
+        self.assertEqual("reserve", r.tier)
+        self.assertEqual("1/A", r.pid)
+        self.assertIsNone(r.override_cap)
+        # Somebody else's topic must not leak in.
+        self.assertNotIn("Security", (r.primary, r.secondary, r.tertiary))
+
+    def test_nomination_topics_are_the_fallback_for_a_non_author(self):
+        # A reserve who wrote nothing is still characterised by the papers that
+        # nominated them, rather than being left area-less and gated out.
+        reserves = self.load(
+            [("n@x.edu", "Nom Inee", "https://dblp.org/pid/2/N.html")],
+            [self.paper(["Quantum Computing"], [],
+                        nominates="Nom Inee / Somewhere / n@x.edu")],
+        )
+        self.assertEqual("Quantum Computing", reserves[0].primary)
+
+    def test_ties_break_alphabetically_so_areas_are_reproducible(self):
+        # Counter.most_common leaves ties in insertion order, which follows the
+        # order papers happen to appear in the export -- and every fingerprint
+        # built from these areas would shift with it.
+        forward = self.load(
+            [("a@x.edu", "Ada", "https://dblp.org/pid/1/A.html")],
+            [self.paper(["Zebra", "Alpha"], ["a@x.edu"])],
+        )
+        backward = self.load(
+            [("a@x.edu", "Ada", "https://dblp.org/pid/1/A.html")],
+            [self.paper(["Alpha", "Zebra"], ["a@x.edu"])],
+        )
+        self.assertEqual("Alpha", forward[0].primary)
+        self.assertEqual(forward[0].primary, backward[0].primary)
+        self.assertEqual(forward[0].secondary, backward[0].secondary)
+
+    def test_derived_areas_satisfy_the_real_area_gate(self):
+        # The whole point: these areas must pass paper_matching's own gate. The
+        # paper they are scored against has to be somebody else's — the paper
+        # their areas were *derived* from is one they wrote, and so is
+        # conflicted out before the gate is ever consulted.
+        own = self.paper(["Memory Systems", "GPUs"], ["a@x.edu"])
+        someone_elses = self.paper(["Memory Systems", "GPUs"], ["other@x.edu"])
+        r = self.load([("a@x.edu", "Ada", "https://dblp.org/pid/1/A.html")], [own])[0]
+        args = ([r.email], np.ones((1, 3), dtype=np.float32),
+                np.ones(3, dtype=np.float32), {r.email: r})
+
+        scored = paper_matching.eligible_scores(someone_elses, *args, area_gate=True)
+        self.assertEqual([r.email], [e for e, _ in scored])
+
+        # And the conflict outranks the area match on their own paper.
+        self.assertEqual([], paper_matching.eligible_scores(own, *args, area_gate=True))
+
+
+class SmokeDatasetTests(unittest.TestCase):
+    """make_smoke_dataset.py: the seeded stand-in for papers never submitted."""
+
+    def test_the_same_seed_reproduces_the_same_draw(self):
+        # Two assignment runs are only comparable if the paper set holds still.
+        pids = list(range(1, 101))
+        a = make_smoke_dataset.choose_withdrawn(pids, 0.30, 20260730)
+        b = make_smoke_dataset.choose_withdrawn(pids, 0.30, 20260730)
+        self.assertEqual(a, b)
+        self.assertEqual(30, len(a))
+        self.assertNotEqual(a, make_smoke_dataset.choose_withdrawn(pids, 0.30, 1))
+
+    def test_the_draw_does_not_depend_on_input_order(self):
+        # The export's order is incidental; sorting first keeps the draw a
+        # function of the seed and the paper set alone.
+        pids = list(range(1, 51))
+        forward = make_smoke_dataset.choose_withdrawn(pids, 0.20, 7)
+        backward = make_smoke_dataset.choose_withdrawn(list(reversed(pids)), 0.20, 7)
+        self.assertEqual(forward, backward)
+
+    def test_withdrawn_papers_are_marked_not_deleted(self):
+        # Marking means paper_matching's own _is_withdrawn drops them, so the
+        # smoke run exercises the real selection path rather than a test filter.
+        tmp = Path(tempfile.mkdtemp())
+        data, out = tmp / "in.json", tmp / "out.json"
+        papers = [
+            {"pid": i, "title": f"Paper {i}", "abstract": "One sentence. And two.",
+             "authors": [{"email": f"a{i}@x.edu"}], "topics": ["Memory Systems"],
+             "status": "draft"}
+            for i in range(1, 11)
+        ]
+        data.write_text(json.dumps(papers), encoding="utf-8")
+        argv = ["make_smoke_dataset.py", "--data", str(data), "--out", str(out),
+                "--fraction", "0.30", "--seed", "5"]
+        with mock.patch.object(sys, "argv", argv), contextlib.redirect_stderr(io.StringIO()):
+            make_smoke_dataset.main()
+
+        written = json.loads(out.read_text())
+        self.assertEqual(10, len(written), "papers must be marked, never dropped")
+        self.assertEqual(3, sum(1 for p in written if p.get("withdrawn")))
+        self.assertEqual(7, len(paper_matching.load_papers(str(out), paper_policy="registered")))
+
+    def test_it_refuses_to_overwrite_the_real_export(self):
+        tmp = Path(tempfile.mkdtemp())
+        data = tmp / "in.json"
+        data.write_text("[]", encoding="utf-8")
+        argv = ["make_smoke_dataset.py", "--data", str(data), "--out", str(data)]
+        with mock.patch.object(sys, "argv", argv), \
+                contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaises(SystemExit):
+            make_smoke_dataset.main()
+
+
+class OwnPaperConflictTests(unittest.TestCase):
+    """paper_matching.own_paper_conflicts: the COI floor under pc_conflicts."""
+
+    def paper(self, **kwargs):
+        base = {"pid": 1, "topics": ["Memory Systems"], "authors": [], "contacts": [],
+                "pc_conflicts": {}, "reserve_reviewer": ""}
+        base.update(kwargs)
+        return base
+
+    def test_authors_and_contacts_conflict_even_with_no_declared_coi(self):
+        # Three reserve reviewers currently have no conflict recorded anywhere
+        # while authoring 18 submissions; without this the matcher hands them
+        # their own papers.
+        p = self.paper(
+            authors=[{"email": "Author@dept.univ-a.edu"}],
+            contacts=[{"email": "contact@x.edu"}],
+        )
+        self.assertEqual({"author@dept.univ-a.edu", "contact@x.edu"},
+                         paper_matching.own_paper_conflicts(p))
+
+    def test_a_nominated_reserve_reviewer_conflicts_with_the_nominating_paper(self):
+        # HPCA's nomination field names a senior author of that same paper.
+        p = self.paper(reserve_reviewer="Ada Lovelace / Somewhere / ada@x.edu\n"
+                                        "Bob Smith / Elsewhere / bob@x.edu")
+        self.assertEqual({"ada@x.edu", "bob@x.edu"},
+                         paper_matching.own_paper_conflicts(p))
+
+    def test_it_only_adds_to_the_declared_conflicts_never_replaces_them(self):
+        r = reviewer()
+        p = self.paper(pid=2, authors=[{"email": "someone@else.edu"}],
+                       pc_conflicts={r.email: 1})
+        args = ([r.email], np.ones((1, 3), dtype=np.float32),
+                np.ones(3, dtype=np.float32), {r.email: r})
+        # Declared conflict still excludes them, though they wrote nothing.
+        self.assertEqual([], paper_matching.eligible_scores(p, *args, area_gate=False))
+
+    def test_a_malformed_nomination_line_is_ignored_not_guessed_at(self):
+        p = self.paper(reserve_reviewer="Just A Name\nNo Email / Somewhere\n")
+        self.assertEqual(set(), paper_matching.own_paper_conflicts(p))
+
+
+class ReservePidResolverTests(unittest.TestCase):
+    """resolve_reserve_pids.py: proposing DBLP pages from the submissions."""
+
+    def test_rerun_keeps_rows_no_longer_listed_as_unresolved(self):
+        # Resolving someone drops them off the unresolved list. Rebuilding the
+        # override file from that list alone would delete the decision that
+        # resolved them, and the next roster rebuild would lose them entirely.
+        tmp = Path(tempfile.mkdtemp())
+        overrides, unresolved, data = (tmp / "ov.csv", tmp / "un.csv", tmp / "papers.json")
+        with overrides.open("w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["email", "dblp", "note"])
+            w.writeheader()
+            w.writerow({"email": "settled@x.edu", "dblp": "https://dblp.org/pid/1/A.html",
+                        "note": "resolved on an earlier run"})
+        with unresolved.open("w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["email", "name", "dblp_url", "problem", "detail"])
+            w.writeheader()
+            w.writerow({"email": "still@x.edu", "name": "Nobody Here",
+                        "dblp_url": "", "problem": "no_dblp_url", "detail": ""})
+        data.write_text("[]", encoding="utf-8")
+
+        argv = ["resolve_reserve_pids.py", "--unresolved", str(unresolved),
+                "--data", str(data), "--out", str(overrides), "--no-network"]
+        with mock.patch.object(sys, "argv", argv), contextlib.redirect_stderr(io.StringIO()):
+            resolve_reserve_pids.main()
+
+        with overrides.open(newline="", encoding="utf-8") as f:
+            rows = {r["email"]: r for r in csv.DictReader(f)}
+        self.assertIn("settled@x.edu", rows)
+        self.assertEqual("https://dblp.org/pid/1/A.html", rows["settled@x.edu"]["dblp"])
+        self.assertEqual("resolved on an earlier run", rows["settled@x.edu"]["note"])
+        # The still-unresolved person is present too, as a blank to-do row.
+        self.assertEqual("", rows["still@x.edu"]["dblp"])
+
+
+def _cell_ref(column, row):
+    letters = ""
+    while True:
+        column, remainder = divmod(column, 26)
+        letters = chr(ord("A") + remainder) + letters
+        if column == 0:
+            break
+        column -= 1
+    return f"{letters}{row}"
+
+
+def write_xlsx(path, rows, *, shared_strings=False, sheet_name="All"):
+    """A minimal .xlsx holding one worksheet of text cells.
+
+    Only the parts read_sheet actually opens are written. A None cell is left
+    out of the XML entirely, which is how a real writer records a gap.
+    """
+    interned = []
+    sheet = ['<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>']
+    for r, row in enumerate(rows, start=1):
+        sheet.append(f'<row r="{r}">')
+        for c, value in enumerate(row):
+            if value is None:
+                continue
+            ref = _cell_ref(c, r)
+            if shared_strings:
+                if value not in interned:
+                    interned.append(value)
+                sheet.append(f'<c r="{ref}" t="s"><v>{interned.index(value)}</v></c>')
+            else:
+                sheet.append(f'<c r="{ref}" t="inlineStr"><is><t>{value}</t></is></c>')
+        sheet.append("</row>")
+    sheet.append("</sheetData></worksheet>")
+
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "xl/workbook.xml",
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+            ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            f'<sheets><sheet name="{sheet_name}" sheetId="1" r:id="rId1"/></sheets></workbook>',
+        )
+        archive.writestr(
+            "xl/_rels/workbook.xml.rels",
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Target="/xl/worksheets/sheet1.xml" Type="worksheet"/>'
+            "</Relationships>",
+        )
+        archive.writestr("xl/worksheets/sheet1.xml", "".join(sheet))
+        if shared_strings:
+            items = "".join(f"<si><t>{v}</t></si>" for v in interned)
+            archive.writestr(
+                "xl/sharedStrings.xml",
+                '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                f"{items}</sst>",
+            )
+
+
+class ReserveRosterTests(unittest.TestCase):
+    """build_reserve_reviewer_info.py: HotCRP upload + vetting workbook -> roster."""
+
+    def build(self, uploaded, vetted, *, shared_strings=False, overrides=()):
+        """Run the script over in-memory inputs; return (roster, unresolved)."""
+        tmp = Path(tempfile.mkdtemp())
+        upload, vetting = tmp / "upload.csv", tmp / "vetting.xlsx"
+        out, unresolved = tmp / "info.csv", tmp / "unresolved.csv"
+        override_path = tmp / "overrides.csv"
+        with override_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["email", "dblp", "note"])
+            writer.writeheader()
+            for email, link in overrides:
+                writer.writerow({"email": email, "dblp": link, "note": "by hand"})
+        with upload.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["email", "name", "roles", "tags"])
+            writer.writeheader()
+            for email, name in uploaded:
+                writer.writerow({"email": email, "name": name,
+                                 "roles": "pc", "tags": "reserve-reviewer"})
+        write_xlsx(
+            vetting, [["name", "email", "dblp_url"], *vetted],
+            shared_strings=shared_strings,
+        )
+        argv = ["build_reserve_reviewer_info.py", "--upload", str(upload),
+                "--vetting", str(vetting), "--out", str(out),
+                "--unresolved", str(unresolved), "--overrides", str(override_path)]
+        with mock.patch.object(sys, "argv", argv), \
+                contextlib.redirect_stderr(io.StringIO()):
+            build_reserve_reviewer_info.main()
+        def read(path):
+            with path.open(newline="", encoding="utf-8") as f:
+                return list(csv.DictReader(f))
+
+        return read(out), read(unresolved)
+
+    def test_sheet_reader_handles_both_string_encodings_and_gaps(self):
+        # Google Sheets inlines its strings; Excel interns them. A re-export in
+        # the other format must not read back as a workbook of empty cells.
+        rows = [["name", "email", "dblp_url"],
+                ["Ada Lovelace", "ada@example.edu", "https://dblp.org/pid/1/Ada"],
+                ["Alan Turing", "alan@example.edu", None]]
+        tmp = Path(tempfile.mkdtemp())
+        parsed = []
+        for shared in (False, True):
+            path = tmp / f"book-{shared}.xlsx"
+            write_xlsx(path, rows, shared_strings=shared)
+            parsed.append(build_reserve_reviewer_info.read_sheet(str(path), "All"))
+        self.assertEqual(parsed[0], parsed[1])
+        self.assertEqual("https://dblp.org/pid/1/Ada", parsed[0][0]["dblp_url"])
+        # The omitted trailing cell is a gap, not a missing column.
+        self.assertEqual("", parsed[0][1]["dblp_url"])
+
+    def test_shared_pid_holds_back_every_claimant(self):
+        # Either one of them is wrong, or one person holds two HotCRP accounts
+        # and would draw double the reviews. Both are the chair's call.
+        roster, unresolved = self.build(
+            [("a@x.edu", "Youhui Zhang"), ("b@x.edu", "Youhui Zhang"),
+             ("c@x.edu", "Ada Lovelace")],
+            [["Youhui Zhang", "a@x.edu", "https://dblp.org/pid/00/5995"],
+             ["Youhui Zhang", "b@x.edu", "https://dblp.org/pid/00/5995.html"],
+             ["Ada Lovelace", "c@x.edu", "https://dblp.org/pid/12/3456"]],
+        )
+        self.assertEqual(["c@x.edu"], [r["email"] for r in roster])
+        self.assertEqual({"a@x.edu", "b@x.edu"}, {r["email"] for r in unresolved})
+        self.assertEqual({"shared_pid"}, {r["problem"] for r in unresolved})
+
+    def test_a_voided_claim_leaves_the_other_claimant_clean(self):
+        # "Tao Zhang" does not own z/HaoZhang2, so that claim never competes and
+        # the real Hao Zhang keeps the PID rather than both being held back.
+        roster, unresolved = self.build(
+            [("tao@x.edu", "Tao Zhang"), ("hao@x.edu", "Hao Zhang")],
+            [["Tao Zhang", "tao@x.edu", "https://dblp.org/pid/z/HaoZhang2"],
+             ["Hao Zhang", "hao@x.edu", "https://dblp.org/pid/z/HaoZhang2"]],
+        )
+        self.assertEqual(["hao@x.edu"], [r["email"] for r in roster])
+        self.assertEqual([("tao@x.edu", "name_mismatch")],
+                         [(r["email"], r["problem"]) for r in unresolved])
+
+    def test_excluded_is_a_finished_decision_not_outstanding_work(self):
+        # Both keep someone off the roster, but they mean different things: one
+        # is a job still to do, the other is a job done. If they were the same
+        # value the report could never reach zero.
+        roster, unresolved = self.build(
+            [("gone@x.edu", "Not A Reviewer"), ("todo@x.edu", "Needs A Link"),
+             ("ok@x.edu", "Ada Lovelace")],
+            [["Not A Reviewer", "gone@x.edu", "https://dblp.org/pid/1/A"],
+             ["Needs A Link", "todo@x.edu", "https://dblp.org/pid/2/B"],
+             ["Ada Lovelace", "ok@x.edu", "https://dblp.org/pid/3/C"]],
+            overrides=[("gone@x.edu", "excluded"), ("todo@x.edu", "none")],
+        )
+        self.assertEqual(["ok@x.edu"], [r["email"] for r in roster])
+        self.assertEqual({"gone@x.edu": "excluded", "todo@x.edu": "withheld"},
+                         {r["email"]: r["problem"] for r in unresolved})
+
+    def test_withheld_override_stops_a_wrong_link_competing(self):
+        # "none" means the workbook's link is known wrong with no replacement.
+        # It has to differ from an empty cell: left in place, the wrong link goes
+        # on claiming w/LinZhao3 and holds back the Univ-A Lin Zhao who owns it.
+        roster, unresolved = self.build(
+            [("lzhao@univ-a.edu.cn", "Lin Zhao"), ("zhaolin@lab-b.com.cn", "Lin Zhao")],
+            [["Lin Zhao", "lzhao@univ-a.edu.cn", "https://dblp.org/pid/w/LinZhao3"],
+             ["Lin Zhao", "zhaolin@lab-b.com.cn", "https://dblp.org/pid/w/LinZhao3"]],
+            overrides=[("zhaolin@lab-b.com.cn", "none")],
+        )
+        self.assertEqual(["lzhao@univ-a.edu.cn"], [r["email"] for r in roster])
+        self.assertEqual([("zhaolin@lab-b.com.cn", "withheld")],
+                         [(r["email"], r["problem"]) for r in unresolved])
+
+    def test_a_hand_entered_override_beats_the_workbook(self):
+        # The workbook's link for the first reviewer named the second; once the
+        # right page is entered by hand it wins outright, and none of the
+        # workbook's checks (including the shared-PID collision) apply any more.
+        roster, unresolved = self.build(
+            [("mlam@cse.univ-h.edu.hk", "Mei Lam"), ("other@x.edu", "Wen Zhou")],
+            [["Mei Lam", "mlam@cse.univ-h.edu.hk", "https://dblp.org/pid/10/0100-12"],
+             ["Wen Zhou", "other@x.edu", "https://dblp.org/pid/10/0100-12"]],
+            overrides=[("mlam@cse.univ-h.edu.hk", "https://dblp.org/pid/28/0100-1")],
+        )
+        self.assertEqual(
+            [("mlam@cse.univ-h.edu.hk", "https://dblp.org/pid/28/0100-1.html"),
+             ("other@x.edu", "https://dblp.org/pid/10/0100-12.html")],
+            [(r["email"], r["dblp"]) for r in roster],
+        )
+        self.assertEqual([], unresolved)
+
+        # A blank cell is a to-do marker, not a decision: it must not mask the
+        # workbook's value, or filling the file in would erase what was there.
+        roster, _ = self.build(
+            [("a@x.edu", "Ada Lovelace")],
+            [["Ada Lovelace", "a@x.edu", "https://dblp.org/pid/12/3456"]],
+            overrides=[("a@x.edu", "")],
+        )
+        self.assertEqual(["https://dblp.org/pid/12/3456.html"],
+                         [r["dblp"] for r in roster])
+
+    def test_collision_reports_the_affiliation_without_deciding_on_it(self):
+        # Both names fit 43/0100-1 ({wei, tan} overlaps either way), and the
+        # domains cannot settle it: "Coastal Advanced Institute of Science and
+        # Technology" would claim coastal.ac.kr as readily as caist.ac.kr. So the
+        # institution is quoted for the chair, and neither is seated.
+        kaist = ["Coastal Advanced Institute of Science and Technology (CAIST), Riverton"]
+        rows = {
+            "minseo@caist.ac.kr": {"pid": "43/0100-1", "problem": None, "detail": "",
+                                     "affiliations": kaist},
+            "jiwon@coastal.ac.kr": {"pid": "43/0100-1", "problem": None, "detail": "",
+                                      "affiliations": kaist},
+        }
+        build_reserve_reviewer_info.apply_shared_pids(rows)
+        self.assertEqual(["shared_pid", "shared_pid"],
+                         [r["problem"] for r in rows.values()])
+        for row in rows.values():
+            self.assertIn("Coastal Advanced Institute", row["detail"])
+
+    def test_named_pid_naming_someone_else_is_caught(self):
+        agree = build_reserve_reviewer_info.names_agree
+        self.assertEqual("Ling Wei Tan",
+                         build_reserve_reviewer_info.pid_name("c/LingWeiTan"))
+        # A numeric PID's digits say nothing about whose page it is.
+        self.assertIsNone(build_reserve_reviewer_info.pid_name("26/1737"))
+        self.assertIsNone(build_reserve_reviewer_info.pid_name("43/0100-1"))
+        self.assertTrue(agree("Ling-Wei Tan", "Ling Wei Tan"))
+        self.assertTrue(agree("Dhabaleswar Panda", "Dhabaleswar K Panda"))
+        # One shared family name is not an identity: this is the real error.
+        self.assertFalse(agree("Tao Zhang", "Hao Zhang"))
+        self.assertFalse(agree("Lei Chen", "Chen Li"))
+        # A mononym has only one token to give; demanding two would fail it for
+        # being short rather than for being someone else.
+        self.assertTrue(agree("Bono", "Bono"))
+        self.assertFalse(agree("Bono", "Cher"))
+
+    def test_annotation_after_the_link_is_flagged_not_stripped(self):
+        # parse_pid stops at the '.', so a hand-written doubt about the link
+        # would otherwise disappear and the PID be accepted as verified.
+        roster, unresolved = self.build(
+            [("z@x.edu", "Zicong Wang"), ("g@x.edu", "Guillem Lopez")],
+            [["Zicong Wang", "z@x.edu",
+              "https://dblp.org/pid/190/5197.html （disambiguation page）"],
+             ["Guillem Lopez", "g@x.edu", ""]],
+        )
+        self.assertEqual([], roster)
+        problems = {r["email"]: r["problem"] for r in unresolved}
+        self.assertEqual({"z@x.edu": "annotated", "g@x.edu": "no_dblp_url"}, problems)
+        # The unresolved file keeps the cell verbatim, annotation and all.
+        kept = next(r["dblp_url"] for r in unresolved if r["email"] == "z@x.edu")
+        self.assertIn("（disambiguation page）", kept)
+
+    def test_roster_is_sorted_and_urls_normalised(self):
+        roster, unresolved = self.build(
+            [("z@x.edu", "Zoe Last"), ("a@x.edu", "Ada First"),
+             ("m@x.edu", "Max Middle"), ("n@x.edu", "New Person")],
+            [["Zoe Last", "z@x.edu", "https://dblp.org/pid/1/Zoe"],
+             ["Ada First", "a@x.edu", "https://dblp.org/pid/26/1737.html"],
+             ["Max Middle", "m@x.edu", "https://dblp.org/pid/62/1131"]],
+        )
+        self.assertEqual(["a@x.edu", "m@x.edu", "z@x.edu"], [r["email"] for r in roster])
+        # Every shape the workbook uses lands on one canonical URL.
+        self.assertEqual(
+            ["https://dblp.org/pid/26/1737.html", "https://dblp.org/pid/62/1131.html",
+             "https://dblp.org/pid/1/Zoe.html"],
+            [r["dblp"] for r in roster],
+        )
+        # An uploaded reviewer the workbook never vetted is reported, not dropped.
+        self.assertEqual([("n@x.edu", "not_in_vetting")],
+                         [(r["email"], r["problem"]) for r in unresolved])
 
 
 if __name__ == "__main__":

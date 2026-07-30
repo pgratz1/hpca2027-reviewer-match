@@ -29,12 +29,13 @@ from pathlib import Path
 import requests
 
 from dblp import fetch_doi_records, normalise_doi
-from area_chairs import load_area_chairs
-from reviewers import load_reviewers
+from reserve_reviewers import DEFAULT_DATA
+from roster import load_roster
 
 DEFAULT_CSV = "HPCA'27 PC Member Acceptance Form (Responses) - Form Responses 1.csv"
 DEFAULT_METADATA_CACHE = "reviewer_publications.json"
 DEFAULT_ABSTRACT_CACHE = "publication_abstracts.json"
+DEFAULT_SNAPSHOT_CACHE = "dblp_snapshot_cache.json"
 METADATA_SCHEMA_VERSION = 1
 ABSTRACT_SCHEMA_VERSION = 1
 ALLOWED_PUBLISHERS = frozenset({"ieee", "acm"})
@@ -179,13 +180,18 @@ def enrich_abstract_cache(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--csv", default=DEFAULT_CSV)
+    parser.add_argument("--csv", default=None)
     parser.add_argument(
-        "--role", choices=("reviewer", "area-chair"), default="reviewer",
-        help="acceptance-form schema to load (default: reviewer)",
+        "--role", choices=("reviewer", "area-chair", "reserve"), default="reviewer",
+        help="roster to load (default: reviewer)",
+    )
+    parser.add_argument(
+        "--data", default=DEFAULT_DATA,
+        help=f"HotCRP paper export, for --role reserve area derivation (default: {DEFAULT_DATA})",
     )
     parser.add_argument("--metadata-cache", default=DEFAULT_METADATA_CACHE)
     parser.add_argument("--abstract-cache", default=DEFAULT_ABSTRACT_CACHE)
+    parser.add_argument("--snapshot-cache", default=DEFAULT_SNAPSHOT_CACHE, help="local DBLP dump cache; PIDs it covers are never fetched live")
     parser.add_argument("--years", type=int, default=4)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--delay", type=float, default=3.0)
@@ -202,16 +208,17 @@ def main() -> int:
             file=sys.stderr,
         )
 
-    reviewers = (
-        load_area_chairs(args.csv) if args.role == "area-chair"
-        else load_reviewers(args.csv)
-    )
+    reviewers = load_roster(args.role, args.csv, args.data)
     if args.limit is not None:
         reviewers = reviewers[:args.limit]
     pids = list(dict.fromkeys(r.pid for r in reviewers if r.pid))
     metadata = load_json(args.metadata_cache)
     session = requests.Session()
-    fetched = failed = attempted_pids = consecutive_failures = 0
+    fetched = failed = attempted_pids = consecutive_failures = from_snapshot = 0
+    snapshot = load_json(args.snapshot_cache)
+    if snapshot:
+        print(f"Snapshot cache available: {len(snapshot)} PID(s) "
+              f"({args.snapshot_cache})", file=sys.stderr)
     # Never-attempted reviewers go first so a few persistently unavailable
     # PIDs cannot starve the rest of the PC on every resumable run.
     pending_pids = (
@@ -220,6 +227,20 @@ def main() -> int:
     )
     for pid in pending_pids:
         entry = metadata.get(pid)
+        # Checked before the pacing sleep: the snapshot is a local file, and
+        # waiting three seconds to read one would spend an idle nine minutes
+        # across a roster this size to be polite to a server never contacted.
+        # The snapshot's records carry DOIs in the same shape the live fetch
+        # returns, so they are a valid source here — unlike the older title and
+        # venue caches, whose schemas predate DOI retention.
+        if pid in snapshot:
+            metadata[pid] = {
+                "complete": True, "records": snapshot[pid],
+                "schema_version": METADATA_SCHEMA_VERSION,
+            }
+            from_snapshot += 1
+            save_json(metadata, args.metadata_cache)
+            continue
         if attempted_pids and args.delay:
             time.sleep(max(0.5, args.delay + random.uniform(-0.5, 0.5) * args.delay))
         attempted_pids += 1
@@ -276,7 +297,8 @@ def main() -> int:
         for p in sorted(ALLOWED_PUBLISHERS)
     }
     print(
-        f"DBLP metadata: {len(pids)} PIDs, {fetched} fetched, {failed} failed; "
+        f"DBLP metadata: {len(pids)} PIDs, {from_snapshot} from snapshot, "
+        f"{fetched} fetched, {failed} failed; "
         f"abstracts: {total_found}/{len(dois)} found "
         f"(IEEE {by_publisher['ieee']}, ACM {by_publisher['acm']}), "
         f"{found}/{attempted} found this run.", file=sys.stderr,

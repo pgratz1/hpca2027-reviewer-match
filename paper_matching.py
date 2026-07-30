@@ -208,6 +208,37 @@ def build_paper_fingerprints(
     fp.save_fingerprint_cache(paper_cache, cache_path)
 
 
+def own_paper_conflicts(paper: dict) -> set[str]:
+    """Emails conflicted with `paper` by their own involvement in it.
+
+    A floor under HotCRP's `pc_conflicts`, which is only as complete as the
+    author COI sweep: authors have not yet been asked to declare conflicts
+    against recently promoted PC and reserve reviewers, so a reviewer can be an
+    author of a paper and not appear in its conflict list. Three reserve
+    reviewers currently have no conflict recorded anywhere while authoring 18
+    submissions between them.
+
+    Three sources, none of which needs anyone to have declared anything:
+    authors, contacts, and the `reserve_reviewer` nomination — HPCA's nomination
+    field names a senior author of that same paper, which the data bears out
+    (227 of 228 nominations are also authorships).
+
+    This closes only the self-authorship hole. It cannot supply the conflicts a
+    sweep would — a reviewer's ties to a paper they did not write stay invisible
+    while nobody on that paper has been asked.
+    """
+    conflicted: set[str] = set()
+    for person in (paper.get("authors") or []) + (paper.get("contacts") or []):
+        email = (person.get("email") or "").strip().lower()
+        if email:
+            conflicted.add(email)
+    for line in (paper.get("reserve_reviewer") or "").splitlines():
+        parts = [part.strip() for part in line.split("/")]
+        if len(parts) >= 3 and "@" in parts[-1]:
+            conflicted.add(parts[-1].lower())
+    return conflicted
+
+
 def eligible_scores(
     paper: dict,
     candidate_emails: list[str],
@@ -219,11 +250,14 @@ def eligible_scores(
 ) -> list[tuple[str, float]]:
     """(email, cosine-similarity) pairs for reviewers eligible for `paper`.
 
-    Excludes reviewers whose email is a key in the paper's pc_conflicts.
-    Unless `area_gate` is False, also excludes reviewers whose primary/
-    secondary area doesn't overlap the paper's topics (case-insensitive).
+    Excludes reviewers conflicted with the paper — those listed in its
+    pc_conflicts, and those involved in it themselves (see
+    `own_paper_conflicts`). Unless `area_gate` is False, also excludes reviewers
+    whose primary/secondary area doesn't overlap the paper's topics
+    (case-insensitive).
     """
     conflicted = {e.lower() for e in paper.get("pc_conflicts", {})}
+    conflicted |= own_paper_conflicts(paper)
     topic_set = {t.lower() for t in paper.get("topics", [])}
 
     eligible_idx = []
