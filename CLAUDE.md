@@ -61,7 +61,7 @@ contains spaces and parentheses — always quote it in shell commands).
   is in, writing `affiliation_countries.csv` with a **blank `country` column as
   the to-do list** (the `dblp_overrides.csv` idiom — the generator writes only
   `suggested`, never `country`, or the hand layer would outrank DBLP with a
-  machine guess). Needed only for `--region-cap`; run `make dblp-snapshot` first,
+  machine guess). Feeds the same-country cap; run `make dblp-snapshot` first,
   since its `dblp_affiliations.json` is the strongest layer. `--validate
   CN=china_faculty.csv '!CN=nonchina_faculty.csv'` checks it against the old
   hand split — which turns out to be exactly the `.cn` email test (100%/0%), so
@@ -122,15 +122,23 @@ contains spaces and parentheses — always quote it in shell commands).
    COI is a hard filter and the area gate (reviewer primary/secondary ∩
    paper topics) governs the normal phases — neither is ever blended into
    the score, but the gate is released per-paper by the relaxation ladder.
-3b. **Region caps** (optional, `--region-cap CN=2`): a paper whose authors are
-   majority-CC holds at most N reviewers affiliated in CC. Affiliation country,
-   **never nationality**; HK/MO/TW/SG are separate ISO codes and are never
-   folded into CN. Hard in all six phases including F3, so a paper under-fills
-   rather than exceed it. Because a region class *crosses* the seniority
-   classes, greedy choice stops being substitutable and stability is no longer
-   guaranteed for capped papers — `Done.` splits the blocking-pair count, and
-   the hard invariant that replaces it is `region_over == 0`. Coverage is
-   printed because an unplaced reviewer can never consume a cap.
+3b. **Same-country cap** (`--same-country-cap N`, **on by default at 2**): a
+   paper whose authors are mostly from country C holds at most N reviewers
+   affiliated in C. One rule for every country — **no country is named in the
+   policy**; the capped set is whatever the submissions contain (31 today).
+   Affiliation country, **never nationality**; HK/MO/TW/SG are separate ISO
+   codes and are never folded into CN. `--same-country-cap 0` admits no
+   same-country reviewer (a real setting this roster satisfies);
+   `--no-same-country-cap` is the off switch. Hard in all six phases including
+   F3, so a paper under-fills rather than exceed it. Because a country class
+   *crosses* the seniority classes, greedy choice stops being substitutable and
+   stability is no longer guaranteed for capped papers — `Done.` splits the
+   blocking-pair count, and the hard invariant that replaces it is
+   `country_over == 0`. **Coverage is the thing to read**: an unplaced reviewer
+   can never consume a cap, so uneven coverage exempts whoever the resolver
+   places worst. Before `affiliation_countries.csv` was filled, `.edu`/`.com`
+   were generic while `.cn`/`.kr` were not, and US did not appear once among
+   the majority countries.
 4. **Assignment**: `assign_reviewers.py` — phased paper-proposing deferred
    acceptance aiming for a full slate plus ≥1 senior, ≤1 junior, and ≤1
    out-of-area per paper. Papers that can't fill release constraints in

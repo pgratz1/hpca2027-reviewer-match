@@ -42,7 +42,7 @@ from roster import ROLES, load_roster, role_label
 DEFAULT_DATA = "hpca2027-data.json"
 DEFAULT_OUT = ac.DEFAULT_COUNTRIES
 
-FIELDS = ("affiliation", "country", "suggested", "source", "people", "note")
+FIELDS = ("affiliation", "country", "decided_by", "suggested", "source", "people", "note")
 
 
 def collect_affiliations(data_path: str, roles: list[str]) -> dict[str, dict]:
@@ -114,7 +114,12 @@ def merge_rows(
 ) -> list[dict]:
     """Fold this run's findings into whatever the file already held.
 
-    Hand-entered `country` values win over everything and are never rewritten.
+    Hand-entered `country` values win over everything and are never rewritten,
+    and `decided_by` rides along with them: it records who or what decided a
+    cell (a person, a lookup) so a filled country can be audited later. Both are
+    carried over verbatim; every other column is regenerated, which is why the
+    provenance cannot live in `note`.
+
     Rows for affiliations no longer in the data are retained with people = 0 --
     the HotCRP export is a moving snapshot, and a withdrawn paper must not delete
     a decision someone already made.
@@ -133,6 +138,7 @@ def merge_rows(
             rows.append({
                 "affiliation": old.get("affiliation", key),
                 "country": (old.get("country") or "").strip().upper(),
+                "decided_by": (old.get("decided_by") or "").strip(),
                 "suggested": old.get("suggested", ""),
                 "source": old.get("source", ""),
                 "people": "0",
@@ -143,6 +149,7 @@ def merge_rows(
         rows.append({
             "affiliation": entry["raw"],
             "country": (old.get("country") or "").strip().upper(),
+            "decided_by": (old.get("decided_by") or "").strip(),
             "suggested": code,
             "source": layer,
             "people": str(entry["people"]),
@@ -262,6 +269,11 @@ def main() -> int:
     print(f"  {len(roster_rows)} used by a roster member, "
           f"{len(unplaced(roster_rows))} of those unplaced", file=sys.stderr)
     print(f"  {len(rows)} total, {len(unplaced(rows))} unplaced", file=sys.stderr)
+    decided = [r for r in rows if r["country"]]
+    if decided:
+        by = Counter(r["decided_by"] or "(unattributed)" for r in decided)
+        print(f"  {len(decided)} decided by hand: "
+              f"{', '.join(f'{n} {who}' for who, n in by.most_common())}", file=sys.stderr)
     sources = Counter(r["source"] for r in rows if r["suggested"])
     print(f"  suggested by: {', '.join(f'{n} {s}' for s, n in sources.most_common())}",
           file=sys.stderr)

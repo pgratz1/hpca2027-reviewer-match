@@ -49,14 +49,18 @@ deferred-acceptance pass whose results are frozen before the next:
       juniors (>= --almost-junior-pubs pubs overall) and "almost not
       out-of-area" reviewers (>= --almost-out-of-area-career career papers).
 
-Region caps (--region-cap CC=N, off unless asked for, repeatable) are the one
-constraint no phase releases: a paper whose authors are majority-CC holds at
-most N reviewers affiliated in CC, in A1-A3 and F1-F3 alike, and under-fills
-rather than exceed it. CC is where the institution is, never anyone's
-nationality; HK, MO, TW and SG are separate ISO codes and are never counted as
-CN. A paper is majority-CC on the authors whose country could be placed, above
-a --region-min-resolved coverage floor; below it the paper is not capped and is
-reported. See README, "Region caps", for the stability caveat this introduces.
+The same-country cap (--same-country-cap N, default 2) is the one constraint no
+phase releases: a paper whose authors are mostly from country C holds at most N
+reviewers affiliated in C, in A1-A3 and F1-F3 alike, and under-fills rather than
+exceed it. One rule for every country -- a US paper is capped on US reviewers
+exactly as a Chinese paper is capped on Chinese ones, and no country is named in
+the policy. C is where the institution is, never anyone's nationality; HK, MO,
+TW and SG are separate ISO codes and are never counted as CN. A paper's majority
+is taken over the authors whose country could be placed, above a
+--region-min-resolved coverage floor; below it the paper is not capped and is
+reported. --same-country-cap 0 admits no same-country reviewer at all;
+--no-same-country-cap switches the policy off. See README, "Same-country cap",
+for the stability caveat this introduces.
 
 Papers that break the criteria even after degradation are printed in a report
 at the end; every paper gets a "match goodness" score — the mean similarity
@@ -110,7 +114,7 @@ UNCAPPED = sys.maxsize
 
 # A class limit is either one int binding every paper (the junior and
 # out-of-area caps) or a {pid: limit} mapping binding only the papers it names
-# (a region cap, which applies to majority-region papers alone).
+# (a same-country cap, which applies to that country's majority papers alone).
 ClassLimit = int | Mapping[int, int]
 CappedClasses = Sequence[tuple[frozenset[str], ClassLimit]]
 
@@ -137,7 +141,7 @@ def class_counts_of(
     """Per-paper counts of each capped class already held.
 
     A reviewer in several classes counts against every one of them — that is
-    what makes a junior who is also region-affiliated consume both caps.
+    what makes a junior who is also same-country consume both caps.
     """
     return {
         pid: [sum(1 for e in slates[pid] if e in emails) for emails, _ in capped]
@@ -160,7 +164,7 @@ def deferred_acceptance(
     reviewers only). Returns `{pid: [email, ...]}`.
 
     `capped` is a list of (emails, limit) pairs — reviewer classes (juniors,
-    out-of-area, a region) of which a paper holds at most `limit` members at a
+    out-of-area, a country) of which a paper holds at most `limit` members at a
     time. A reviewer may belong to several classes and consumes every one of
     them; the limit is either one int for all papers or a {pid: limit} mapping
     binding only the papers it names. Class members a paper can't currently take
@@ -193,7 +197,13 @@ def deferred_acceptance(
     paper_held: dict[int, list[str]] = {pid: [] for pid in pids}
     held_counts = held_counts or {}
     class_held = {pid: list(held_counts.get(pid, [0] * len(capped))) for pid in pids}
-    deferred: dict[int, list[deque[str]]] = {pid: [deque() for _ in cells] for pid in pids}
+    # Keyed by cell and created on demand, because the number of cells is set by
+    # the whole candidate pool while any one paper only ever defers into the few
+    # cells its own caps can block. Under one same-country cap per paper that is
+    # 1-3 cells out of the ~60 a full country roster produces, so a list would be
+    # ~98% empty deques and would make every scan below proportional to the
+    # number of countries in the conference rather than to the work at hand.
+    deferred: dict[int, dict[int, deque[str]]] = {pid: {} for pid in pids}
     reviewer_held: dict[str, list[tuple[int, float]]] = {}
 
     def sig_ok(pid: int, sig: tuple[int, ...]) -> bool:
@@ -202,14 +212,14 @@ def deferred_acceptance(
     def cell_ok(pid: int, c: int) -> bool:
         return sig_ok(pid, cells[c])
 
+    def proposable(pid: int) -> bool:
+        return paper_ptr[pid] < len(paper_prefs[pid]) or any(
+            cell_ok(pid, c) for c in deferred[pid]
+        )
+
     def count_class(pid: int, email: str, delta: int) -> None:
         for k in sig_of.get(email, ()):
             class_held[pid][k] += delta
-
-    def proposable(pid: int) -> bool:
-        return paper_ptr[pid] < len(paper_prefs[pid]) or any(
-            dq and cell_ok(pid, c) for c, dq in enumerate(deferred[pid])
-        )
 
     def next_candidate(pid: int) -> str | None:
         """Best-scoring proposable candidate, honoring the class caps.
@@ -224,16 +234,21 @@ def deferred_acceptance(
             sig = sig_of.get(prefs[paper_ptr[pid]])
             if sig is None or sig_ok(pid, sig):
                 break
-            deferred[pid][cell_index[sig]].append(prefs[paper_ptr[pid]])
+            cell = deferred[pid].setdefault(cell_index[sig], deque())
+            cell.append(prefs[paper_ptr[pid]])
             paper_ptr[pid] += 1
         head = prefs[paper_ptr[pid]] if paper_ptr[pid] < len(prefs) else None
         best, best_c = head, None
-        for c, dq in enumerate(deferred[pid]):
-            if dq and cell_ok(pid, c):
+        for c, dq in deferred[pid].items():
+            if cell_ok(pid, c):
                 if best is None or score_lookup[(dq[0], pid)] >= score_lookup[(best, pid)]:
                     best, best_c = dq[0], c
         if best_c is not None:
-            return deferred[pid][best_c].popleft()
+            dq = deferred[pid][best_c]
+            email = dq.popleft()
+            if not dq:  # keep the scan proportional to what is actually waiting
+                del deferred[pid][best_c]
+            return email
         if head is not None:
             paper_ptr[pid] += 1
         return head
@@ -301,12 +316,12 @@ def count_blocking_pairs(
     reports blocking pairs the matcher correctly refused.
 
     **Zero is guaranteed only when the classes form a laminar family** — pairwise
-    disjoint or nested, as `{juniors, out-of-area}` alone are. A region class
+    disjoint or nested, as `{juniors, out-of-area}` alone are. A country class
     crosses the seniority classes, and greedy-by-score choice over a crossing
     family is not substitutable, so paper-proposing deferred acceptance no longer
     guarantees a stable outcome for the papers that carry one. Callers should
-    judge region-capped papers separately from the rest; the caps themselves stay
-    hard either way.
+    judge capped papers separately from the rest; the caps themselves stay hard
+    either way.
     """
     pids = list(eligible_by_pid)
     limits = resolve_caps(capped, pids)
@@ -686,68 +701,54 @@ def relaxation_report(
     return len(skipped), len(relaxed_papers)
 
 
+DEFAULT_SAME_COUNTRY_CAP = 2
 DEFAULT_REGION_MAJORITY = 0.5
 DEFAULT_REGION_MIN_RESOLVED = 0.5
 
 
 @dataclass(frozen=True)
-class RegionCap:
-    """One `--region-cap CC=N` rule, resolved against this run's data."""
+class CountryCap:
+    """The same-country cap as it applies to one country, for this run's data."""
 
     code: str  # ISO 3166-1 alpha-2 — where the institution is, not a nationality
     cap: int
     members: frozenset[str]  # candidate reviewers affiliated in `code`
     papers: dict[int, int]  # pid -> cap, majority-`code` papers only
-    thin: list[int]  # pids with too few placed authors to judge
-    shares: dict[int, tuple[int, int, int]]  # pid -> (in region, placed, authors)
+    shares: dict[int, tuple[int, int, int]]  # pid -> (in country, placed, authors)
 
 
-def parse_region_cap(value: str) -> tuple[str, int]:
-    """Parse `--region-cap CC=N` into (ISO alpha-2, cap).
-
-    The code names where an institution is, never anyone's nationality. Hong
-    Kong, Macao, Taiwan and Singapore are their own codes, so a cap on CN is not
-    a cap on any of them.
-    """
-    code, sep, raw = value.partition("=")
-    code = code.strip().upper()
-    if not sep or not code or not raw.strip():
-        raise argparse.ArgumentTypeError(f"expected CC=N, got {value!r}")
-    if not affiliation_country.is_country_code(code):
-        raise argparse.ArgumentTypeError(
-            f"{code!r} is not an ISO alpha-2 code affiliation_country can resolve; "
-            f"a cap on it would silently be a class of zero reviewers"
-        )
-    try:
-        cap = int(raw)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"{raw!r} is not a whole number") from None
-    if cap < 0:
-        raise argparse.ArgumentTypeError(f"cap must be non-negative, got {cap}")
-    return code, cap
-
-
-def build_region_caps(
+def build_country_caps(
     papers: list[dict],
     candidate_emails: list[str],
     reviewers_by_email: dict,
-    specs: list[tuple[str, int]],
+    cap: int,
     layers,
     *,
     majority: float,
     min_resolved: float,
-) -> tuple[list[RegionCap], dict[str, str], dict[int, tuple[int, int]]]:
-    """Resolve every `--region-cap` against this run's reviewers and papers.
+) -> tuple[list[CountryCap], dict[str, str], dict[int, tuple[int, int]], list[int]]:
+    """Build one capped class per country that is some paper's majority.
 
-    A paper is majority-`code` when more than `majority` of the authors whose
-    country could be placed are in `code`. The denominator is the placed authors,
-    not all of them: an unplaced author is a gap in our data, and counting them
-    against the region would make thin coverage silently look like a non-majority
+    The rule is the same for everyone: a paper whose authors are mostly from
+    country C holds at most `cap` reviewers affiliated in C. Nothing singles out
+    a country — the set of capped countries is whatever the submissions turn out
+    to contain, so a US paper is capped on US reviewers exactly as a Chinese one
+    is capped on Chinese reviewers.
+
+    A paper is majority-C when more than `majority` of the authors whose country
+    could be *placed* are in C. The denominator is the placed authors, not all of
+    them: an unplaced author is a gap in our data, and counting them against the
+    country would make thin coverage silently look like a non-majority
     everywhere. To stop that reading the other way — one placed author out of ten
     reading as 100% — a paper below `min_resolved` coverage is not capped at all
     and is reported by name instead.
 
-    Returns (caps, {reviewer email: code or ""}, {pid: (placed, authors)}).
+    Countries are disjoint as reviewer sets (a reviewer resolves to one country)
+    and a paper has at most one majority, so these classes never cross each
+    other; they cross only the seniority classes.
+
+    Returns (caps, {reviewer email: code or ""}, {pid: (placed, authors)},
+    [pid too thin to judge]).
     """
     reviewer_country = {}
     for email in candidate_emails:
@@ -755,8 +756,11 @@ def build_region_caps(
         reviewer_country[email] = code
 
     coverage: dict[int, tuple[int, int]] = {}
+    majority_of: dict[int, str] = {}
     counts: dict[int, Counter] = {}
+    thin: list[int] = []
     for p in papers:
+        pid = p["pid"]
         authors = p.get("authors") or []
         seen = Counter()
         for author in authors:
@@ -764,68 +768,67 @@ def build_region_caps(
             if code:
                 seen[code] += 1
         placed = sum(seen.values())
-        coverage[p["pid"]] = (placed, len(authors))
-        counts[p["pid"]] = seen
+        coverage[pid] = (placed, len(authors))
+        counts[pid] = seen
+        if not authors:
+            continue
+        if placed / len(authors) < min_resolved:
+            thin.append(pid)
+            continue
+        if placed:
+            code, n = seen.most_common(1)[0]
+            if n / placed > majority:
+                majority_of[pid] = code
 
     caps = []
-    for code, cap in specs:
+    for code in sorted(set(majority_of.values())):
         members = frozenset(e for e, c in reviewer_country.items() if c == code)
-        bound: dict[int, int] = {}
-        thin: list[int] = []
-        shares: dict[int, tuple[int, int, int]] = {}
-        for p in papers:
-            pid = p["pid"]
-            placed, total = coverage[pid]
-            here = counts[pid][code]
-            shares[pid] = (here, placed, total)
-            if not total:
-                continue
-            if placed / total < min_resolved:
-                thin.append(pid)
-                continue
-            if placed and here / placed > majority:
-                bound[pid] = cap
-        caps.append(RegionCap(code, cap, members, bound, thin, shares))
-    return caps, reviewer_country, coverage
+        bound = {pid: cap for pid, c in majority_of.items() if c == code}
+        shares = {
+            pid: (counts[pid][code], coverage[pid][0], coverage[pid][1]) for pid in bound
+        }
+        caps.append(CountryCap(code, cap, members, bound, shares))
+    return caps, reviewer_country, coverage, thin
 
 
-def region_report(
+def country_cap_report(
     papers: list[dict],
     slates: dict[int, list[str]],
-    regions: list[RegionCap],
+    countries: list[CountryCap],
     reviewer_country: dict[str, str],
     paper_coverage: dict[int, tuple[int, int]],
-    reviewers_by_email: dict,
+    thin: list[int],
     released_prefs: dict[int, list[str]],
     paper_target: dict[int, int],
     score_lookup: dict[tuple[str, int], float],
     *,
+    cap: int,
     majority: float,
     min_resolved: float,
 ) -> int:
-    """Print how each region cap bound, and how well the data supported it.
+    """Print how the same-country cap bound, and how well the data supported it.
 
-    Returns the number of papers over a cap, which must always be 0.
+    Returns the number of papers over the cap, which must always be 0.
 
-    The coverage lines are the point of this report as much as the caps are. A
-    reviewer whose country could not be placed is in no region class and can
-    never consume a cap, and a paper whose authors could not be placed is never
-    judged — so on thin data the rule quietly applies to almost nothing, and that
-    has to be visible rather than inferred from a small "papers capped" number.
+    The coverage lines are the point of this report as much as the caps are, and
+    more so than under a single named country: a reviewer whose country could not
+    be placed is in no class and can never consume a cap, and a paper whose
+    authors could not be placed is never judged. Uneven coverage therefore does
+    not weaken the rule evenly -- it exempts whoever we happen to be worse at
+    placing -- so the numbers have to be read, not assumed.
     """
     by_title = {p["pid"]: p["title"] for p in papers}
     placed_reviewers = sum(1 for c in reviewer_country.values() if c)
     total_reviewers = len(reviewer_country)
-    judged = sum(
-        1 for pid, (placed, total) in paper_coverage.items()
-        if total and placed / total >= min_resolved
-    )
+    judged = len(papers) - len(thin)
+    capped_papers = sum(len(c.papers) for c in countries)
 
-    print("\n=== Region cap report ===")
+    print("\n=== Same-country cap report ===")
     print(
-        f"Target: a paper whose placed-country authors are more than "
-        f"{majority:.0%} one region holds at most that region's cap in reviewers "
-        f"affiliated there, in every phase including the cap-relaxed fill."
+        f"Target: at most {cap} reviewer(s) from a paper's own majority-author "
+        f"country, where a paper counts as majority-C when more than "
+        f"{majority:.0%} of its placed-country authors are in C. The same rule "
+        f"applies to every country; none is named in the policy."
     )
     print(
         "Country is where the institution is, not anyone's nationality; HK, MO, "
@@ -842,68 +845,79 @@ def region_report(
         f"{len(papers) - judged} were not."
     )
 
-    over_total = 0
-    for r in regions:
-        counts = {pid: sum(1 for e in slates[pid] if e in r.members) for pid in r.papers}
-        at_cap = [pid for pid, n in counts.items() if n == r.cap]
-        over = [pid for pid, n in counts.items() if n > r.cap]
-        over_total += len(over)
-        # Two different costs, worth separating. A paper is SHORT when the cap
-        # is why a slot is empty — the serious case, and the one that turns up
-        # in the shortage report. A paper is DISPLACED when it filled its slate
-        # but a better-matched reviewer from the region was passed over for a
-        # worse-matched one; that is the quality the cap is spending, and on a
-        # roster with a large region it is the usual outcome rather than a fault.
-        def spare(pid):
-            return [e for e in released_prefs[pid] if e in r.members and e not in slates[pid]]
+    rows, over_total, short_total, traded_total = [], 0, 0, 0
+    for c in countries:
+        counts = {pid: sum(1 for e in slates[pid] if e in c.members) for pid in c.papers}
+        at_cap = [pid for pid, n in counts.items() if n == c.cap]
+        over = [pid for pid, n in counts.items() if n > c.cap]
 
-        short = [
-            pid for pid in at_cap
-            if len(slates[pid]) < paper_target[pid] and spare(pid)
-        ]
-        displaced = []
+        # Two different costs, worth separating. A paper is SHORT when the cap is
+        # why a slot is empty -- the serious case, and the one that turns up in
+        # the shortage report. A paper TRADED when it filled its slate but a
+        # better-matched reviewer from its own country was passed over for a
+        # worse-matched one; that is the match quality the policy spends, and on
+        # a country with many reviewers it is the usual outcome, not a fault.
+        def spare(pid, members=c.members):
+            return [e for e in released_prefs[pid] if e in members and e not in slates[pid]]
+
+        short = [pid for pid in at_cap
+                 if len(slates[pid]) < paper_target[pid] and spare(pid)]
+        traded = []
         for pid in at_cap:
             if pid in short or not slates[pid]:
                 continue
             worst = min(score_lookup[(e, pid)] for e in slates[pid])
             if any(score_lookup[(e, pid)] > worst for e in spare(pid)):
-                displaced.append(pid)
+                traded.append(pid)
+        over_total += len(over)
+        short_total += len(short)
+        traded_total += len(traded)
+        rows.append((c, counts, at_cap, over, short, traded))
+
+    print(
+        f"{capped_papers} paper(s) capped across {len(countries)} countries; "
+        f"{over_total} over cap; {short_total} left short by the cap; "
+        f"{traded_total} that traded a better-matched same-country reviewer."
+    )
+
+    rows.sort(key=lambda r: (-len(r[0].papers), r[0].code))
+    for c, counts, at_cap, over, short, traded in rows:
         print(
-            f"\n{r.code} (cap {r.cap}): {len(r.members)} reviewer(s) affiliated there; "
-            f"{len(r.papers)} paper(s) majority-{r.code} and capped, "
-            f"{len(at_cap)} at the cap, {len(short)} left short by it, "
-            f"{len(displaced)} that traded a better-matched {r.code} reviewer for another."
+            f"\n{c.code}: {len(c.members)} reviewer(s) affiliated there; "
+            f"{len(c.papers)} paper(s) majority-{c.code}, {len(at_cap)} at the cap, "
+            f"{len(short)} short, {len(traded)} traded."
         )
         if over:
             print(f"  OVER THE CAP — should never happen: {len(over)} paper(s)")
             for pid in sorted(over):
-                print(f"    [{pid}] {by_title.get(pid, '')} — {counts[pid]} of cap {r.cap}")
+                print(f"    [{pid}] {by_title.get(pid, '')} — {counts[pid]} of cap {c.cap}")
         if short:
-            print(f"  Left short by the cap — a {r.code} reviewer was available and refused:")
+            print(f"  Left short — a {c.code} reviewer was available and refused:")
             for pid in sorted(short):
-                here, placed, total = r.shares[pid]
+                here, placed, _ = c.shares[pid]
                 print(f"    [{pid}] {by_title.get(pid, '')} — "
                       f"{len(slates[pid])} of {paper_target[pid]} reviewer(s); "
-                      f"{here}/{placed} placed authors in {r.code}")
-        if r.thin:
-            print(f"  Not judged, too few authors placed ({len(r.thin)} paper(s)):")
-            for pid in sorted(r.thin)[:20]:
-                _, placed, total = r.shares[pid]
-                print(f"    [{pid}] {by_title.get(pid, '')} — "
-                      f"{placed} of {total} author(s) placed")
-            if len(r.thin) > 20:
-                print(f"    ... and {len(r.thin) - 20} more")
+                      f"{here}/{placed} placed authors in {c.code}")
+
+    if thin:
+        print(f"\nNot judged, too few authors placed ({len(thin)} paper(s)):")
+        for pid in sorted(thin)[:20]:
+            placed, total = paper_coverage[pid]
+            print(f"    [{pid}] {by_title.get(pid, '')} — {placed} of {total} author(s) placed")
+        if len(thin) > 20:
+            print(f"    ... and {len(thin) - 20} more")
 
     if placed_reviewers < total_reviewers:
         print(
             f"\nWARNING: {total_reviewers - placed_reviewers} of {total_reviewers} "
-            f"candidate reviewers have no placed country, so no region cap can count "
-            f"them and every cap under-applies. Run build_affiliation_countries.py and "
-            f"fill the blank country cells in affiliation_countries.csv."
+            f"candidate reviewers have no placed country, so no cap can count them "
+            f"and the policy under-applies — unevenly, in favour of whichever "
+            f"countries we are worse at placing. Run build_affiliation_countries.py "
+            f"and fill the blank country cells in affiliation_countries.csv."
         )
-    if judged < len(papers):
+    if thin:
         print(
-            f"WARNING: {len(papers) - judged} of {len(papers)} papers had fewer than "
+            f"WARNING: {len(thin)} of {len(papers)} papers had fewer than "
             f"{min_resolved:.0%} of their authors placed and were NOT capped. Raise "
             f"coverage, or lower --region-min-resolved deliberately."
         )
@@ -1111,15 +1125,22 @@ def main() -> int:
         help="max out-of-area reviewers per paper before the almost-not-out-of-area relaxation (default: %(default)s)"
     )
     parser.add_argument(
-        "--region-cap", action="append", type=parse_region_cap, default=[], metavar="CC=N",
-        help="max reviewers affiliated in ISO country/region CC on a paper whose "
-             "authors are majority-CC; repeatable, e.g. --region-cap CN=2. Keyed on "
-             "where the institution is, never anyone's nationality; HK, MO, TW and SG "
-             "are separate codes and are never counted as CN"
+        "--same-country-cap", type=int, default=DEFAULT_SAME_COUNTRY_CAP, metavar="N",
+        help="max reviewers from a paper's own majority-author country (default: "
+             "%(default)s). One rule for every country: a US paper is capped on US "
+             "reviewers exactly as a Chinese paper is capped on Chinese ones. Keyed "
+             "on where the institution is, never anyone's nationality; HK, MO, TW "
+             "and SG are separate ISO codes. 0 means no same-country reviewer at "
+             "all; use --no-same-country-cap to switch the policy off"
+    )
+    parser.add_argument(
+        "--no-same-country-cap", action="store_true",
+        help="disable the same-country cap entirely (distinct from --same-country-cap 0, "
+             "which admits no same-country reviewer)"
     )
     parser.add_argument(
         "--region-majority", type=float, default=DEFAULT_REGION_MAJORITY,
-        help="share of a paper's placed authors that must be in the region for its "
+        help="share of a paper's placed authors that must share a country for its "
              "cap to bind (default: %(default)s)"
     )
     parser.add_argument(
@@ -1158,9 +1179,8 @@ def main() -> int:
         parser.error("--area-weight must be greater than 0")
     if args.min_seniors < 0 or args.max_juniors < 0 or args.max_out_of_area < 0:
         parser.error("--min-seniors, --max-juniors, and --max-out-of-area must be non-negative")
-    seen_regions = [code for code, _ in args.region_cap]
-    if len(seen_regions) != len(set(seen_regions)):
-        parser.error("--region-cap given twice for the same country/region code")
+    if args.same_country_cap < 0:
+        parser.error("--same-country-cap must be non-negative")
     if not 0 < args.region_majority <= 1:
         parser.error("--region-majority must be greater than 0 and at most 1")
     if not 0 <= args.region_min_resolved <= 1:
@@ -1262,20 +1282,21 @@ def main() -> int:
 
     report_conflict_coverage(papers, reviewers_by_email)
 
-    # Region caps bind before any phase runs, and are never released by one.
-    regions: list[RegionCap] = []
+    # The same-country cap binds before any phase runs, and no phase releases it.
+    countries: list[CountryCap] = []
     reviewer_country: dict[str, str] = {}
     paper_coverage: dict[int, tuple[int, int]] = {}
-    if args.region_cap:
+    thin_papers: list[int] = []
+    if not args.no_same_country_cap:
         layers = affiliation_country.load_layers(args.affiliation_countries)
-        regions, reviewer_country, paper_coverage = build_region_caps(
-            papers, candidate_emails, reviewers_by_email, args.region_cap, layers,
+        countries, reviewer_country, paper_coverage, thin_papers = build_country_caps(
+            papers, candidate_emails, reviewers_by_email, args.same_country_cap, layers,
             majority=args.region_majority, min_resolved=args.region_min_resolved,
         )
-    region_capped: list[tuple[frozenset[str], dict[int, int]]] = [
-        (r.members, r.papers) for r in regions
+    country_capped: list[tuple[frozenset[str], dict[int, int]]] = [
+        (c.members, c.papers) for c in countries
     ]
-    region_pids = {pid for r in regions for pid in r.papers}
+    capped_pids = {pid for c in countries for pid in c.papers}
 
     pids = [p["pid"] for p in papers]
     paper_target = {pid: args.reviewers_per_paper for pid in pids}
@@ -1287,17 +1308,17 @@ def main() -> int:
     }
 
     assigned_via: dict[tuple[int, str], str] = {}
-    # Only the F1 pass mixes a region class with the seniority classes, so only
+    # Only the F1 pass mixes a country class with the seniority classes, so only
     # it can lose the stability guarantee; every other path stays laminar.
-    region_blocking = 0
+    capped_blocking = 0
 
     if args.no_seniority:
         slates = deferred_acceptance(pids, paper_prefs, paper_target, reviewer_cap,
-                                     score_lookup, region_capped)
+                                     score_lookup, country_capped)
         # Judge stability on the gated pass alone — the area-released fill
         # below deliberately steps outside the gated preference lists.
         blocking = count_blocking_pairs(eligible_by_pid, slates, reviewer_cap, paper_target,
-                                        score_lookup, region_capped)
+                                        score_lookup, country_capped)
         blocking_label = "gated-pass blocking pairs"
         pools = None
         assigned_via = {(pid, e): "fill" for pid, emails in slates.items() for e in emails}
@@ -1308,7 +1329,7 @@ def main() -> int:
         relax_target = {pid: paper_target[pid] - len(slates[pid]) for pid in pids}
         held_r, _, _ = assignment_phase(
             pids, released_prefs, relax_target, slates, used, reviewer_cap, score_lookup,
-            set(reviewer_cap), region_capped,
+            set(reviewer_cap), country_capped,
         )
         for pid, emails in held_r.items():
             for e in emails:
@@ -1341,20 +1362,20 @@ def main() -> int:
         # cap-relaxed fill: a paper under-fills rather than exceed one.
         # A1: anchor each paper's best eligible in-area senior(s) — frozen afterwards.
         anchor_target = {pid: min(args.min_seniors, args.reviewers_per_paper) for pid in pids}
-        run_phase("senior anchor", paper_prefs, anchor_target, pools.seniors, region_capped)
+        run_phase("senior anchor", paper_prefs, anchor_target, pools.seniors, country_capped)
         # A2: papers short a senior try area-released true seniors (area is
         # released before the senior requirement is relaxed).
         a2_target = {pid: max(0, anchor_target[pid] - len(slates[pid])) for pid in pids}
         run_phase("senior anchor (area released)", released_prefs, a2_target, pools.seniors,
-                  region_capped)
+                  country_capped)
         # A3: papers still senior-less fall back to an almost-senior, any area.
         a3_target = {pid: max(0, anchor_target[pid] - len(slates[pid])) for pid in pids}
         run_phase("almost-senior anchor", released_prefs, a3_target, pools.almost_seniors,
-                  region_capped)
+                  country_capped)
         # F1: main fill — everyone competes on score within the area gate,
         # juniors and out-of-area reviewers each capped per paper.
         capped = [(pools.juniors, args.max_juniors),
-                  (pools.out_of_area, args.max_out_of_area), *region_capped]
+                  (pools.out_of_area, args.max_out_of_area), *country_capped]
         # What the anchors froze, so the F1 self-check judges F1 in F1's terms.
         f1_seed = class_counts_of(slates, pids, capped)
         fill_target = {pid: args.reviewers_per_paper - len(slates[pid]) for pid in pids}
@@ -1364,11 +1385,11 @@ def main() -> int:
         f2_target = {pid: args.reviewers_per_paper - len(slates[pid]) for pid in pids}
         run_phase("fill (area released)", released_prefs, f2_target, set(reviewer_cap), capped)
         # F3: papers still under-filled may exceed the junior and out-of-area
-        # caps with extra almost-nots. The region caps are not relaxed here.
+        # caps with extra almost-nots. The same-country cap is not relaxed here.
         f3_target = {pid: args.reviewers_per_paper - len(slates[pid]) for pid in pids}
         run_phase(
             "fill (cap relaxed)", released_prefs, f3_target,
-            pools.almost_not_juniors | pools.almost_not_out_of_area, region_capped,
+            pools.almost_not_juniors | pools.almost_not_out_of_area, country_capped,
         )
         paper_held = slates
 
@@ -1379,17 +1400,17 @@ def main() -> int:
         # not extend to them: a region class crosses the seniority classes, and
         # greedy-by-score choice over a crossing family is not substitutable, so
         # deferred acceptance no longer promises a stable outcome there. Their
-        # caps are still hard — `region_over` below is the check that replaces
-        # this one. With no --region-cap, region_pids is empty and this is
-        # exactly the check it has always been.
+        # caps are still hard — `country_over` below is the check that replaces
+        # this one. With --no-same-country-cap, capped_pids is empty and this
+        # is exactly the check it has always been.
         pairs2 = {pid: [(e, score_lookup[(e, pid)]) for e in prefs2[pid]] for pid in pids}
-        laminar = {pid: v for pid, v in pairs2.items() if pid not in region_pids}
+        laminar = {pid: v for pid, v in pairs2.items() if pid not in capped_pids}
         blocking = count_blocking_pairs(
             laminar, held2, cap2, fill_target, score_lookup, capped, f1_seed
         )
         blocking_label = "F1 blocking pairs"
-        crossing = {pid: v for pid, v in pairs2.items() if pid in region_pids}
-        region_blocking = count_blocking_pairs(
+        crossing = {pid: v for pid, v in pairs2.items() if pid in capped_pids}
+        capped_blocking = count_blocking_pairs(
             crossing, held2, cap2, fill_target, score_lookup, capped, f1_seed
         ) if crossing else 0
 
@@ -1454,17 +1475,18 @@ def main() -> int:
             f"out-of-area policy, and {over_target} over target — should always be 0; "
         )
 
-    region_summary = ""
-    if regions:
-        region_over = region_report(
-            papers, paper_held, regions, reviewer_country, paper_coverage,
-            reviewers_by_email, released_prefs, paper_target, score_lookup,
-            majority=args.region_majority, min_resolved=args.region_min_resolved,
+    country_summary = ""
+    if not args.no_same_country_cap:
+        country_over = country_cap_report(
+            papers, paper_held, countries, reviewer_country, paper_coverage,
+            thin_papers, released_prefs, paper_target, score_lookup,
+            cap=args.same_country_cap, majority=args.region_majority,
+            min_resolved=args.region_min_resolved,
         )
-        region_summary = (
-            f"{region_over} papers over a region cap — should always be 0; "
-            f"{region_blocking} F1 blocking pairs among region-capped papers "
-            f"(a region class crosses the seniority classes, so a stable matching "
+        country_summary = (
+            f"{country_over} papers over the same-country cap — should always be 0; "
+            f"{capped_blocking} F1 blocking pairs among capped papers "
+            f"(a country class crosses the seniority classes, so a stable matching "
             f"is not guaranteed there — see README); "
         )
 
@@ -1485,7 +1507,7 @@ def main() -> int:
         f" — should always be 0; "
         f"{blocking} {blocking_label} — should always be 0; "
         f"{seniority_summary}"
-        f"{region_summary}"
+        f"{country_summary}"
         f"{n_excluded} papers excluded and {n_relaxed} relaxed — see relaxation report above; "
         f"{total_missing} reviewer-slot(s) unfilled — see shortage report above).",
         file=sys.stderr,

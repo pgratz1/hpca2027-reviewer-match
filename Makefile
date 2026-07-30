@@ -15,8 +15,10 @@
 #                            the rate-limited DBLP caches
 #
 # Override the interpreter with `make PYTHON=python3` if not using the venv.
-# Region caps are off by default; enable with e.g.
-# `make REGION_CAP="--region-cap CN=2"` (see README, "Region caps").
+# The same-country cap is ON by default at 2: a paper whose authors are mostly
+# from one country gets at most that many reviewers from it, the same rule for
+# every country. `make SAME_COUNTRY_CAP=3` loosens it, `=0` admits no
+# same-country reviewer at all, and `=off` disables the policy.
 #
 # assignment.txt and area_chair_assignment.txt cover the registered papers;
 # once HotCRP has real submissions, switch with
@@ -24,8 +26,10 @@
 
 PYTHON ?= $(HOME)/envs/hpca-matching/bin/python3
 PAPER_POLICY ?= registered
-# Per-paper region caps, off unless asked for: REGION_CAP="--region-cap CN=2"
-REGION_CAP ?=
+# Max reviewers from a paper's own majority-author country. A number, or `off`.
+SAME_COUNTRY_CAP ?= 2
+REGION_FLAG = $(if $(filter off,$(SAME_COUNTRY_CAP)),--no-same-country-cap,\
+                   --same-country-cap $(SAME_COUNTRY_CAP))
 
 # Optional local secrets. This file is gitignored; variables must be exported
 # so enrich_publications.py can read them from its environment.
@@ -136,7 +140,7 @@ smoke: $(SMOKE_DATA)
 	@test -f reserve_fingerprints.json || { echo "ERROR: reserve_fingerprints.json not found; run make reserves first" >&2; exit 1; }
 	$(PYTHON) assign_reviewers.py --data $(SMOKE_DATA) --csv "$(CSV)" \
 		--include-reserves --reserve-cap $(SMOKE_RESERVE_CAP) \
-		$(REGION_CAP) > $(SMOKE_OUT)
+		$(REGION_FLAG) > $(SMOKE_OUT)
 	@echo "wrote $(SMOKE_OUT)" >&2
 
 complete-papers: assignment-complete.txt
@@ -171,13 +175,13 @@ assignment.txt: assign_reviewers.py paper_matching.py classify_reviewers.py \
 		affiliation_country.py $(EMBED_LIBS) \
 		fingerprints.json reviewer_seniority.csv hpca2027-data.json
 	$(PYTHON) assign_reviewers.py --paper-policy $(PAPER_POLICY) --csv "$(CSV)" \
-		$(REGION_CAP) > $@
+		$(REGION_FLAG) > $@
 
 assignment-complete.txt: assign_reviewers.py paper_matching.py classify_reviewers.py \
 		affiliation_country.py $(EMBED_LIBS) \
 		fingerprints.json reviewer_seniority.csv hpca2027-data.json
 	$(PYTHON) assign_reviewers.py --paper-policy complete --csv "$(CSV)" \
-		$(REGION_CAP) > $@
+		$(REGION_FLAG) > $@
 
 clean:
 	rm -f assignment.txt area_chair_assignment.txt assignment-complete.txt \

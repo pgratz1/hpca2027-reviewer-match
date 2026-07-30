@@ -651,6 +651,26 @@ class AssignmentPropertyTests(unittest.TestCase):
             self.assertEqual(0, assign_reviewers.count_blocking_pairs(
                 pairs, held, caps, targets, scores, capped))
 
+    def test_many_classes_cost_no_more_than_the_ones_that_bind(self):
+        # One cap per country means ~30 classes and ~60 membership signatures,
+        # but any one paper can only ever defer into the cells its own caps
+        # block. Allocating a deque per signature per paper made every scan
+        # proportional to the number of countries in the conference; the result
+        # must be identical to running with only the binding class present.
+        emails = [f"r{i}" for i in range(6)]
+        scores = {(e, 1): 1.0 - i / 10 for i, e in enumerate(emails)}
+        prefs = {1: emails}
+        caps = {e: 1 for e in emails}
+        binding = frozenset({"r0", "r1", "r2"})
+        # 25 further classes that name this paper's reviewers but never bind it.
+        idle = [(frozenset({e}), {99: 1}) for e in emails for _ in range(4)]
+        lean = assign_reviewers.deferred_acceptance(
+            [1], prefs, {1: 3}, caps, scores, [(binding, 1)])
+        fat = assign_reviewers.deferred_acceptance(
+            [1], prefs, {1: 3}, caps, scores, [(binding, 1), *idle])
+        self.assertEqual(lean[1], fat[1])
+        self.assertEqual(1, sum(e in binding for e in fat[1]))
+
     def test_crossing_class_caps_can_leave_a_blocking_pair(self):
         # Not a bug: {juniors, region} is a crossing family, and greedy-by-score
         # choice over one is not substitutable, so no stable outcome is
@@ -2035,8 +2055,8 @@ class RegionResolutionTests(unittest.TestCase):
         self.assertNotEqual(norm("Blue University"), norm("Blue Univ."))
 
 
-class RegionCapTests(unittest.TestCase):
-    """assign_reviewers.py: which papers a region cap binds, and the flag."""
+class SameCountryCapTests(unittest.TestCase):
+    """assign_reviewers.py: which papers the same-country cap binds, and how."""
 
     def paper(self, pid, countries):
         # countries: one entry per author, "" for an author we cannot place.
@@ -2045,12 +2065,42 @@ class RegionCapTests(unittest.TestCase):
         ]
         return {"pid": pid, "title": f"P{pid}", "authors": authors}
 
-    def build(self, papers, majority=0.5, min_resolved=0.5, cap=2):
+    def build(self, papers, majority=0.5, min_resolved=0.5, cap=2, reviewers=()):
         layers = affiliation_country.CountryLayers()
-        return assign_reviewers.build_region_caps(
-            papers, [], {}, [("CN", cap)], layers,
+        by_email = {}
+        for email, affiliation in reviewers:
+            by_email[email] = reviewer()
+            by_email[email].email = email
+            by_email[email].affiliation = affiliation
+            by_email[email].pid = None
+        return assign_reviewers.build_country_caps(
+            papers, list(by_email), by_email, cap, layers,
             majority=majority, min_resolved=min_resolved,
         )
+
+    def by_code(self, caps):
+        return {c.code: c for c in caps}
+
+    def test_every_country_is_capped_on_its_own_papers(self):
+        # The point of the rule: nothing names a country. A US paper is capped
+        # on US reviewers exactly as a Chinese paper is on Chinese ones, in one
+        # run, from one flag.
+        papers = [self.paper(1, ["China", "China", "USA"]),
+                  self.paper(2, ["USA", "USA", "China"])]
+        caps, _, _, _ = self.build(papers)
+        by = self.by_code(caps)
+        self.assertEqual({"CN", "US"}, set(by))
+        self.assertEqual({1: 2}, by["CN"].papers)   # CN caps the CN-majority paper
+        self.assertEqual({2: 2}, by["US"].papers)   # and not the US-majority one
+        self.assertNotIn(2, by["CN"].papers)
+        self.assertNotIn(1, by["US"].papers)
+
+    def test_only_the_majority_country_is_capped_on_a_paper(self):
+        # A paper with a Chinese majority and one American author caps Chinese
+        # reviewers only; the US class does not exist unless some paper is
+        # majority-US.
+        caps, _, _, _ = self.build([self.paper(1, ["China", "China", "USA"])])
+        self.assertEqual(["CN"], [c.code for c in caps])
 
     def test_majority_uses_placed_authors_under_a_coverage_floor(self):
         papers = [
@@ -2061,31 +2111,43 @@ class RegionCapTests(unittest.TestCase):
             self.paper(2, ["China"] + [""] * 9),
             # exactly half is not a majority
             self.paper(3, ["China", "USA"]),
-            self.paper(4, ["USA", "USA"]),
         ]
-        caps, _, coverage = self.build(papers)
-        cn = caps[0]
+        caps, _, coverage, thin = self.build(papers)
+        cn = self.by_code(caps)["CN"]
         self.assertEqual({1: 2}, cn.papers)
-        self.assertEqual([2], cn.thin)
+        self.assertEqual([2], thin)
         self.assertEqual((5, 10), coverage[1])
         self.assertEqual((3, 5, 10), cn.shares[1])
 
-    def test_a_paper_with_no_authors_is_never_capped(self):
-        caps, _, _ = self.build([self.paper(1, [])])
-        self.assertEqual({}, caps[0].papers)
-        self.assertEqual([], caps[0].thin)
+    def test_a_paper_with_no_majority_or_no_authors_is_uncapped(self):
+        caps, _, _, thin = self.build([self.paper(1, []), self.paper(2, ["China", "USA"])])
+        self.assertEqual([], caps)
+        self.assertEqual([], thin)   # an authorless paper is not "thin", just absent
+
+    def test_reviewers_are_classed_by_their_own_country(self):
+        papers = [self.paper(1, ["China", "China"])]
+        caps, by_email, _, _ = self.build(
+            papers, reviewers=[("cn@x.edu", "Tsinghua University, China"),
+                               ("us@x.edu", "Duke University, USA"),
+                               ("no@x.edu", "Somewhere Unknown")])
+        cn = self.by_code(caps)["CN"]
+        self.assertEqual(frozenset({"cn@x.edu"}), cn.members)
+        # An unplaced reviewer is in no class and can never consume a cap.
+        self.assertEqual("", by_email["no@x.edu"])
 
     def test_the_thresholds_are_tunable(self):
         papers = [self.paper(1, ["China", "USA"])]
-        self.assertEqual({}, self.build(papers)[0][0].papers)
-        # A 40% threshold makes an even split a majority.
-        self.assertEqual({1: 2}, self.build(papers, majority=0.4)[0][0].papers)
+        self.assertEqual([], self.build(papers)[0])
+        # A 40% threshold makes an even split a majority — for whichever country
+        # Counter.most_common puts first, so just assert one class appeared.
+        self.assertEqual(1, len(self.build(papers, majority=0.4)[0]))
 
-    def test_region_cap_flag_rejects_what_it_cannot_enforce(self):
-        self.assertEqual(("CN", 2), assign_reviewers.parse_region_cap("cn=2"))
-        for bad in ("CN", "CN=", "=2", "ZZ=2", "CN=x", "CN=-1"):
-            with self.assertRaises(argparse.ArgumentTypeError, msg=bad):
-                assign_reviewers.parse_region_cap(bad)
+    def test_a_zero_cap_is_a_policy_not_an_off_switch(self):
+        # 0 means "no reviewer from the paper's own country", which this roster
+        # can actually satisfy; switching the policy off is --no-same-country-cap
+        # and is handled by main, not here.
+        caps, _, _, _ = self.build([self.paper(1, ["China", "China"])], cap=0)
+        self.assertEqual({1: 0}, caps[0].papers)
 
 
 class AffiliationCountryFileTests(unittest.TestCase):
@@ -2123,6 +2185,20 @@ class AffiliationCountryFileTests(unittest.TestCase):
             {affiliation_country.normalize_affiliation("Blue University"): "JP"},
             affiliation_country.load_affiliation_countries(self.out),
         )
+
+    def test_decided_by_rides_along_with_the_country_it_explains(self):
+        # Provenance has to survive a regenerate for a filled cell to stay
+        # auditable. It cannot live in `note`, which merge_rows rewrites.
+        layers = affiliation_country.CountryLayers()
+        rows = build_affiliation_countries.merge_rows([], self.entries(), layers)
+        rows[0]["country"] = "JP"
+        rows[0]["decided_by"] = "websearch"
+        build_affiliation_countries.write_countries(self.out, rows)
+        again = build_affiliation_countries.merge_rows(
+            build_affiliation_countries.read_existing(self.out), self.entries(), layers)
+        self.assertEqual("JP", again[0]["country"])
+        self.assertEqual("websearch", again[0]["decided_by"])
+        self.assertEqual("roster", again[0]["note"])   # regenerated, not carried
 
     def test_rerunning_on_unchanged_input_is_byte_identical(self):
         layers = affiliation_country.CountryLayers()

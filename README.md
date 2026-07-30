@@ -281,12 +281,14 @@ for under-filled papers still applies).
 ~/envs/hpca-matching/bin/python3 assign_reviewers.py --light-cap 7 --full-cap 15 --reviewers-per-paper 6
 ```
 
-#### Region caps
+#### Same-country cap
 
-`--region-cap CC=N` caps how many reviewers affiliated in region `CC` a paper
-whose authors are majority-`CC` may hold. It is off unless asked for, repeatable
-(`--region-cap CN=2 --region-cap KR=2`), and country-agnostic — nothing about any
-one region is in the code.
+**On by default at 2.** A paper whose authors are mostly from country C gets at
+most `--same-country-cap N` reviewers affiliated in C. The same rule applies to
+every country: a US paper is capped on US reviewers exactly as a Chinese paper
+is capped on Chinese ones, and **no country is named in the policy** — the set
+of capped countries is whatever the submissions happen to contain (31 in the
+current data).
 
 It keys on **where the institution is, never anyone's nationality**: HotCRP
 records affiliations and email addresses, not citizenship, and institutional
@@ -296,9 +298,13 @@ HotCRP do write "Hong Kong …, China", so a region name always outranks the
 sovereign state it sits in. See "The affiliation-country file" for how an
 institution is placed.
 
-A paper is majority-`CC` when more than `--region-majority` (default 0.5) of the
-authors whose country could be **placed** are in `CC`. The denominator is the
-placed authors, not all of them — counting unplaced authors against the region
+`--same-country-cap 0` is a real setting, not the off switch: it admits **no**
+reviewer from the paper's own country, which this roster can actually satisfy.
+Use `--no-same-country-cap` to disable the policy.
+
+A paper is majority-C when more than `--region-majority` (default 0.5) of the
+authors whose country could be **placed** are in C. The denominator is the
+placed authors, not all of them — counting unplaced authors against the country
 would make thin data look like a non-majority everywhere. To stop that reading
 the other way (one placed author out of ten reading as 100%), a paper with fewer
 than `--region-min-resolved` (default 0.5) of its authors placed is **not capped
@@ -307,30 +313,36 @@ at all** and is listed by name in the report.
 The cap is **hard in all six phases**, including the senior anchors and the
 `fill (cap relaxed)` phase where the junior and out-of-area caps break. A paper
 under-fills rather than exceed it, and the shortfall shows up in the shortage
-report. `region_report` prints, per region, how many papers were capped, how many
-sat at the cap, how many were **left short** by it, and how many **traded** a
-better-matched region reviewer for another — the second is the usual cost and the
-first is the serious one.
+report. `country_cap_report` prints, per country, how many papers were capped,
+how many sat at the cap, how many were **left short** by it, and how many
+**traded** a better-matched same-country reviewer for another — the second is
+the usual cost and the first is the serious one.
 
-Two coverage lines lead the report and matter as much as the caps. A reviewer
-whose country could not be placed is in no region class and can never consume a
-cap; a paper whose authors could not be placed is never judged. On thin data the
-rule quietly applies to very little, so both counts are printed and a shortfall
-warns explicitly.
+Two coverage lines lead the report and matter more here than under a single
+named region. A reviewer whose country could not be placed is in no class and
+can never consume a cap; a paper whose authors could not be placed is never
+judged. Uneven coverage therefore does **not** weaken the rule evenly — it
+exempts whoever the resolver is worst at placing. That was not hypothetical:
+before `affiliation_countries.csv` was filled in, `.cn` and `.kr` were ccTLDs
+while `.edu` and `.com` were not, so US institutions were essentially invisible
+and **US did not appear once among the majority countries**. Read the coverage
+numbers before trusting a run.
 
-**One caveat on stability.** `{juniors, out-of-area, region}` is a *crossing*
-family — a region reviewer can also be junior or out-of-area — and greedy-by-score
-choice over a crossing family is not substitutable, so paper-proposing deferred
-acceptance no longer guarantees a stable outcome for region-capped papers. The
-`Done.` line therefore reports `F1 blocking pairs` over papers with no region cap
-(where the family is laminar and 0 is still guaranteed) and a separate count over
-the capped ones. What stays hard everywhere is the thing the rule needs: no cap
-is ever exceeded, which `region_over` checks and which must always be 0.
+**One caveat on stability.** `{juniors, out-of-area, country}` is a *crossing*
+family — a reviewer from the paper's country can also be junior or out-of-area —
+and greedy-by-score choice over a crossing family is not substitutable, so
+paper-proposing deferred acceptance no longer guarantees a stable outcome for
+capped papers. The `Done.` line therefore reports `F1 blocking pairs` over
+papers with no cap (where the family is laminar and 0 is still guaranteed) and a
+separate count over the capped ones. What stays hard everywhere is the thing the
+rule needs: no cap is ever exceeded, which must always be 0.
 
 ```bash
-~/envs/hpca-matching/bin/python3 assign_reviewers.py --region-cap CN=2
-make REGION_CAP="--region-cap CN=2"
-make smoke REGION_CAP="--region-cap CN=2"
+~/envs/hpca-matching/bin/python3 assign_reviewers.py                  # cap 2
+~/envs/hpca-matching/bin/python3 assign_reviewers.py --same-country-cap 3
+~/envs/hpca-matching/bin/python3 assign_reviewers.py --no-same-country-cap
+make SAME_COUNTRY_CAP=3
+make smoke SAME_COUNTRY_CAP=off
 ```
 
 ### `build_affiliation_countries.py` — the affiliation-country to-do list
