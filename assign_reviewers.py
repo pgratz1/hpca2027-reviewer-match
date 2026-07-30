@@ -801,6 +801,7 @@ def country_cap_report(
     released_prefs: dict[int, list[str]],
     paper_target: dict[int, int],
     score_lookup: dict[tuple[str, int], float],
+    has_capacity: set[str],
     *,
     cap: int,
     majority: float,
@@ -857,7 +858,20 @@ def country_cap_report(
         # better-matched reviewer from its own country was passed over for a
         # worse-matched one; that is the match quality the policy spends, and on
         # a country with many reviewers it is the usual outcome, not a fault.
+        #
+        # SHORT is an UPPER BOUND on the cap's fill cost, not a measurement of
+        # it. `has_capacity` removes the clearest false positives -- a
+        # same-country reviewer who ended the run at their own paper cap proves
+        # nothing, since the slot would have been empty either way -- but a paper
+        # can still land here having run out of phases rather than out of
+        # reviewers: F3 only draws from the almost-not pools, so a free reviewer
+        # outside them was never takeable. The true cost is a counterfactual and
+        # needs the two-run diff against --no-same-country-cap.
         def spare(pid, members=c.members):
+            return [e for e in released_prefs[pid]
+                    if e in members and e not in slates[pid] and e in has_capacity]
+
+        def eligible_spare(pid, members=c.members):
             return [e for e in released_prefs[pid] if e in members and e not in slates[pid]]
 
         short = [pid for pid in at_cap
@@ -867,7 +881,7 @@ def country_cap_report(
             if pid in short or not slates[pid]:
                 continue
             worst = min(score_lookup[(e, pid)] for e in slates[pid])
-            if any(score_lookup[(e, pid)] > worst for e in spare(pid)):
+            if any(score_lookup[(e, pid)] > worst for e in eligible_spare(pid)):
                 traded.append(pid)
         over_total += len(over)
         short_total += len(short)
@@ -876,7 +890,8 @@ def country_cap_report(
 
     print(
         f"{capped_papers} paper(s) capped across {len(countries)} countries; "
-        f"{over_total} over cap; {short_total} left short by the cap; "
+        f"{over_total} over cap; at most {short_total} left short by it "
+        f"(upper bound — diff a --no-same-country-cap run for the true cost); "
         f"{traded_total} that traded a better-matched same-country reviewer."
     )
 
@@ -892,7 +907,8 @@ def country_cap_report(
             for pid in sorted(over):
                 print(f"    [{pid}] {by_title.get(pid, '')} — {counts[pid]} of cap {c.cap}")
         if short:
-            print(f"  Left short — a {c.code} reviewer was available and refused:")
+            print(f"  Possibly short because of the cap — under target with a "
+                  f"free {c.code} reviewer refused:")
             for pid in sorted(short):
                 here, placed, _ = c.shares[pid]
                 print(f"    [{pid}] {by_title.get(pid, '')} — "
@@ -1480,6 +1496,7 @@ def main() -> int:
         country_over = country_cap_report(
             papers, paper_held, countries, reviewer_country, paper_coverage,
             thin_papers, released_prefs, paper_target, score_lookup,
+            {e for e in reviewer_cap if reviewer_load[e] < reviewer_cap[e]},
             cap=args.same_country_cap, majority=args.region_majority,
             min_resolved=args.region_min_resolved,
         )
