@@ -1,3 +1,4 @@
+import argparse
 import contextlib
 import csv
 import io
@@ -14,9 +15,11 @@ from unittest import mock
 import numpy as np
 import requests
 
+import affiliation_country
 import assign_reviewers
 import assign_area_chairs
 import area_chairs
+import build_affiliation_countries
 import build_fingerprints
 import build_dblp_snapshot_cache
 import build_reserve_reviewer_info
@@ -525,6 +528,178 @@ class AssignmentPropertyTests(unittest.TestCase):
                     pairs, held, caps, targets, scores, capped
                 ),
             )
+
+    def test_a_reviewer_in_two_classes_counts_against_both(self):
+        # Classes used to be keyed one-per-email, last writer winning, so a
+        # junior who is also region-affiliated would silently drop out of the
+        # junior cap. Both caps have to see them.
+        juniors = frozenset({"jr"})
+        region = frozenset({"jr", "r2"})
+        held = assign_reviewers.deferred_acceptance(
+            [1], {1: ["jr", "r2"]}, {1: 2}, {"jr": 1, "r2": 1},
+            {("jr", 1): 0.9, ("r2", 1): 0.8}, [(juniors, 1), (region, 1)],
+        )
+        self.assertEqual(["jr"], held[1])
+
+    def test_a_multi_class_candidate_is_not_stalled_by_an_unrelated_full_class(self):
+        # 'jrreg' is deferred because the junior cap is full. Keyed by class
+        # rather than by membership signature, it would sit at the head of the
+        # region queue blocking 'reg', which the region cap still has room for,
+        # and the paper would under-fill for no reason.
+        juniors = frozenset({"j1", "jrreg"})
+        region = frozenset({"jrreg", "reg"})
+        held = assign_reviewers.deferred_acceptance(
+            [1], {1: ["j1", "jrreg", "reg"]}, {1: 3},
+            {"j1": 1, "jrreg": 1, "reg": 1},
+            {("j1", 1): 0.9, ("jrreg", 1): 0.8, ("reg", 1): 0.7},
+            [(juniors, 1), (region, 2)],
+        )
+        self.assertEqual(["j1", "reg"], held[1])
+
+    def test_a_per_paper_cap_binds_only_the_papers_it_names(self):
+        # A region cap applies to majority-region papers alone; every other
+        # paper must behave as though the class did not exist.
+        region = frozenset({"a", "b"})
+        held = assign_reviewers.deferred_acceptance(
+            [1, 2], {1: ["a", "b"], 2: ["a", "b"]}, {1: 2, 2: 2}, {"a": 2, "b": 2},
+            {("a", 1): 0.9, ("b", 1): 0.8, ("a", 2): 0.7, ("b", 2): 0.6},
+            [(region, {1: 1})],
+        )
+        self.assertEqual(["a"], held[1])
+        self.assertEqual(["a", "b"], sorted(held[2]))
+
+    def test_random_assignments_with_crossing_classes_obey_every_cap(self):
+        # The same sweep as the laminar one, but with a third class that cuts
+        # across the first two. Stability is deliberately NOT asserted here --
+        # see test_crossing_class_caps_can_leave_a_blocking_pair.
+        rng = random.Random(7)
+        for _ in range(250):
+            pids = list(range(rng.randint(1, 6)))
+            emails = [f"r{i}" for i in range(rng.randint(1, 8))]
+            juniors, out_of_area, region = set(), set(), set()
+            for e in emails:
+                roll = rng.random()
+                if roll < 0.4:
+                    juniors.add(e)
+                elif roll < 0.6:
+                    out_of_area.add(e)
+                if rng.random() < 0.5:
+                    region.add(e)
+            capped = [
+                (frozenset(juniors), 1),
+                (frozenset(out_of_area), 1),
+                (frozenset(region), {pid: 2 for pid in pids if rng.random() < 0.7}),
+            ]
+            caps = {e: rng.randint(1, 3) for e in emails}
+            targets = {pid: rng.randint(1, 4) for pid in pids}
+            prefs, scores = {}, {}
+            for pid in pids:
+                candidates = []
+                for email in emails:
+                    if rng.random() < 0.75:
+                        score = rng.random()
+                        candidates.append((email, score))
+                        scores[email, pid] = score
+                candidates.sort(key=lambda pair: -pair[1])
+                prefs[pid] = [email for email, _ in candidates]
+            held = assign_reviewers.deferred_acceptance(
+                pids, prefs, targets, caps, scores, capped
+            )
+            limits = assign_reviewers.resolve_caps(capped, pids)
+            for pid in pids:
+                self.assertLessEqual(len(held[pid]), targets[pid])
+                # proposed at most once, and only to eligible candidates
+                self.assertEqual(len(held[pid]), len(set(held[pid])))
+                self.assertTrue(set(held[pid]) <= set(prefs[pid]))
+                for k, (class_emails, _) in enumerate(capped):
+                    self.assertLessEqual(
+                        sum(e in class_emails for e in held[pid]), limits[k][pid]
+                    )
+
+    def test_laminar_class_families_have_no_blocking_pairs(self):
+        # The guarantee that survives: with pairwise-disjoint or nested classes
+        # the greedy choice is substitutable, so deferred acceptance is stable.
+        rng = random.Random(11)
+        for _ in range(250):
+            pids = list(range(rng.randint(1, 6)))
+            emails = [f"r{i}" for i in range(rng.randint(1, 8))]
+            inner, outer = set(), set()
+            for e in emails:
+                roll = rng.random()
+                if roll < 0.3:
+                    inner.add(e)
+                    outer.add(e)  # nested: inner is a subset of outer
+                elif roll < 0.6:
+                    outer.add(e)
+            capped = [(frozenset(inner), 1), (frozenset(outer), 2)]
+            caps = {e: rng.randint(1, 3) for e in emails}
+            targets = {pid: rng.randint(1, 4) for pid in pids}
+            pairs, prefs, scores = {}, {}, {}
+            for pid in pids:
+                candidates = []
+                for email in emails:
+                    if rng.random() < 0.75:
+                        score = rng.random()
+                        candidates.append((email, score))
+                        scores[email, pid] = score
+                candidates.sort(key=lambda pair: -pair[1])
+                pairs[pid] = candidates
+                prefs[pid] = [email for email, _ in candidates]
+            held = assign_reviewers.deferred_acceptance(
+                pids, prefs, targets, caps, scores, capped
+            )
+            self.assertEqual(0, assign_reviewers.count_blocking_pairs(
+                pairs, held, caps, targets, scores, capped))
+
+    def test_crossing_class_caps_can_leave_a_blocking_pair(self):
+        # Not a bug: {juniors, region} is a crossing family, and greedy-by-score
+        # choice over one is not substitutable, so no stable outcome is
+        # promised. Paper 1 anchors 'a', is bumped off it by paper 2, and by
+        # then its region slots hold f and g -- both worse than the deferred e,
+        # which it can no longer take without dropping one of them.
+        pids = [1, 2]
+        prefs = {1: ["a", "e", "f", "g"], 2: ["x1", "x2", "a"]}
+        scores = {("a", 1): 1.0, ("e", 1): 0.9, ("f", 1): 0.5, ("g", 1): 0.4,
+                  ("x1", 2): 3.0, ("x2", 2): 2.0, ("a", 2): 1.5}
+        caps = {e: 1 for e in ["a", "e", "f", "g", "x1", "x2"]}
+        capped = [(frozenset({"a", "e"}), 1), (frozenset({"e", "f", "g"}), 2)]
+        held = assign_reviewers.deferred_acceptance(
+            pids, prefs, {1: 3, 2: 3}, caps, scores, capped)
+        self.assertEqual(["f", "g"], held[1])
+        pairs = {p: [(e, scores[(e, p)]) for e in prefs[p]] for p in pids}
+        self.assertEqual(1, assign_reviewers.count_blocking_pairs(
+            pairs, held, caps, {1: 3, 2: 3}, scores, capped))
+        # The caps themselves are still hard, which is what the rule needs.
+        for class_emails, limit in capped:
+            for pid in pids:
+                self.assertLessEqual(sum(e in class_emails for e in held[pid]), limit)
+
+    def test_papers_without_a_region_cap_stay_stable(self):
+        # The crossing instance again, but the region limit names only paper 2.
+        # Paper 1 sees a laminar family and keeps the guarantee.
+        pids = [1, 2]
+        prefs = {1: ["a", "e", "f", "g"], 2: ["x1", "x2", "a"]}
+        scores = {("a", 1): 1.0, ("e", 1): 0.9, ("f", 1): 0.5, ("g", 1): 0.4,
+                  ("x1", 2): 3.0, ("x2", 2): 2.0, ("a", 2): 1.5}
+        caps = {e: 1 for e in ["a", "e", "f", "g", "x1", "x2"]}
+        capped = [(frozenset({"a", "e"}), 1), (frozenset({"e", "f", "g"}), {2: 2})]
+        held = assign_reviewers.deferred_acceptance(
+            pids, prefs, {1: 3, 2: 3}, caps, scores, capped)
+        pairs = {1: [(e, scores[(e, 1)]) for e in prefs[1]]}
+        self.assertEqual(0, assign_reviewers.count_blocking_pairs(
+            pairs, held, caps, {1: 3, 2: 3}, scores, capped))
+
+    def test_blocking_pair_check_counts_frozen_phase_assignments(self):
+        # An anchor phase can seat a region-affiliated senior, so F1 starts with
+        # the region class already full even though nobody in this phase's
+        # paper_held is in it. Without the seed the check invents a blocking
+        # pair the matcher was right to refuse.
+        region = frozenset({"r1", "r2"})
+        args = ({1: [("r2", 0.9)]}, {1: []}, {"r2": 1}, {1: 1},
+                {("r2", 1): 0.9}, [(region, 1)])
+        self.assertEqual(1, assign_reviewers.count_blocking_pairs(*args))
+        self.assertEqual(0, assign_reviewers.count_blocking_pairs(
+            *args, held_counts={1: [1]}))
 
     def test_held_counts_seed_makes_caps_cumulative(self):
         # j1 (a junior) was frozen onto the paper by an earlier phase; with the
@@ -1077,6 +1252,8 @@ SNAPSHOT_FIXTURE = """<?xml version="1.0" encoding="ISO-8859-1"?>
 <www key="homepages/2/Beta">
 <author>Mei Lam 0001</author>
 <title>Home Page</title>
+<note type="affiliation">Blue University, Riverton, Portugal</note>
+<note type="award">not an affiliation</note>
 </www>
 <www key="homepages/9/Other">
 <author>Nobody Wanted</author>
@@ -1122,6 +1299,22 @@ class DblpSnapshotTests(unittest.TestCase):
         names = build_dblp_snapshot_cache.collect_names(self.path, set(wanted))
         by_name = {n: pid for pid, spellings in names.items() for n in spellings}
         return names, build_dblp_snapshot_cache.collect_publications(self.path, by_name)
+
+    def test_person_records_carry_the_affiliation_note(self):
+        # The notes sit in the records pass 1 already reads, so the region cap
+        # gets an offline country source for free. Only type="affiliation"
+        # counts, and collect_names still returns the shape its callers expect.
+        people = build_dblp_snapshot_cache.collect_person_records(
+            self.path, {"1/Alpha", "2/Beta"}
+        )
+        self.assertEqual(["Blue University, Riverton, Portugal"],
+                         people["2/Beta"]["affiliations"])
+        self.assertEqual([], people["1/Alpha"]["affiliations"])
+        self.assertEqual(["Mei Lam 0001"], people["2/Beta"]["names"])
+        self.assertEqual(
+            {pid: rec["names"] for pid, rec in people.items()},
+            build_dblp_snapshot_cache.collect_names(self.path, {"1/Alpha", "2/Beta"}),
+        )
 
     def test_person_records_decode_entities_and_list_every_spelling(self):
         # The dump declares a DTD it does not ship and uses named HTML
@@ -1763,6 +1956,205 @@ class ReserveRosterTests(unittest.TestCase):
         # An uploaded reviewer the workbook never vetted is reported, not dropped.
         self.assertEqual([("n@x.edu", "not_in_vetting")],
                          [(r["email"], r["problem"]) for r in unresolved])
+
+
+class RegionResolutionTests(unittest.TestCase):
+    """affiliation_country.py: placing an institution, and never guessing."""
+
+    def test_hong_kong_is_never_folded_into_china(self):
+        # The whole point of the rule: HK, MO, TW and SG are their own codes.
+        # DBLP and HotCRP both write "Hong Kong ..., China", so the region has
+        # to outrank the sovereign state whenever both are named.
+        resolve = affiliation_country.resolve_country
+        self.assertEqual("HK", resolve("The Chinese University of Hong Kong")[0])
+        self.assertEqual("HK", resolve("Unknown Lab", "someone@cse.univ-h.edu.hk")[0])
+        self.assertEqual("HK", resolve(
+            "Hong Kong University of Science and Technology, Department of "
+            "Electronic and Computer Engineering, China")[0])
+        self.assertEqual("MO", resolve("University of Macau, China")[0])
+        self.assertEqual("TW", resolve("National Taiwan University, Taipei")[0])
+        self.assertEqual("SG", resolve("National University of Singapore")[0])
+        # "Chinese" is an adjective, not a location; only the real name counts.
+        self.assertEqual(
+            "CN",
+            resolve("Institute of Computing Technology, Chinese Academy of "
+                    "Sciences", "someone@ict.ac.cn")[0],
+        )
+
+    def test_waterfall_precedence_and_the_layer_it_reports(self):
+        overrides = {affiliation_country.normalize_affiliation("Blue University"): "JP"}
+        notes = ["Blue University, Riverton, Portugal"]
+        self.assertEqual(
+            ("JP", "hand"),
+            affiliation_country.resolve_country(
+                "Blue University", "x@blue.ac.kr", notes, overrides),
+        )
+        self.assertEqual(
+            ("PT", "dblp"),
+            affiliation_country.resolve_country("Blue University", "x@blue.ac.kr", notes),
+        )
+        self.assertEqual(
+            ("KR", "email"),
+            affiliation_country.resolve_country("Blue University", "x@blue.ac.kr"),
+        )
+        self.assertEqual(
+            ("PT", "affiliation"),
+            affiliation_country.resolve_country("Blue University, Portugal", "x@blue.com"),
+        )
+
+    def test_nothing_is_guessed(self):
+        resolve = affiliation_country.resolve_country
+        # Generic TLDs are sold to anyone anywhere and place nobody.
+        for tld in ("com", "edu", "org", "io", "ai", "co", "me"):
+            self.assertEqual("", resolve("Some Startup", f"x@acme.{tld}")[0], tld)
+        # Country names must match whole tokens, so a lookalike is not a match.
+        self.assertEqual("", resolve("Indiana University", "x@iu.edu")[0])
+        # Names that are also institutions or US states are left out entirely
+        # rather than producing a confident wrong answer.
+        self.assertEqual("", resolve("Georgia Institute of Technology")[0])
+        self.assertEqual(("", "unresolved"), resolve("Unknown Place", "x@nowhere.com"))
+
+    def test_a_dblp_note_is_chosen_by_matching_the_stated_affiliation(self):
+        # DBLP's note order means nothing -- a Tsinghua professor's notes can
+        # list UC Santa Barbara first -- so the person's own affiliation picks
+        # the note, and no match means this layer declines rather than
+        # answering with a former employer's country.
+        notes = ["University of California at Santa Barbara, CA, USA",
+                 "Blue University, Riverton, Portugal"]
+        self.assertEqual("PT", affiliation_country.country_from_dblp(notes, "Blue University"))
+        self.assertEqual("US", affiliation_country.country_from_dblp(
+            notes, "University of California at Santa Barbara"))
+        self.assertEqual("", affiliation_country.country_from_dblp(notes, "Green Institute"))
+        self.assertEqual("", affiliation_country.country_from_dblp(notes, ""))
+
+    def test_normalize_folds_only_trivial_spelling_differences(self):
+        norm = affiliation_country.normalize_affiliation
+        self.assertEqual(norm("The Blue University"), norm("Blue University,"))
+        self.assertEqual(norm("Universite de Montreal"), norm("Université de Montréal"))
+        # Abbreviations are a judgement call, so they stay distinct.
+        self.assertNotEqual(norm("Blue University"), norm("Blue Univ."))
+
+
+class RegionCapTests(unittest.TestCase):
+    """assign_reviewers.py: which papers a region cap binds, and the flag."""
+
+    def paper(self, pid, countries):
+        # countries: one entry per author, "" for an author we cannot place.
+        authors = [
+            {"email": f"a{i}@x.edu", "affiliation": c} for i, c in enumerate(countries)
+        ]
+        return {"pid": pid, "title": f"P{pid}", "authors": authors}
+
+    def build(self, papers, majority=0.5, min_resolved=0.5, cap=2):
+        layers = affiliation_country.CountryLayers()
+        return assign_reviewers.build_region_caps(
+            papers, [], {}, [("CN", cap)], layers,
+            majority=majority, min_resolved=min_resolved,
+        )
+
+    def test_majority_uses_placed_authors_under_a_coverage_floor(self):
+        papers = [
+            # 3 CN of 5 placed = 60% > 50%, and 5 of 10 placed clears the floor.
+            self.paper(1, ["China", "China", "China", "USA", "USA"] + [""] * 5),
+            # 1 CN of 1 placed reads as 100%, but 1 of 10 is below the floor:
+            # not capped, and reported instead of guessed at.
+            self.paper(2, ["China"] + [""] * 9),
+            # exactly half is not a majority
+            self.paper(3, ["China", "USA"]),
+            self.paper(4, ["USA", "USA"]),
+        ]
+        caps, _, coverage = self.build(papers)
+        cn = caps[0]
+        self.assertEqual({1: 2}, cn.papers)
+        self.assertEqual([2], cn.thin)
+        self.assertEqual((5, 10), coverage[1])
+        self.assertEqual((3, 5, 10), cn.shares[1])
+
+    def test_a_paper_with_no_authors_is_never_capped(self):
+        caps, _, _ = self.build([self.paper(1, [])])
+        self.assertEqual({}, caps[0].papers)
+        self.assertEqual([], caps[0].thin)
+
+    def test_the_thresholds_are_tunable(self):
+        papers = [self.paper(1, ["China", "USA"])]
+        self.assertEqual({}, self.build(papers)[0][0].papers)
+        # A 40% threshold makes an even split a majority.
+        self.assertEqual({1: 2}, self.build(papers, majority=0.4)[0][0].papers)
+
+    def test_region_cap_flag_rejects_what_it_cannot_enforce(self):
+        self.assertEqual(("CN", 2), assign_reviewers.parse_region_cap("cn=2"))
+        for bad in ("CN", "CN=", "=2", "ZZ=2", "CN=x", "CN=-1"):
+            with self.assertRaises(argparse.ArgumentTypeError, msg=bad):
+                assign_reviewers.parse_region_cap(bad)
+
+
+class AffiliationCountryFileTests(unittest.TestCase):
+    """build_affiliation_countries.py: the hand layer's to-do file."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.out = str(self.dir / "affiliation_countries.csv")
+
+    def entries(self):
+        return {
+            affiliation_country.normalize_affiliation("Blue University"): {
+                "raw": "Blue University", "emails": {"a@blue.ac.kr"},
+                "pids": set(), "roster": True, "people": 1,
+            },
+        }
+
+    def test_the_generator_never_clobbers_a_hand_entered_country(self):
+        layers = affiliation_country.CountryLayers()
+        rows = build_affiliation_countries.merge_rows([], self.entries(), layers)
+        build_affiliation_countries.write_countries(self.out, rows)
+        # The country column is the human's; the generator only ever suggests.
+        self.assertEqual("", rows[0]["country"])
+        self.assertEqual("KR", rows[0]["suggested"])
+
+        # A hand decision survives a rerun that disagrees with it, and is what
+        # gets read back.
+        rows[0]["country"] = "JP"
+        build_affiliation_countries.write_countries(self.out, rows)
+        again = build_affiliation_countries.merge_rows(
+            build_affiliation_countries.read_existing(self.out), self.entries(), layers)
+        self.assertEqual("JP", again[0]["country"])
+        self.assertEqual("KR", again[0]["suggested"])
+        self.assertEqual(
+            {affiliation_country.normalize_affiliation("Blue University"): "JP"},
+            affiliation_country.load_affiliation_countries(self.out),
+        )
+
+    def test_rerunning_on_unchanged_input_is_byte_identical(self):
+        layers = affiliation_country.CountryLayers()
+        first = str(self.dir / "a.csv")
+        second = str(self.dir / "b.csv")
+        rows = build_affiliation_countries.merge_rows([], self.entries(), layers)
+        build_affiliation_countries.write_countries(first, rows)
+        build_affiliation_countries.write_countries(
+            second,
+            build_affiliation_countries.merge_rows(
+                build_affiliation_countries.read_existing(first), self.entries(), layers),
+        )
+        self.assertEqual(Path(first).read_bytes(), Path(second).read_bytes())
+
+    def test_an_affiliation_that_left_the_data_keeps_its_decision(self):
+        # The HotCRP export is a moving snapshot; a withdrawn paper must not
+        # delete a decision someone already made.
+        layers = affiliation_country.CountryLayers()
+        rows = build_affiliation_countries.merge_rows([], self.entries(), layers)
+        rows[0]["country"] = "KR"
+        build_affiliation_countries.write_countries(self.out, rows)
+        after = build_affiliation_countries.merge_rows(
+            build_affiliation_countries.read_existing(self.out), {}, layers)
+        self.assertEqual("KR", after[0]["country"])
+        self.assertEqual("0", after[0]["people"])
+
+    def test_an_unknown_country_code_fails_loudly(self):
+        Path(self.out).write_text(
+            "affiliation,country,suggested,source,people,note\n"
+            "Blue University,ZZ,,,,\n", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            affiliation_country.load_affiliation_countries(self.out)
 
 
 if __name__ == "__main__":

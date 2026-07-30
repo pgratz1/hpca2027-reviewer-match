@@ -281,6 +281,83 @@ for under-filled papers still applies).
 ~/envs/hpca-matching/bin/python3 assign_reviewers.py --light-cap 7 --full-cap 15 --reviewers-per-paper 6
 ```
 
+#### Region caps
+
+`--region-cap CC=N` caps how many reviewers affiliated in region `CC` a paper
+whose authors are majority-`CC` may hold. It is off unless asked for, repeatable
+(`--region-cap CN=2 --region-cap KR=2`), and country-agnostic — nothing about any
+one region is in the code.
+
+It keys on **where the institution is, never anyone's nationality**: HotCRP
+records affiliations and email addresses, not citizenship, and institutional
+proximity is what the concern is actually about. **Hong Kong, Macao, Taiwan and
+Singapore are their own ISO codes and are never counted as CN**; both DBLP and
+HotCRP do write "Hong Kong …, China", so a region name always outranks the
+sovereign state it sits in. See "The affiliation-country file" for how an
+institution is placed.
+
+A paper is majority-`CC` when more than `--region-majority` (default 0.5) of the
+authors whose country could be **placed** are in `CC`. The denominator is the
+placed authors, not all of them — counting unplaced authors against the region
+would make thin data look like a non-majority everywhere. To stop that reading
+the other way (one placed author out of ten reading as 100%), a paper with fewer
+than `--region-min-resolved` (default 0.5) of its authors placed is **not capped
+at all** and is listed by name in the report.
+
+The cap is **hard in all six phases**, including the senior anchors and the
+`fill (cap relaxed)` phase where the junior and out-of-area caps break. A paper
+under-fills rather than exceed it, and the shortfall shows up in the shortage
+report. `region_report` prints, per region, how many papers were capped, how many
+sat at the cap, how many were **left short** by it, and how many **traded** a
+better-matched region reviewer for another — the second is the usual cost and the
+first is the serious one.
+
+Two coverage lines lead the report and matter as much as the caps. A reviewer
+whose country could not be placed is in no region class and can never consume a
+cap; a paper whose authors could not be placed is never judged. On thin data the
+rule quietly applies to very little, so both counts are printed and a shortfall
+warns explicitly.
+
+**One caveat on stability.** `{juniors, out-of-area, region}` is a *crossing*
+family — a region reviewer can also be junior or out-of-area — and greedy-by-score
+choice over a crossing family is not substitutable, so paper-proposing deferred
+acceptance no longer guarantees a stable outcome for region-capped papers. The
+`Done.` line therefore reports `F1 blocking pairs` over papers with no region cap
+(where the family is laminar and 0 is still guaranteed) and a separate count over
+the capped ones. What stays hard everywhere is the thing the rule needs: no cap
+is ever exceeded, which `region_over` checks and which must always be 0.
+
+```bash
+~/envs/hpca-matching/bin/python3 assign_reviewers.py --region-cap CN=2
+make REGION_CAP="--region-cap CN=2"
+make smoke REGION_CAP="--region-cap CN=2"
+```
+
+### `build_affiliation_countries.py` — the affiliation-country to-do list
+
+Collects every distinct affiliation string across the submissions and all three
+rosters (~1,300), runs the automatic layers over each, and writes
+`affiliation_countries.csv` with the machine's answer in `suggested` and an
+**empty `country` column for a human to fill in**. Only `country` is read back.
+The generator never writes it: that column is the hand-decided layer that
+outranks DBLP and everything below, so filling it in automatically would collapse
+the waterfall into a machine guess. A blank cell is a to-do marker, not a
+decision — the same contract as `dblp_overrides.csv`.
+
+Reruns are safe. Hand values are carried over verbatim, rows whose affiliation
+has left the data are kept with `people = 0` (the export is a moving snapshot and
+a withdrawn paper must not delete a decision), and an unchanged rerun is
+byte-identical.
+
+`--validate CC=PATH` / `!CC=PATH` checks the resolver against any hand-labelled
+CSV with an `email` column and lists the disagreements, which are the highest-value
+rows to curate.
+```bash
+make affiliation-countries
+~/envs/hpca-matching/bin/python3 build_affiliation_countries.py \
+    --validate CN=china_faculty.csv --validate '!CN=nonchina_faculty.csv'
+```
+
 ### `estimate_reserve_need.py` — size the reserve-reviewer cohort
 Pure arithmetic on the selected papers and the PC's per-member caps: how many
 review slots the papers need, how many the PC supplies, and how many reserve
@@ -402,6 +479,13 @@ make dblp-snapshot DBLP_SNAPSHOT=dblp-2027-01-01.xml
 A snapshot is a fixed point in time: anyone added to a roster after it was taken
 is absent and is **reported by PID at the end**, not silently left without
 publications. Those still need the live path, which remains the fallback.
+
+Pass 1 also writes `dblp_affiliations.json`, `{pid: ["Institution, City,
+Country", …]}`, from the `<note type="affiliation">` records sitting beside the
+name strings. It is a separate file because `--out` has a shape the publication
+loaders already read. This is the only place in the pipeline where a country is
+stated outright rather than inferred, and it is what lets the region cap place
+the roster offline.
 
 ### `reserve_reviewers.py` — the reserve roster as Reviewer records
 
@@ -589,6 +673,40 @@ It absorbed the output of a retired semi-automated lookup chain
 (`lookup_no_dblp_reviewers.py` / `apply_human_guesses.py`, removed July
 2026) that bulk-resolved the original ~57 no-DBLP reviewers; rows noting
 "migrated from final_identity_resolution.csv" came from there.
+
+## The affiliation-country file
+
+`affiliation_countries.csv` (columns `affiliation,country,suggested,source,
+people,note`) is the hand-maintained layer under the region cap, keyed by the
+normalized affiliation string. Same contract as `dblp_overrides.csv`: a filled
+`country` cell **wins over every automatic layer**, a blank cell is a to-do
+marker rather than a decision, and `build_affiliation_countries.py` regenerates
+the file with blanks so it doubles as the to-do list. `suggested` and `source`
+are the machine's independent opinion and are never read back — only `country`
+is.
+
+`affiliation_country.py` resolves an institution in four layers, first hit wins,
+and **nothing is ever guessed**:
+
+1. **`affiliation_countries.csv`** — the hand layer.
+2. **DBLP's `<note type="affiliation">`.** A profile often carries several and
+   *their order means nothing* (a Tsinghua professor's notes can list UC Santa
+   Barbara first), so the note is chosen by how well it matches the affiliation
+   the person gave HotCRP; if none matches, this layer declines rather than
+   answering with a former employer's country. The whole note is scanned for a
+   country name, not just its trailing field, because DBLP writes "Hong Kong
+   University of Science and Technology, …, China".
+3. **A country or region name in the affiliation string**, matched on whole
+   tokens. Adjectives are deliberately not names — "Chinese" would place "The
+   Chinese University of Hong Kong" in CN — and names that are also common
+   institution or place words ("Georgia", "Jordan", "Turkey") are excluded
+   rather than producing confident wrong answers.
+4. **The email ccTLD**, ignoring the TLDs sold generically (`.com`, `.edu`,
+   `.io`, `.ai`, `.co`, …), which say nothing about location.
+
+Anything the four layers cannot place stays **unresolved** and is reported, never
+assumed. That is why `assign_reviewers.py` prints reviewer and paper coverage
+whenever a region cap is on: an unplaced reviewer can never consume a cap.
 
 ## Support modules (not standalone scripts)
 

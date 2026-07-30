@@ -23,6 +23,13 @@ colleague cache uses, so `dblp.load_rich_cache` reads it directly and
 `dblp.load_colleague_cache` normalises the very same file to the [[year, title]]
 form build_fingerprints.py wants. No consumer needs to know where it came from.
 
+Pass 1 also writes `dblp_affiliations.json`, `{pid: ["Institution, City,
+Country", ...]}`, from the `<note type="affiliation">` records sitting alongside
+the name strings. It is a separate file because `--out` has a shape the loaders
+already read. This is the one place in the pipeline where a country is stated
+outright instead of inferred, and it is what lets `affiliation_country` place
+the roster offline.
+
 A snapshot is a fixed point in time: anyone added to a roster after it was taken
 is absent, and is reported at the end rather than silently left with no
 publications. Those still need the live path.
@@ -43,6 +50,11 @@ from roster import ROLES, load_roster
 
 DEFAULT_SNAPSHOT = "dblp-2026-07-01.xml"
 DEFAULT_OUT = "dblp_snapshot_cache.json"
+
+# Kept apart from DEFAULT_OUT deliberately: that file is {pid: [publication]} and
+# dblp.load_rich_cache reads it directly, so a second shape in it would break the
+# loaders that already understand it.
+DEFAULT_AFFILIATIONS_OUT = "dblp_affiliations.json"
 
 # Person records live under this key prefix; everything else in <www> is a
 # stray web page, not a human.
@@ -113,9 +125,16 @@ def _publication_doi(pub) -> str:
     return ""
 
 
-def collect_names(path: str, wanted: set[str]) -> dict[str, list[str]]:
-    """Pass 1: {pid: [name strings]} for the PIDs in `wanted`."""
-    names: dict[str, list[str]] = {}
+def collect_person_records(path: str, wanted: set[str]) -> dict[str, dict]:
+    """Pass 1: {pid: {"names": [...], "affiliations": [...]}} for `wanted`.
+
+    The affiliation notes sit in the very records the name strings come from, so
+    they cost nothing to pick up here and save the region cap a second network
+    source. DBLP writes them canonically as "Institution, City, Country", which
+    is the only place in this pipeline a country is stated outright rather than
+    inferred; `affiliation_country` reads them as its second layer.
+    """
+    people: dict[str, dict] = {}
     for elem in top_level_records(path):
         if elem.tag != "www":
             continue
@@ -125,8 +144,21 @@ def collect_names(path: str, wanted: set[str]) -> dict[str, list[str]]:
         pid = key[len(_HOMEPAGE_PREFIX):]
         if pid in wanted:
             found = ["".join(a.itertext()).strip() for a in elem.findall("author")]
-            names[pid] = [n for n in found if n]
-    return names
+            notes = [
+                "".join(n.itertext()).strip()
+                for n in elem.findall("note")
+                if n.get("type") == "affiliation"
+            ]
+            people[pid] = {
+                "names": [n for n in found if n],
+                "affiliations": [n for n in notes if n],
+            }
+    return people
+
+
+def collect_names(path: str, wanted: set[str]) -> dict[str, list[str]]:
+    """Pass 1, names only: {pid: [name strings]} for the PIDs in `wanted`."""
+    return {pid: rec["names"] for pid, rec in collect_person_records(path, wanted).items()}
 
 
 def collect_publications(
@@ -193,6 +225,9 @@ def main() -> int:
                         help=f"DBLP XML dump (default: {DEFAULT_SNAPSHOT})")
     parser.add_argument("--out", default=DEFAULT_OUT,
                         help=f"publication cache to write (default: {DEFAULT_OUT})")
+    parser.add_argument("--affiliations-out", default=DEFAULT_AFFILIATIONS_OUT,
+                        help=f"DBLP affiliation notes to write, {{pid: [note]}} "
+                             f"(default: {DEFAULT_AFFILIATIONS_OUT})")
     parser.add_argument("--role", action="append", choices=ROLES, default=None,
                         help="roster to cover; repeatable (default: all three)")
     args = parser.parse_args()
@@ -205,9 +240,15 @@ def main() -> int:
     print(f"{len(wanted)} PID(s) wanted across {', '.join(roles)}", file=sys.stderr)
 
     print(f"Pass 1/2: reading person records from {args.snapshot} ...", file=sys.stderr)
-    names = collect_names(args.snapshot, set(wanted))
+    people = collect_person_records(args.snapshot, set(wanted))
+    names = {pid: rec["names"] for pid, rec in people.items()}
     print(f"  matched {len(names)} of {len(wanted)} PID(s) to a person record",
           file=sys.stderr)
+
+    affiliations = {pid: rec["affiliations"] for pid, rec in people.items() if rec["affiliations"]}
+    save_cache(affiliations, args.affiliations_out)
+    print(f"  {len(affiliations)} PID(s) carry a DBLP affiliation note -> "
+          f"{args.affiliations_out}", file=sys.stderr)
 
     pid_by_name: dict[str, str] = {}
     for pid, spellings in names.items():

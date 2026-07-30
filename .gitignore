@@ -42,6 +42,11 @@ hpca2027-data-smoke*.json
 area_chair_assignment-complete.txt
 abstract-evaluation*.csv
 
+# Affiliation -> country layer and the DBLP affiliation notes behind it: both
+# are derived from real PC, area-chair and reserve identities.
+affiliation_countries.csv
+dblp_affiliations.json
+
 # Test fixture with a placeholder author email, not core project data
 hpca2027-data.json
 

@@ -56,6 +56,16 @@ contains spaces and parentheses — always quote it in shell commands).
   publication list, which is part of the fingerprint key, and re-embed them for
   nothing. PIDs absent from the snapshot (anyone added after it was taken) are
   reported and still use the live path.
+- `make affiliation-countries` enumerates every affiliation string across the
+  submissions and all three rosters and resolves which country each institution
+  is in, writing `affiliation_countries.csv` with a **blank `country` column as
+  the to-do list** (the `dblp_overrides.csv` idiom — the generator writes only
+  `suggested`, never `country`, or the hand layer would outrank DBLP with a
+  machine guess). Needed only for `--region-cap`; run `make dblp-snapshot` first,
+  since its `dblp_affiliations.json` is the strongest layer. `--validate
+  CN=china_faculty.csv '!CN=nonchina_faculty.csv'` checks it against the old
+  hand split — which turns out to be exactly the `.cn` email test (100%/0%), so
+  it misfiles Chinese-institution reviewers who use gmail/qq addresses.
 - `make reserves` puts the reserve roster through the same three stages as the
   PC (enrich → fingerprints → classify) via `--role reserve`, writing
   `reserve_fingerprints.json` and `reserve_seniority.csv`. Reserves never filled
@@ -78,13 +88,14 @@ contains spaces and parentheses — always quote it in shell commands).
   completeness filter in separate `*-complete.txt` artifacts.
 - Library modules (imported, never run): `reviewers.py`, `dblp.py`,
   `paper_matching.py`, `fingerprint.py`, `specter2_model.py`,
-  `reserve_reviewers.py`, `roster.py`. Runnable
+  `reserve_reviewers.py`, `roster.py`, `affiliation_country.py`. Runnable
   scripts: `classify_reviewers.py`, `build_fingerprints.py`,
   `enrich_publications.py`, `assign_reviewers.py`, `score_papers.py`,
   `nearest_neighbors.py`, `compare_abstract_rankings.py`,
   `score_abstract_evaluation.py`, `assign_area_chairs.py`,
   `estimate_reserve_need.py`, `build_reserve_reviewer_info.py`, `make_smoke_dataset.py`,
   `resolve_reserve_pids.py`, `build_dblp_snapshot_cache.py`,
+  `build_affiliation_countries.py`,
   `resolve_trc_members.py`, `main.py`.
 
 ## Architecture (filter-then-rank, then constrained assignment)
@@ -111,6 +122,15 @@ contains spaces and parentheses — always quote it in shell commands).
    COI is a hard filter and the area gate (reviewer primary/secondary ∩
    paper topics) governs the normal phases — neither is ever blended into
    the score, but the gate is released per-paper by the relaxation ladder.
+3b. **Region caps** (optional, `--region-cap CN=2`): a paper whose authors are
+   majority-CC holds at most N reviewers affiliated in CC. Affiliation country,
+   **never nationality**; HK/MO/TW/SG are separate ISO codes and are never
+   folded into CN. Hard in all six phases including F3, so a paper under-fills
+   rather than exceed it. Because a region class *crosses* the seniority
+   classes, greedy choice stops being substitutable and stability is no longer
+   guaranteed for capped papers — `Done.` splits the blocking-pair count, and
+   the hard invariant that replaces it is `region_over == 0`. Coverage is
+   printed because an unplaced reviewer can never consume a cap.
 4. **Assignment**: `assign_reviewers.py` — phased paper-proposing deferred
    acceptance aiming for a full slate plus ≥1 senior, ≤1 junior, and ≤1
    out-of-area per paper. Papers that can't fill release constraints in
@@ -168,6 +188,9 @@ large shortage/relaxation reports are expected, not a bug.
 - `publication_exclusions.csv` is the hand-maintained, per-email DOI exclusion
   layer for reviewer and area-chair fingerprints; exclusions never delete
   entries from the shared publication or abstract caches.
+- `affiliation_countries.csv` is the hand-maintained affiliation → ISO country
+  layer for the region cap, and `dblp_affiliations.json` the DBLP notes under
+  it; both are gitignored, both derive from real identities.
 - A title-only comparison cache must use a distinct path such as
   `fingerprints-title-only.json`; all `fingerprints-*.json` files are ignored.
 
