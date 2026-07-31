@@ -57,6 +57,7 @@ from collections import Counter
 from dataclasses import dataclass
 
 import dblp
+import pc_membership
 from reserve_reviewers import load_reserve_reviewers
 from reviewers import DEFAULT_OVERRIDES, Reviewer, load_reviewers
 
@@ -347,6 +348,8 @@ def main() -> int:
     parser.add_argument("--out", default=None, help=f"output CSV (default: {DEFAULT_OUT}; for --role reserve, {DEFAULT_RESERVE_OUT})")
     parser.add_argument("--pcdb", default=DEFAULT_PCDB, help="PC-service database CSV whose chair/PC/ERC history overrides the publication classes (default: %(default)s)")
     parser.add_argument("--no-pcdb", action="store_true", help="skip the PCDB service overrides entirely")
+    parser.add_argument("--pcinfo", default=pc_membership.DEFAULT_PCINFO, help="HotCRP user export deciding who is still on the PC (default: %(default)s)")
+    parser.add_argument("--no-pc-check", action="store_true", help="keep everyone the roster lists, even if HotCRP no longer marks them pc")
     parser.add_argument("--pcdb-senior-score", type=float, default=DEFAULT_PCDB_SENIOR_SCORE, help="#PC + 0.5*#ERC score at or above which a PCDB-matched reviewer is senior (default: %(default)s)")
     parser.add_argument("--pcdb-typical-score", type=float, default=DEFAULT_PCDB_TYPICAL_SCORE, help="score at or above which a PCDB-matched junior is promoted to typical (default: %(default)s)")
     parser.add_argument("--window", type=int, default=DEFAULT_WINDOW, help="length of the senior window in years (default: %(default)s)")
@@ -381,12 +384,21 @@ def main() -> int:
         except FileNotFoundError:
             parser.error(f"PCDB file not found: {args.pcdb} — fix --pcdb or pass --no-pcdb")
 
-    if args.role == "reserve":
-        reviewers = load_reserve_reviewers(
-            args.csv or DEFAULT_RESERVE_INFO, args.data
-        )
-    else:
-        reviewers = load_reviewers(args.csv or DEFAULT_CSV, overrides_path=args.overrides)
+    pcinfo = None if args.no_pc_check else args.pcinfo
+    try:
+        if args.role == "reserve":
+            reviewers = load_reserve_reviewers(
+                args.csv or DEFAULT_RESERVE_INFO, args.data, pcinfo_path=pcinfo
+            )
+        else:
+            reviewers = load_reviewers(
+                args.csv or DEFAULT_CSV, overrides_path=args.overrides,
+                pcinfo_path=pcinfo,
+            )
+    except (FileNotFoundError, ValueError) as exc:
+        if pcinfo and str(exc).startswith(pcinfo):
+            parser.error(str(exc))
+        raise
     venue_cache = dblp.load_rich_cache(args.venue_cache)
     colleague_cache = dblp.load_rich_cache(args.colleague_cache)
     # Local DBLP dump, for anyone neither cache covers. Restricted to genuine

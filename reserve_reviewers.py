@@ -26,6 +26,7 @@ from collections import Counter, defaultdict
 
 import json
 
+import pc_membership
 from dblp import parse_pid
 from reviewers import Reviewer
 
@@ -101,6 +102,7 @@ def load_reserve_reviewers(
     data_path: str = DEFAULT_DATA,
     *,
     max_areas: int = DEFAULT_MAX_AREAS,
+    pcinfo_path: str | None = pc_membership.DEFAULT_PCINFO,
 ) -> list[Reviewer]:
     """Load the reserve roster, deriving each one's areas from their papers.
 
@@ -110,6 +112,11 @@ def load_reserve_reviewers(
     withdrawn or still-draft paper says just as much about their expertise, and
     filtering by policy left three of them with no areas at all and so gated out
     of everything.
+
+    Reserves are checked against the HotCRP user export the same way PC members
+    are, and it matters more here: a recruit who is later stood down keeps the
+    `reserve-reviewer` tag on their account, so the roster file alone cannot
+    tell that the `pc` role is gone. `pcinfo_path=None` skips the check.
     """
     with open(data_path, encoding="utf-8") as f:
         papers = json.load(f)
@@ -118,14 +125,19 @@ def load_reserve_reviewers(
 
     with open(info_path, newline="", encoding="utf-8-sig") as f:
         rows = list(csv.DictReader(f))
+    index = pc_membership.load_pc_accounts(pcinfo_path) if pcinfo_path else None
 
     reserves = []
+    dropped: list[str] = []
     for row in rows:
         email = (row.get("email") or "").strip().lower()
         if not email:
             continue
         name = (row.get("name") or "").strip()
         first, _, last = name.partition(" ")
+        if index is not None and index.match(email, first, last)[0] is None:
+            dropped.append(email)
+            continue
         topics = authored.get(email) or nominated.get(email) or Counter()
         areas = top_areas(topics, max_areas)
         areas += [""] * (3 - len(areas))
@@ -151,4 +163,7 @@ def load_reserve_reviewers(
                 pid_from_override=True,
             )
         )
+
+    if index is not None:
+        pc_membership.report_pruned(dropped, len(reserves), "reserve reviewers", index)
     return reserves

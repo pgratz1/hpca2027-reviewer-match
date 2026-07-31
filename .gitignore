@@ -4,9 +4,11 @@ Area Chair Acceptance Form (Responses) - Form Responses 1.csv
 hpca2027-trc*.csv
 PCDB_with_emails.csv
 # HotCRP user export (names, emails, ORCIDs, affiliations, collaborators) and
-# the duplicate-account report derived from it
+# the duplicate-account and roster-check reports derived from it
 hpca2027-pcinfo.csv
 duplicate_accounts.csv
+pc_roster_pruned.csv
+pc_roster_missing.csv
 fingerprints.json
 fingerprints-*.json
 area_chair_fingerprints.json

@@ -93,6 +93,7 @@ from paper_matching import (
     eligible_scores,
     load_papers,
 )
+import pc_membership
 from reserve_reviewers import DEFAULT_DATA as DEFAULT_RESERVE_DATA
 from reserve_reviewers import DEFAULT_INFO as DEFAULT_RESERVE_INFO
 from reserve_reviewers import load_reserve_reviewers
@@ -1081,6 +1082,8 @@ def main() -> int:
         help="paper selection policy (default: registered)",
     )
     parser.add_argument("--csv", default=DEFAULT_CSV, help="path to the reviewer CSV")
+    parser.add_argument("--pcinfo", default=pc_membership.DEFAULT_PCINFO, help="HotCRP user export deciding who is still on the PC (default: %(default)s)")
+    parser.add_argument("--no-pc-check", action="store_true", help="keep everyone the roster lists, even if HotCRP no longer marks them pc")
     parser.add_argument(
         "--fingerprint-cache", default=DEFAULT_FINGERPRINT_CACHE, help="path to the reviewer fingerprint cache"
     )
@@ -1234,10 +1237,20 @@ def main() -> int:
     )
 
     reviewer_fp = fp.load_fingerprint_cache(args.fingerprint_cache)
-    reviewers_by_email = {r.email: r for r in load_reviewers(args.csv)}
+    pcinfo = None if args.no_pc_check else args.pcinfo
+    try:
+        reviewers_by_email = {
+            r.email: r for r in load_reviewers(args.csv, pcinfo_path=pcinfo)
+        }
+    except (FileNotFoundError, ValueError) as exc:
+        if pcinfo and str(exc).startswith(pcinfo):
+            parser.error(str(exc))
+        raise
 
     if args.include_reserves:
-        reserves = load_reserve_reviewers(args.reserve_info, args.data)
+        reserves = load_reserve_reviewers(
+            args.reserve_info, args.data, pcinfo_path=pcinfo
+        )
         reserve_fp = fp.load_fingerprint_cache(args.reserve_fingerprint_cache)
         reserve_seniority = (
             {} if seniority is None else load_seniority(args.reserve_seniority)

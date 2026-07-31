@@ -27,13 +27,21 @@ Both workflows share the reviewer loader (`reviewers.py`) and DBLP caches:
 
 ```
                        ┌─▶ classify_reviewers.py ──▶ reviewer_seniority.csv ──▶ (assign_reviewers.py)
-acceptance CSV ──▶ reviewers.py (+ dblp_overrides.csv)
+acceptance CSV ──▶ reviewers.py (+ dblp_overrides.csv, + hpca2027-pcinfo.csv)
                        └─▶ build_fingerprints.py ──▶ fingerprints.json ─┐
                                ▲                                      │
               enrich_publications.py (DBLP DOI + S2 abstracts) ──┘
                                                                         ├─▶ score_papers.py
 paper JSON ──▶ paper_matching.py ──▶ paper_fingerprints.json ───────────┘    assign_reviewers.py
 ```
+
+`dblp_overrides.csv` and `hpca2027-pcinfo.csv` answer two different questions.
+The overrides file is the **identity** layer — which DBLP page is this person.
+The HotCRP user export is the **membership** layer — is this person still on the
+committee. Accepting an invitation is not the same as being on the PC: people
+get removed afterwards, and the acceptance form has no way to know. Every roster
+loader therefore drops anyone the export does not have on the PC. See
+`audit_pc_roster.py` below, and `make PC_CHECK=--no-pc-check` to run without it.
 
 **Paper-selection policy:** by default (`--paper-policy registered`), every
 paper-side tool processes the *registered* papers — every record that has not
@@ -53,18 +61,26 @@ withdrawn checks.
 ## Start-to-finish workflow
 
 1. **Drop the inputs in place**: the latest acceptance-form CSV export (keep
-   the exact filename) and a fresh `hpca2027-data.json` from HotCRP.
-2. **Optionally fill in `S2_API_KEY` in the gitignored `.env` file**,
+   the exact filename), a fresh `hpca2027-data.json`, and a fresh
+   `hpca2027-pcinfo.csv` user export (HotCRP → Users → download → user
+   information), which decides who is still on the PC.
+2. **Run `make pc-roster`** and read the two reports it writes. It is offline
+   and instant. `pc_roster_pruned.csv` is who the pipeline is about to stop
+   using because HotCRP no longer marks them `pc`; `pc_roster_missing.csv` is
+   the PC accounts no roster explains, most of which are people holding a
+   second HotCRP account that wants merging. Both reports are worth acting on
+   before an assignment, not after.
+3. **Optionally fill in `S2_API_KEY` in the gitignored `.env` file**,
    then run **`make`** — rebuilds
    whatever is stale, in order: reviewer seniority classification, cached
    IEEE/ACM abstract enrichment, reviewer fingerprints, then the assignment. The final
    output lands in **`assignment.txt`**: per-paper reviewer slates, the
    per-area shortage report, and the seniority criteria report.
-3. **If classify reported reviewers with missing DBLP identities**, it
+4. **If classify reported reviewers with missing DBLP identities**, it
    appended blank stub rows for them to `dblp_overrides.csv` — fill in their
    `dblp` cells and `make` again. Unknowns caused by transient DBLP fetch
    failures are retried and do not create identity stubs.
-4. **Ad-hoc follow-ups**: `score_papers.py --pid N` for one paper's full
+5. **Ad-hoc follow-ups**: `score_papers.py --pid N` for one paper's full
    ranking, `nearest_neighbors.py --email X` to eyeball a reviewer's profile.
 
 The equivalent manual commands, in dependency order:
@@ -130,6 +146,10 @@ score = `#PC` + 0.5 × `#ERC`, and only ever promoting:
 
 A fired override is recorded in the `pcdb_override` column; duplicate PCDB
 rows for one email (name variants) merge by summing the counts.
+
+Reviewers HotCRP no longer marks `pc` are dropped before any of this, so they
+never reach `reviewer_seniority.csv` (`--pcinfo` points at a different export;
+`--no-pc-check` skips the check). See `audit_pc_roster.py`.
 
 Writes `reviewer_seniority.csv`: one row per reviewer with per-venue career
 and window counts backing the classification (enough for the assignment step
@@ -241,7 +261,8 @@ Per-paper and independent — no load awareness.
 ```
 
 ### `assign_reviewers.py` — global load-capped assignment
-One assignment across all papers at once, respecting COI, the area gate,
+One assignment across all papers at once, over the reviewers HotCRP still marks
+`pc` (`--pcinfo` / `--no-pc-check`), respecting COI, the area gate,
 per-reviewer caps (`--light-cap` / `--full-cap`, or the CSV's per-reviewer
 override column) and `--reviewers-per-paper`. Solved by paper-proposing
 deferred acceptance (Hospital/Residents stable matching), run in phases that
@@ -588,6 +609,79 @@ homonym suffix and hundreds of papers (`26/6190` "Hui Yu", 363 papers) is a
 holding pen for everyone of that name, not a person, and will score well on
 co-author overlap for the wrong reason.
 
+### `audit_pc_roster.py` — the HotCRP roster cross-check
+
+Two lists have to agree and constantly drift apart: who accepted an invitation
+(the acceptance forms and the reserve upload) and who is on the committee in
+HotCRP today (`hpca2027-pcinfo.csv`). This reports both directions. It decides
+nothing — the loaders in `pc_membership.py` apply the rule; this explains what
+the rule did and what it could not account for.
+
+```bash
+make pc-roster          # or: audit_pc_roster.py
+```
+
+**The one number that shaped the design:** of the roster rows whose own email
+address is not marked `pc`, only a quarter are genuine removals. The rest hold a
+*second* HotCRP account that is on the PC — people accept from an institutional
+address and keep their account under a personal one, or move institution
+mid-cycle. Keying the check on email alone would have removed twelve sitting PC
+members on the export this was built against. So a roster row is matched to an
+account by email, then by exact name tokens, then by email local part, and only
+a row that fails all three is treated as removed. The matching is exact
+throughout: a false match merely keeps someone already on the roster, while a
+false miss silently removes a real reviewer, so the two error directions are not
+equally bad.
+
+`pc_roster_pruned.csv` — who the loaders drop, with `problem`:
+
+- `no_account` — no HotCRP account under this address and no PC account is the
+  same person. The real "removed from HotCRP" case.
+- `role_removed` — the account is still there but the `pc` role is gone.
+  `detail` keeps the surviving tags, which is what separates a deliberate
+  stand-down (a stood-down reserve keeps their `reserve-reviewer` tag) from a
+  wiped account.
+- `disabled` — on the PC but unable to log in, so unable to review.
+
+`pc_roster_missing.csv` — PC accounts that appear in neither acceptance form nor
+the reserve upload, with `category`. `chair`, `trc`, `sysadmin`, `disabled` and
+`area-chair` are settled and need nothing. The rest are work: `alternate_account`
+(the person is on a roster under another address — merge the two in HotCRP, and
+`make duplicates` lists the pairs), `declined` (their latest form response says
+they cannot serve and they are still marked `pc` — the sharpest anomaly here),
+and `no_roster_row` (on the PC with no acceptance and no upload row at all).
+
+Both files are always written, even when empty, and sorted by email, so a re-run
+against a fresh export diffs cleanly rather than going stale. A useful sanity
+signal: `no_roster_row` counts drop to zero as invitees answer the form, so a
+number that *stays* up is a real question, not a backlog.
+
+If the export is missing, or is a truncated download in which nothing is marked
+`pc`, every script refuses to run rather than pruning the entire roster and
+reporting every paper unstaffed. `make PC_CHECK=--no-pc-check` is the deliberate
+override, for when the export is staler than the rosters.
+
+### `find_duplicate_accounts.py` — one person, two HotCRP accounts
+
+Registering twice — once institutionally, once with gmail — is routine, and it
+splits that person's conflicts, topics and review load across two accounts. This
+lists candidate pairs ranked by confidence (shared ORCID, matching affiliation
+or email, name variants), so a human can merge them. It decides nothing.
+
+```bash
+make duplicates         # pairs with a PC member on both sides
+~/envs/hpca-matching/bin/python3 find_duplicate_accounts.py --pc-only
+```
+
+`--both-pc` is the remediation list for `audit_pc_roster.py`'s
+`alternate_account` rows: two PC accounts mean two review loads and two
+half-populated conflict sets for one human, so the matcher can hand them a paper
+they are conflicted with under their other address. `--pc-only` widens this to
+pairs with a PC member on either side, which also catches an author account
+shadowing a PC member. Conflicting ORCIDs *demote* a name match rather than
+promoting it: on a roster this size an exact name collision is more often two
+people than one.
+
 ### `resolve_trc_members.py` — Training Review Committee roster
 
 Fills two columns into the TRC roster CSV (`hpca2027-trc - hpca2027-trc.csv`),
@@ -723,7 +817,9 @@ whenever a region cap is on: an unplaced reviewer can never consume a cap.
 ## Support modules (not standalone scripts)
 
 `reviewers.py` (acceptance-CSV parsing, duplicate-submission collapsing,
-override application) · `dblp.py` (DBLP fetch, caching, rate limiting) ·
+override application) · `pc_membership.py` (the HotCRP account model, name
+comparison, and the "is this person still on the PC" predicate every roster
+loader applies) · `dblp.py` (DBLP fetch, caching, rate limiting) ·
 `paper_matching.py` (paper selection, fingerprinting, and eligibility) ·
 `fingerprint.py` / `specter2_model.py` (embedding plumbing).
 
@@ -731,9 +827,13 @@ override application) · `dblp.py` (DBLP fetch, caching, rate limiting) ·
 
 **Inputs:** the reviewer and area-chair acceptance-form CSVs (Google Forms
 exports — real names and emails, treat as sensitive), `hpca2027-data.json`
-(HotCRP paper export), `dblp_pubs_cache.json` (colleague's read-only rich DBLP
-cache), and `PCDB_with_emails.csv` (PC-service history with emails — also
-sensitive). `hpca2027-trc - hpca2027-trc.csv` is the Training Review Committee
+(HotCRP paper export), `hpca2027-pcinfo.csv` (the HotCRP *user* export — names,
+emails, ORCIDs, affiliations and declared collaborators, so among the most
+sensitive files here; it is the authority on who is on the PC, and like
+`hpca2027-data.json` it is a moving snapshot, so a stale one is exactly what the
+`make pc-roster` reports exist to surface), `dblp_pubs_cache.json` (colleague's
+read-only rich DBLP cache), and `PCDB_with_emails.csv` (PC-service history with
+emails — also sensitive). `hpca2027-trc - hpca2027-trc.csv` is the Training Review Committee
 roster: an input that `resolve_trc_members.py` writes its two resolved columns
 back into, so it is also hand-maintained. `reserve_reviewer_upload.csv` (the
 HotCRP reserve-reviewer upload) and `reserve_reviewers_vetting_final.xlsx` (the
@@ -753,7 +853,8 @@ leaves `reserve_reviewer_unresolved.csv`; correcting
 `reviewer_publications.json`, `publication_abstracts.json`,
 `dblp_profile_cache.json`, `dblp_author_search_cache.json`,
 `reviewer_seniority.csv`, `assignment.txt`, `area_chair_assignment.txt`,
-`reserve_reviewer_info.csv`, `reserve_reviewer_unresolved.csv`, and
+`reserve_reviewer_info.csv`, `reserve_reviewer_unresolved.csv`,
+`pc_roster_pruned.csv`, `pc_roster_missing.csv`, `duplicate_accounts.csv`, and
 experimental fingerprint caches such as `fingerprints-title-only.json`. The
 enrichment caches are rebuildable but expensive because live DBLP retrieval
 is rate-limited.

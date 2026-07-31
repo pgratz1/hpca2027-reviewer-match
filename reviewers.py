@@ -12,6 +12,7 @@ import datetime
 import sys
 from dataclasses import dataclass
 
+import pc_membership
 from dblp import parse_pid
 
 TIMESTAMP_FORMAT = "%m/%d/%Y %H:%M:%S"
@@ -136,7 +137,12 @@ def _latest_rows_by_email(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     return list(latest.values())
 
 
-def load_reviewers(csv_path: str, overrides_path: str = DEFAULT_OVERRIDES) -> list[Reviewer]:
+def load_reviewers(
+    csv_path: str,
+    overrides_path: str = DEFAULT_OVERRIDES,
+    *,
+    pcinfo_path: str | None = pc_membership.DEFAULT_PCINFO,
+) -> list[Reviewer]:
     """Load accepted PC members from the acceptance CSV.
 
     Rows are first collapsed to one per email via `_latest_rows_by_email` so
@@ -144,6 +150,14 @@ def load_reviewers(csv_path: str, overrides_path: str = DEFAULT_OVERRIDES) -> li
     accept, or vice versa) wins. Declines (rows whose 'PC membership' says
     the member is unable to accept) are then skipped; everyone else is
     returned, including those without a DBLP link.
+
+    Whoever is left is checked against the HotCRP user export, which is the
+    authority on who is still on the committee: accepting the invitation is
+    not the same as being on the PC today, and people do get removed after
+    they accept. Anyone the export does not have on the PC under any address
+    is dropped — see `pc_membership`, which is careful about the second
+    address, since accepting from one and holding the HotCRP account under
+    another is common. `pcinfo_path=None` skips the check entirely.
 
     If a DBLP override file exists (see load_dblp_overrides), its PID wins
     over whatever the form's DBLP column says — filling in reviewers who left
@@ -154,20 +168,29 @@ def load_reviewers(csv_path: str, overrides_path: str = DEFAULT_OVERRIDES) -> li
     with open(csv_path, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
     overrides = load_dblp_overrides(overrides_path)
+    index = pc_membership.load_pc_accounts(pcinfo_path) if pcinfo_path else None
 
     reviewers: list[Reviewer] = []
+    dropped: list[str] = []
     for row in _latest_rows_by_email(rows):
         membership = field(row, "PC membership")
         if "unable" in membership.lower():
             continue
         tier = "light" if "light" in membership.lower() else "full"
-        dblp_url = field(row, "DBLP")
         email = field(row, "email address").lower()
+        first, last = field(row, "First Name"), field(row, "Last Name")
+        # Before the Reviewer is built, not after: someone who is off the PC
+        # shouldn't be able to take the whole pipeline down through a garbage
+        # override-cap cell they will never use.
+        if index is not None and index.match(email, first, last)[0] is None:
+            dropped.append(email)
+            continue
+        dblp_url = field(row, "DBLP")
         reviewers.append(
             Reviewer(
                 email=email,
-                first=field(row, "First Name"),
-                last=field(row, "Last Name"),
+                first=first,
+                last=last,
                 dblp_url=dblp_url,
                 pid=overrides.get(email) or parse_pid(dblp_url),
                 affiliation=field(row, "institutional affiliation"),
@@ -181,7 +204,14 @@ def load_reviewers(csv_path: str, overrides_path: str = DEFAULT_OVERRIDES) -> li
             )
         )
 
-    unmatched = set(overrides) - {r.email for r in reviewers}
+    if index is not None:
+        pc_membership.report_pruned(
+            dropped, len(reviewers), "acceptance-form reviewers", index
+        )
+
+    # A dropped reviewer's override is accounted for, not a typo — saying
+    # otherwise would send someone hunting for a mistake they didn't make.
+    unmatched = set(overrides) - {r.email for r in reviewers} - set(dropped)
     for email in sorted(unmatched):
         print(
             f"Warning: DBLP override for {email} matches no accepted reviewer "

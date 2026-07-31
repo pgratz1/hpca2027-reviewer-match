@@ -28,6 +28,17 @@ contains spaces and parentheses — always quote it in shell commands).
 - `make area-chairs` is deliberately separate: it requires `assignment.txt`,
   builds 10-year chair fingerprints, and writes a chair-grouped
   `area_chair_assignment.txt` under hard COIs and the closest feasible loads.
+- **`make pc-roster` cross-checks both rosters against `hpca2027-pcinfo.csv`**,
+  the HotCRP user export, and should be run after every fresh export. Offline,
+  instant, read-only. It writes `pc_roster_pruned.csv` (roster rows the loaders
+  now drop, because HotCRP no longer marks them `pc`) and
+  `pc_roster_missing.csv` (PC accounts no roster explains). The membership check
+  itself is **on by default in every loader** — `make PC_CHECK=--no-pc-check`,
+  or `--no-pc-check` on `classify_reviewers.py`/`assign_reviewers.py`, turns it
+  off for when the export is staler than the rosters. A **missing export, or a
+  truncated one in which nothing is marked `pc`, is a hard error**, not a
+  silent skip: the alternative is pruning all ~460 reviewers and reporting every
+  paper unstaffed. `make duplicates` is the companion remediation tool.
 - `make reserve-need` is also separate and independent of the assignment: it
   sizes the review-slot shortfall, i.e. how many reserve reviewers have to be
   recruited. No GPU, no fingerprints, no network — pure arithmetic. Recruiting
@@ -88,8 +99,10 @@ contains spaces and parentheses — always quote it in shell commands).
   completeness filter in separate `*-complete.txt` artifacts.
 - Library modules (imported, never run): `reviewers.py`, `dblp.py`,
   `paper_matching.py`, `fingerprint.py`, `specter2_model.py`,
-  `reserve_reviewers.py`, `roster.py`, `affiliation_country.py`. Runnable
-  scripts: `classify_reviewers.py`, `build_fingerprints.py`,
+  `reserve_reviewers.py`, `roster.py`, `affiliation_country.py`,
+  `pc_membership.py`. Runnable
+  scripts: `audit_pc_roster.py`, `find_duplicate_accounts.py`,
+  `audit_reserve_identities.py`, `classify_reviewers.py`, `build_fingerprints.py`,
   `enrich_publications.py`, `assign_reviewers.py`, `score_papers.py`,
   `nearest_neighbors.py`, `compare_abstract_rankings.py`,
   `score_abstract_evaluation.py`, `assign_area_chairs.py`,
@@ -109,6 +122,22 @@ contains spaces and parentheses — always quote it in shell commands).
    A filled `dblp` cell wins over the form's DBLP
    column. `classify_reviewers.py` auto-appends blank stub rows for reviewers
    it can't resolve — the file doubles as the to-do list.
+1b. **Membership** is a *separate* authority from identity: `dblp_overrides.csv`
+   says which DBLP page a person is, `hpca2027-pcinfo.csv` (the HotCRP user
+   export) says whether they are still on the committee. Accepting an
+   invitation is not the same as being on the PC — people are removed
+   afterwards and the form cannot know. `pc_membership.py` applies the check
+   inside `load_reviewers`, `load_reserve_reviewers` and `load_area_chairs`
+   (not in `roster.load_roster`, which 7 of the 11 roster consumers bypass), so
+   no two scripts can disagree about the committee. Two rules make it safe:
+   **prune-only, never add** — the same shape as the promote-only PCDB rule —
+   and **never prune someone holding a PC-marked account under another
+   address**. That second rule is the whole difficulty: matching on email alone
+   would have dropped 12 sitting PC members out of 16 candidates, because
+   accepting from one address and holding the HotCRP account under another is
+   ordinary. Matching is exact (email → name tokens → email local part) and
+   never fuzzy; a false match keeps someone already on the roster, a false miss
+   silently removes a real reviewer.
 2. **Seniority**: `classify_reviewers.py` → `reviewer_seniority.csv`
    (senior ≥0.8 papers/yr over 15y in ISCA/MICRO/HPCA/ASPLOS; junior <20
    pubs overall; out-of-area ≥20 pubs but <5 target-venue career; typical
@@ -199,6 +228,13 @@ large shortage/relaxation reports are expected, not a bug.
 - `affiliation_countries.csv` is the hand-maintained affiliation → ISO country
   layer for the region cap, and `dblp_affiliations.json` the DBLP notes under
   it; both are gitignored, both derive from real identities.
+- `hpca2027-pcinfo.csv` is the HotCRP **user** export — names, emails, ORCIDs,
+  affiliations and declared collaborators, so among the most sensitive files
+  here — and, like `hpca2027-data.json`, a moving snapshot. It and the three
+  reports derived from it (`pc_roster_pruned.csv`, `pc_roster_missing.csv`,
+  `duplicate_accounts.csv`) are gitignored. A stale export is the failure mode
+  those reports exist to surface; note it can easily be *older* than the
+  acceptance form, since form responses keep arriving.
 - A title-only comparison cache must use a distinct path such as
   `fingerprints-title-only.json`; all `fingerprints-*.json` files are ignored.
 

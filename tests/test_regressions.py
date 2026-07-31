@@ -35,7 +35,39 @@ import paper_matching
 import fingerprint
 import resolve_trc_members
 import score_abstract_evaluation
+import audit_pc_roster
+import find_duplicate_accounts
+import pc_membership
+import reviewers as reviewers_mod
+import roster as roster_mod
 from reviewers import Reviewer, _parse_override_cap
+
+PCINFO_FIELDS = [
+    "given_name", "family_name", "email", "affiliation", "orcid", "country",
+    "disabled", "roles", "tags",
+]
+
+
+def write_pcinfo(path, accounts):
+    """Write a HotCRP user-export fixture.
+
+    `accounts` is a sequence of dicts with any subset of PCINFO_FIELDS; the
+    common case is {"email": ..., "given_name": ..., "family_name": ...,
+    "roles": "pc"}. Returns the path, so a caller can inline it.
+    """
+    path = Path(path)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=PCINFO_FIELDS)
+        writer.writeheader()
+        for account in accounts:
+            writer.writerow({field: account.get(field, "") for field in PCINFO_FIELDS})
+    return path
+
+
+def pc_account(email, given="Test", family="Person", roles="pc", **extra):
+    """One PC-marked row of a user-export fixture."""
+    return {"email": email, "given_name": given, "family_name": family,
+            "roles": roles, **extra}
 
 
 def reviewer(pid="1/Test"):
@@ -156,7 +188,9 @@ class AreaChairAssignmentTests(unittest.TestCase):
                 writer = csv.writer(f)
                 writer.writerow(headers)
                 writer.writerows(rows)
-            chairs = area_chairs.load_area_chairs(str(path), str(Path(tmp) / "missing.csv"))
+            chairs = area_chairs.load_area_chairs(
+                str(path), str(Path(tmp) / "missing.csv"), pcinfo_path=None
+            )
         self.assertEqual(1, len(chairs))
         self.assertEqual("chair@example.com", chairs[0].email)
         self.assertEqual("New Name", chairs[0].name)
@@ -1486,7 +1520,7 @@ class BackoffTests(unittest.TestCase):
 class ReserveReviewerLoaderTests(unittest.TestCase):
     """reserve_reviewers.py: a roster with no acceptance form behind it."""
 
-    def load(self, roster, papers):
+    def load(self, roster, papers, pcinfo=None):
         tmp = Path(tempfile.mkdtemp())
         info, data = tmp / "info.csv", tmp / "papers.json"
         with info.open("w", newline="", encoding="utf-8") as f:
@@ -1495,7 +1529,14 @@ class ReserveReviewerLoaderTests(unittest.TestCase):
             for email, name, link in roster:
                 w.writerow({"email": email, "name": name, "dblp": link})
         data.write_text(json.dumps(papers), encoding="utf-8")
-        return reserve_reviewers.load_reserve_reviewers(str(info), str(data))
+        # pcinfo=None means "don't check membership", not "check against the real
+        # export" -- a unit test must never depend on today's HotCRP roster.
+        path = None
+        if pcinfo is not None:
+            path = str(write_pcinfo(tmp / "pcinfo.csv", pcinfo))
+        return reserve_reviewers.load_reserve_reviewers(
+            str(info), str(data), pcinfo_path=path
+        )
 
     def paper(self, topics, authors=(), nominates=""):
         return {"pid": 1, "topics": list(topics), "reserve_reviewer": nominates,
@@ -2231,6 +2272,447 @@ class AffiliationCountryFileTests(unittest.TestCase):
             "Blue University,ZZ,,,,\n", encoding="utf-8")
         with self.assertRaises(ValueError):
             affiliation_country.load_affiliation_countries(self.out)
+
+
+class PcMembershipTests(unittest.TestCase):
+    """pc_membership.py: the HotCRP export is the authority on who is on the PC."""
+
+    def index(self, accounts):
+        tmp = Path(tempfile.mkdtemp())
+        return pc_membership.load_pc_accounts(str(write_pcinfo(tmp / "pc.csv", accounts)))
+
+    def test_the_roles_column_is_a_token_list_not_a_substring(self):
+        # HotCRP writes a chair's roles as "chair pc", so a substring test was
+        # needed for them -- but a substring test also lets "spc" or "pcx" pass,
+        # which would keep people on the roster who hold no PC role at all.
+        self.assertTrue(pc_membership.on_pc("pc"))
+        self.assertTrue(pc_membership.on_pc("chair pc"))
+        self.assertFalse(pc_membership.on_pc("spc"))
+        self.assertFalse(pc_membership.on_pc("pcx"))
+        self.assertFalse(pc_membership.on_pc(""))
+
+    def test_a_member_registered_under_a_second_address_is_matched_by_name(self):
+        # The failure this exists to prevent: people accept from one address and
+        # hold their HotCRP account under another. On the export this was built
+        # against that is twelve of the sixteen rows whose own address is not
+        # pc, so an email-only rule removes twelve sitting PC members.
+        index = self.index([pc_account("real@b.edu", "Ada", "Lovelace")])
+        acct, how = index.match("other@a.edu", "Ada", "Lovelace")
+        self.assertEqual("real@b.edu", acct.email)
+        self.assertEqual("name", how)
+
+    def test_a_member_registered_under_a_second_address_is_matched_by_local_part(self):
+        # Same person, same mailbox name, different institution -- and the form
+        # row carries no name at all, so the name index cannot save them.
+        index = self.index([pc_account("alovelace@b.edu", "Ada", "Lovelace")])
+        acct, how = index.match("alovelace@a.edu", "", "")
+        self.assertEqual("alovelace@b.edu", acct.email)
+        self.assertEqual("local", how)
+
+    def test_an_email_cell_holding_a_name_is_read_as_a_name(self):
+        # One acceptance row has a name typed into the email box. That is a
+        # form-entry slip, not a resignation; treating the cell as an address
+        # only would drop a sitting PC member over a typo.
+        index = self.index([pc_account("ada@b.edu", "Ada", "Lovelace")])
+        acct, how = index.match("ada lovelace", "", "")
+        self.assertEqual("ada@b.edu", acct.email)
+        self.assertEqual("name", how)
+
+    def test_only_an_account_that_exists_and_is_not_pc_is_pruned(self):
+        index = self.index([
+            pc_account("member@a.edu", "Ada", "Lovelace"),
+            {"email": "former@a.edu", "given_name": "Alan", "family_name": "Turing",
+             "roles": "", "tags": "pc-full"},
+        ])
+        self.assertIsNotNone(index.match("member@a.edu", "Ada", "Lovelace")[0])
+        self.assertIsNone(index.match("former@a.edu", "Alan", "Turing")[0])
+        self.assertIsNone(index.match("stranger@a.edu", "Grace", "Hopper")[0])
+
+    def test_a_disabled_pc_account_does_not_keep_its_holder_on_the_roster(self):
+        # Disabled means they cannot log in, so they cannot review -- but the
+        # account stays in by_email so the audit can say "disabled" rather than
+        # "no account".
+        index = self.index([
+            pc_account("off@a.edu", "Ada", "Lovelace", disabled="yes"),
+            pc_account("on@a.edu", "Alan", "Turing"),
+        ])
+        self.assertIsNone(index.match("off@a.edu", "Ada", "Lovelace")[0])
+        self.assertIn("off@a.edu", index.by_email)
+
+    def test_a_missing_export_is_an_error_not_an_empty_index(self):
+        # load_dblp_overrides returns {} for a missing file, which is right
+        # there and catastrophic here: an empty index prunes the entire roster.
+        with self.assertRaises(FileNotFoundError) as caught:
+            pc_membership.load_pc_accounts(str(Path(tempfile.mkdtemp()) / "gone.csv"))
+        self.assertIn("--no-pc-check", str(caught.exception))
+
+    def test_an_export_with_no_pc_accounts_is_refused(self):
+        # A truncated or half-downloaded export parses perfectly and marks
+        # nobody pc. Accepting it would drop every reviewer and report every
+        # paper unstaffed -- the single most destructive thing this can do.
+        with self.assertRaises(ValueError) as caught:
+            self.index([{"email": "author@a.edu", "roles": ""}])
+        self.assertIn("truncated", str(caught.exception))
+
+    def test_a_name_shared_by_two_pc_accounts_still_matches(self):
+        # Common names collide. A collision resolves toward keeping the person,
+        # because a false keep leaves the roster as it is today while a false
+        # prune silently removes a sitting PC member.
+        index = self.index([
+            pc_account("b@a.edu", "Ada", "Lovelace"),
+            pc_account("a@a.edu", "Ada", "Lovelace"),
+        ])
+        acct, how = index.match("third@a.edu", "Ada", "Lovelace")
+        self.assertEqual("name", how)
+        self.assertEqual("a@a.edu", acct.email)  # deterministic, lowest email
+
+
+class ReviewerLoaderTests(unittest.TestCase):
+    """reviewers.py: the acceptance form plus the HotCRP membership check."""
+
+    HEADERS = [
+        "Timestamp", "Please confirm your HotCRP email address", "PC membership",
+        "First Name", "Last Name", "Enter your DBLP Link", "institutional affiliation",
+        "primary area", "secondary area", "tertiary area", "keywords",
+        "Override paper assignment number",
+    ]
+
+    def load(self, rows, accounts, *, check=True):
+        tmp = Path(tempfile.mkdtemp())
+        form = tmp / "form.csv"
+        with form.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(self.HEADERS)
+            writer.writerows(rows)
+        pcinfo = str(write_pcinfo(tmp / "pc.csv", accounts)) if check else None
+        with contextlib.redirect_stderr(io.StringIO()):
+            return reviewers_mod.load_reviewers(
+                str(form), str(tmp / "missing-overrides.csv"), pcinfo_path=pcinfo
+            )
+
+    def row(self, email, membership="Yes, I accept as a full PC member",
+            first="Ada", last="Lovelace", override=""):
+        return ["07/01/2026 10:00:00", email, membership, first, last, "none",
+                "Example", "Memory", "", "", "", override]
+
+    def test_an_acceptance_whose_account_lost_the_pc_role_is_dropped(self):
+        people = self.load(
+            [self.row("gone@a.edu"), self.row("here@a.edu", first="Alan", last="Turing")],
+            [pc_account("here@a.edu", "Alan", "Turing"),
+             {"email": "gone@a.edu", "given_name": "Ada", "family_name": "Lovelace",
+              "roles": "", "tags": "pc-full"}],
+        )
+        self.assertEqual(["here@a.edu"], [r.email for r in people])
+
+    def test_pcinfo_path_none_keeps_the_pre_check_roster(self):
+        # The --no-pc-check contract: the loader must be able to answer "who
+        # accepted", which is what audit_pc_roster.py needs to report the drops.
+        people = self.load([self.row("gone@a.edu")], [], check=False)
+        self.assertEqual(["gone@a.edu"], [r.email for r in people])
+
+    def test_a_decline_is_never_reported_as_a_removal(self):
+        # Order of operations: dedupe, then decline, then the PC check. A
+        # decliner who also lost their HotCRP role must be counted once, as a
+        # decline -- they are not a roster removal anyone needs to look into.
+        dropped = []
+        with mock.patch.object(pc_membership, "report_pruned",
+                               side_effect=lambda d, *a, **k: dropped.extend(d)):
+            people = self.load(
+                [self.row("no@a.edu", "No, I am unable to accept"),
+                 self.row("yes@a.edu", first="Alan", last="Turing")],
+                [pc_account("yes@a.edu", "Alan", "Turing")],
+            )
+        self.assertEqual(["yes@a.edu"], [r.email for r in people])
+        self.assertEqual([], dropped)
+
+    def test_a_removed_reviewer_with_a_bad_override_cap_does_not_break_the_load(self):
+        # _parse_override_cap raises on a non-numeric cell, by design. Someone
+        # who is off the PC must be dropped before that runs, or one stale form
+        # cell takes down every script in the pipeline.
+        people = self.load(
+            [self.row("gone@a.edu", override="two"),
+             self.row("here@a.edu", first="Alan", last="Turing")],
+            [pc_account("here@a.edu", "Alan", "Turing")],
+        )
+        self.assertEqual(["here@a.edu"], [r.email for r in people])
+
+    def test_an_override_for_a_removed_reviewer_does_not_warn_about_a_typo(self):
+        # The unmatched-override warning says "typo, or they declined?" -- which
+        # would send someone hunting for a mistake that isn't there when the
+        # real reason is that HotCRP dropped the person.
+        tmp = Path(tempfile.mkdtemp())
+        form = tmp / "form.csv"
+        with form.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(self.HEADERS)
+            writer.writerow(self.row("gone@a.edu"))
+        overrides = tmp / "overrides.csv"
+        with overrides.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["email", "dblp", "note"])
+            writer.writeheader()
+            writer.writerow({"email": "gone@a.edu", "dblp": "https://dblp.org/pid/1/A",
+                             "note": ""})
+        pcinfo = write_pcinfo(tmp / "pc.csv", [pc_account("other@a.edu", "Alan", "Turing")])
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            reviewers_mod.load_reviewers(str(form), str(overrides), pcinfo_path=str(pcinfo))
+        # The drop itself must be reported -- asserting only the absence of
+        # "typo" would also pass if nothing were written to stderr at all.
+        self.assertIn("gone@a.edu", stderr.getvalue())
+        self.assertNotIn("typo", stderr.getvalue())
+
+
+class RosterDispatchTests(unittest.TestCase):
+    """roster.py: every script must agree on who is on the PC."""
+
+    def test_load_roster_prunes_the_same_people_as_the_direct_loader(self):
+        # Seven of the eleven roster consumers bypass load_roster and call the
+        # loaders directly. If the gate lived in the dispatcher, those seven
+        # would keep people the others dropped -- and a reviewer present in the
+        # assignment but absent from reviewer_seniority.csv can fill slots while
+        # never satisfying the senior requirement.
+        tmp = Path(tempfile.mkdtemp())
+        form = tmp / "form.csv"
+        with form.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(ReviewerLoaderTests.HEADERS)
+            writer.writerow(["07/01/2026 10:00:00", "gone@a.edu",
+                             "Yes, I accept as a full PC member", "Ada", "Lovelace",
+                             "none", "Example", "Memory", "", "", "", ""])
+            writer.writerow(["07/01/2026 10:00:00", "here@a.edu",
+                             "Yes, I accept as a light PC member", "Alan", "Turing",
+                             "none", "Example", "Memory", "", "", "", ""])
+        pcinfo = str(write_pcinfo(tmp / "pc.csv", [pc_account("here@a.edu", "Alan", "Turing")]))
+        with contextlib.redirect_stderr(io.StringIO()):
+            direct = reviewers_mod.load_reviewers(str(form), str(tmp / "none.csv"),
+                                                  pcinfo_path=pcinfo)
+            dispatched = roster_mod.load_roster("reviewer", str(form), pcinfo_path=pcinfo)
+        self.assertEqual(["here@a.edu"], [r.email for r in direct])
+        self.assertEqual([r.email for r in direct], [r.email for r in dispatched])
+
+    def test_load_roster_forwards_the_pcinfo_path_to_every_role(self):
+        # An unforwarded path silently means "use the default export", which is
+        # how one role ends up checked against a different file from the others.
+        seen = {}
+        for role, module, name in (
+            ("reviewer", roster_mod, "load_reviewers"),
+            ("area-chair", roster_mod, "load_area_chairs"),
+            ("reserve", roster_mod, "load_reserve_reviewers"),
+        ):
+            with mock.patch.object(
+                module, name,
+                side_effect=lambda *a, pcinfo_path=None, **k: seen.__setitem__(role, pcinfo_path) or [],
+            ):
+                roster_mod.load_roster(role, "roster.csv", pcinfo_path="sentinel.csv")
+        self.assertEqual({"reviewer": "sentinel.csv", "area-chair": "sentinel.csv",
+                          "reserve": "sentinel.csv"}, seen)
+
+
+class ReserveMembershipTests(unittest.TestCase):
+    """reserve_reviewers.py: reserves face the same HotCRP check as the PC."""
+
+    def load(self, roster, accounts):
+        with contextlib.redirect_stderr(io.StringIO()):
+            return ReserveReviewerLoaderTests.load(
+                ReserveReviewerLoaderTests(), roster,
+                [{"pid": 1, "topics": ["Memory"], "reserve_reviewer": "",
+                  "authors": [], "contacts": []}],
+                pcinfo=accounts,
+            )
+
+    def test_a_reserve_who_kept_the_tag_but_lost_the_role_is_dropped(self):
+        # A stood-down reserve keeps the reserve-reviewer tag on their account,
+        # so the roster file alone cannot tell that the pc role is gone.
+        people = self.load(
+            [("gone@a.edu", "Ada Lovelace", ""), ("here@a.edu", "Alan Turing", "")],
+            [pc_account("here@a.edu", "Alan", "Turing"),
+             {"email": "gone@a.edu", "given_name": "Ada", "family_name": "Lovelace",
+              "roles": "", "tags": "reserve-reviewer"}],
+        )
+        self.assertEqual(["here@a.edu"], [r.email for r in people])
+
+    def test_a_reserve_on_the_pc_under_another_address_is_kept(self):
+        people = self.load(
+            [("recruit@a.edu", "Ada Lovelace", "")],
+            [pc_account("ada@b.edu", "Ada", "Lovelace")],
+        )
+        self.assertEqual(["recruit@a.edu"], [r.email for r in people])
+
+
+class PcRosterAuditTests(unittest.TestCase):
+    """audit_pc_roster.py: both directions of the HotCRP cross-check."""
+
+    def run_audit(self, form_rows, accounts, uploaded=(), reserves=()):
+        tmp = Path(tempfile.mkdtemp())
+        form, ac_form = tmp / "form.csv", tmp / "ac.csv"
+        with form.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(ReviewerLoaderTests.HEADERS)
+            writer.writerows(form_rows)
+        with ac_form.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Timestamp", "Please confirm your HotCRP email address",
+                             "Area Chair membership", "First Name", "Last Name",
+                             "Enter your DBLP Link", "institutional affiliation",
+                             "primary area", "keywords", "secondary area"])
+        upload = tmp / "upload.csv"
+        with upload.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["email", "name", "roles", "tags"])
+            writer.writeheader()
+            for email, name in uploaded:
+                writer.writerow({"email": email, "name": name, "roles": "pc",
+                                 "tags": "reserve-reviewer"})
+        info = tmp / "info.csv"
+        with info.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["email", "name", "dblp"])
+            writer.writeheader()
+            for email, name in reserves:
+                writer.writerow({"email": email, "name": name, "dblp": ""})
+        data = tmp / "papers.json"
+        data.write_text(json.dumps([]), encoding="utf-8")
+        pruned, missing = tmp / "pruned.csv", tmp / "missing.csv"
+        argv = ["audit_pc_roster.py",
+                "--pcinfo", str(write_pcinfo(tmp / "pc.csv", accounts)),
+                "--csv", str(form), "--area-chair-csv", str(ac_form),
+                "--reserve-info", str(info), "--upload", str(upload),
+                "--data", str(data), "--pruned", str(pruned),
+                "--missing", str(missing)]
+        with mock.patch.object(sys, "argv", argv), \
+                contextlib.redirect_stderr(io.StringIO()):
+            audit_pc_roster.main()
+
+        def read(path):
+            with path.open(newline="", encoding="utf-8") as f:
+                return list(csv.DictReader(f))
+
+        return read(pruned), read(missing)
+
+    def accept(self, email, first="Ada", last="Lovelace",
+               membership="Yes, I accept as a full PC member"):
+        return ["07/01/2026 10:00:00", email, membership, first, last, "none",
+                "Example", "Memory", "", "", "", ""]
+
+    def test_the_pruned_report_separates_a_missing_account_from_a_lost_role(self):
+        pruned, _ = self.run_audit(
+            [self.accept("nobody@a.edu", "Grace", "Hopper"),
+             self.accept("former@a.edu", "Alan", "Turing")],
+            [pc_account("keep@a.edu", "Ada", "Lovelace"),
+             {"email": "former@a.edu", "given_name": "Alan", "family_name": "Turing",
+              "roles": "", "tags": "pc-full"}],
+        )
+        by_email = {r["email"]: r for r in pruned}
+        self.assertEqual("no_account", by_email["nobody@a.edu"]["problem"])
+        self.assertEqual("role_removed", by_email["former@a.edu"]["problem"])
+        self.assertIn("pc-full", by_email["former@a.edu"]["detail"])
+
+    def test_an_alternate_account_is_reported_as_missing_and_never_pruned(self):
+        # The two-file contract: a person reachable under a second PC-marked
+        # address is kept on the roster, and the fact that needs acting on is
+        # the un-merged HotCRP account, which belongs in the other report.
+        pruned, missing = self.run_audit(
+            [self.accept("ada@a.edu", "Ada", "Lovelace")],
+            [pc_account("ada@b.edu", "Ada", "Lovelace")],
+        )
+        self.assertEqual([], pruned)
+        self.assertEqual(["ada@b.edu"], [r["email"] for r in missing])
+        self.assertEqual("alternate_account", missing[0]["category"])
+        self.assertIn("ada@a.edu", missing[0]["detail"])
+
+    def test_a_reserve_upload_row_settles_a_pc_account_with_no_acceptance(self):
+        # Reserves never fill in the acceptance form, so without the upload
+        # every one of them would be reported as an unexplained PC account.
+        _, missing = self.run_audit(
+            [], [pc_account("recruit@a.edu", "Grace", "Hopper")],
+            uploaded=[("recruit@a.edu", "Grace Hopper")],
+        )
+        self.assertEqual([], missing)
+
+    def test_a_decliner_still_marked_pc_is_outstanding(self):
+        # Zero of these today; the category exists so that when it stops being
+        # zero it is not invisible.
+        _, missing = self.run_audit(
+            [self.accept("no@a.edu", "Grace", "Hopper", "No, I am unable to accept")],
+            [pc_account("no@a.edu", "Grace", "Hopper")],
+        )
+        self.assertEqual(["no@a.edu"], [r["email"] for r in missing])
+        self.assertEqual("declined", missing[0]["category"])
+
+    def test_a_structural_role_outranks_an_identity_match(self):
+        # A chair holding a second account is on the PC because they chair the
+        # conference. Filing them under alternate_account would put a settled
+        # row on the to-do list.
+        _, missing = self.run_audit(
+            [self.accept("chair@a.edu", "Ada", "Lovelace")],
+            [pc_account("chair@b.edu", "Ada", "Lovelace", tags="chairs")],
+        )
+        self.assertEqual("chair", missing[0]["category"])
+
+    def test_a_pc_account_with_no_roster_row_at_all_is_outstanding(self):
+        _, missing = self.run_audit([], [pc_account("who@a.edu", "Grace", "Hopper")])
+        self.assertEqual("no_roster_row", missing[0]["category"])
+
+    def test_both_reports_are_written_even_when_everything_agrees(self):
+        # A report that stops being written goes stale silently; one that
+        # converges to a bare header says "checked, nothing found".
+        pruned, missing = self.run_audit(
+            [self.accept("ada@a.edu", "Ada", "Lovelace")],
+            [pc_account("ada@a.edu", "Ada", "Lovelace")],
+        )
+        self.assertEqual([], pruned)
+        self.assertEqual([], missing)
+
+    def test_rows_are_sorted_by_email_so_a_rerun_diffs_cleanly(self):
+        pruned, _ = self.run_audit(
+            [self.accept("c@a.edu", "Grace", "Hopper"),
+             self.accept("a@a.edu", "Alan", "Turing"),
+             self.accept("b@a.edu", "Edsger", "Dijkstra")],
+            [pc_account("keep@a.edu", "Ada", "Lovelace")],
+        )
+        self.assertEqual(["a@a.edu", "b@a.edu", "c@a.edu"], [r["email"] for r in pruned])
+
+
+class DuplicateAccountTests(unittest.TestCase):
+    """find_duplicate_accounts.py: ranking candidate same-person pairs."""
+
+    def account(self, email, given, family, orcid="", affiliation=""):
+        return pc_membership.Account({
+            "email": email, "given_name": given, "family_name": family,
+            "orcid": orcid, "affiliation": affiliation, "roles": "pc",
+        })
+
+    def test_a_shared_orcid_under_one_name_is_the_strongest_evidence(self):
+        verdict = find_duplicate_accounts.classify(
+            self.account("a@x.edu", "Ada", "Lovelace", orcid="0000-1"),
+            self.account("b@y.edu", "Ada", "Lovelace", orcid="0000-1"),
+            pc_membership.DEFAULT_TOKEN_RATIO,
+        )
+        self.assertEqual(("high", "exact_name"), verdict[:2])
+        self.assertIn("same_orcid", verdict[2])
+
+    def test_conflicting_orcids_demote_an_exact_name_match(self):
+        # Two people sharing a common name is more likely than one person
+        # holding two ORCIDs, so the evidence has to cut against the match.
+        confidence, reason, _ = find_duplicate_accounts.classify(
+            self.account("a@x.edu", "Ada", "Lovelace", orcid="0000-1"),
+            self.account("b@y.edu", "Ada", "Lovelace", orcid="0000-2"),
+            pc_membership.DEFAULT_TOKEN_RATIO,
+        )
+        self.assertEqual(("low", "exact_name"), (confidence, reason))
+
+    def test_unrelated_names_sharing_an_orcid_are_flagged_for_review(self):
+        confidence, reason, _ = find_duplicate_accounts.classify(
+            self.account("a@x.edu", "Ada", "Lovelace", orcid="0000-1"),
+            self.account("b@y.edu", "Grace", "Hopper", orcid="0000-1"),
+            pc_membership.DEFAULT_TOKEN_RATIO,
+        )
+        self.assertEqual(("review", "shared_orcid_different_names"), (confidence, reason))
+
+    def test_two_people_with_no_shared_evidence_are_not_a_pair(self):
+        self.assertIsNone(find_duplicate_accounts.classify(
+            self.account("a@x.edu", "Ada", "Lovelace"),
+            self.account("b@y.edu", "Grace", "Hopper"),
+            pc_membership.DEFAULT_TOKEN_RATIO,
+        ))
 
 
 if __name__ == "__main__":
