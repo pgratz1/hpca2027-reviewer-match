@@ -1,83 +1,84 @@
-# PII / PII-derived — real PC member data
-HPCA'27 PC Member Acceptance Form (Responses) - Form Responses 1.csv
-Area Chair Acceptance Form (Responses) - Form Responses 1.csv
+# Sensitive or machine-local project data. Keep only directory placeholders.
+data/inputs/*
+!data/inputs/.gitkeep
+data/curated/*
+!data/curated/.gitkeep
+data/cache/*
+!data/cache/.gitkeep
+!data/cache/smoke/
+data/cache/smoke/*
+!data/cache/smoke/.gitkeep
+
+# Generated human-facing artifacts.
+outputs/assignments/*
+!outputs/assignments/.gitkeep
+outputs/reports/*
+!outputs/reports/.gitkeep
+outputs/evaluations/*
+!outputs/evaluations/.gitkeep
+
+# Historical data can still contain names, email addresses, or paper records.
+archive/retired-identity-resolution/*
+!archive/retired-identity-resolution/.gitkeep
+archive/historical-snapshots/*
+!archive/historical-snapshots/.gitkeep
+
+# Belt and braces. The rules above are location-based, so a sensitive file
+# dropped anywhere but its usual directory would not be caught by them. These
+# match on name wherever the file lands, which is what the pre-restructure
+# .gitignore did for everything; real PC identities have leaked from this repo
+# once already and the cost of a redundant rule is nothing.
+*PC Member Acceptance Form*
+*Area Chair Acceptance Form*
+hpca2027-pcinfo.csv
+hpca2027-data*.json
 hpca2027-trc*.csv
 PCDB_with_emails.csv
-# HotCRP user export (names, emails, ORCIDs, affiliations, collaborators) and
-# the duplicate-account and roster-check reports derived from it
-hpca2027-pcinfo.csv
-duplicate_accounts.csv
-pc_roster_pruned.csv
-pc_roster_missing.csv
-fingerprints.json
-fingerprints-*.json
-area_chair_fingerprints.json
-paper_fingerprints.json
-dblp_cache.json
-dblp_cache2.json
-dblp_pubs_cache.json
-openalex_cache.json
-no_dblp_lookup_report.csv
-manual_review_report*.csv
-final_identity_resolution.csv
-dblp_venue_cache.json
-dblp_person_cache.json
-dblp_profile_cache.json
-dblp_author_search_cache.json
-dblp_snapshot_cache.json
-# The DBLP dump itself — 5.2 GB, never committable
 dblp-*.xml
 dblp-*.xml.gz
 dblp-*.dtd
+dblp_*cache*.json
+dblp_affiliations.json
+dblp_overrides.csv
+reserve_dblp_overrides.csv
 reserve_reviewer*.csv
 reserve_reviewer*.xlsx
-reserve_dblp_overrides.csv
-reserve_identity_audit.csv
-reserve_seniority.csv
-reserve_fingerprints.json
+affiliation_countries.csv
+publication_exclusions.csv
 reviewer_publications.json
 publication_abstracts.json
-reviewer_seniority.csv
-dblp_overrides.csv
-publication_exclusions.csv
-assignment.txt
-area_chair_assignment.txt
-assignment-complete.txt
-assignment-smoke*.txt
-hpca2027-data-smoke*.json
-area_chair_assignment-complete.txt
+fingerprints.json
+fingerprints-*.json
+*_fingerprints.json
+*_seniority.csv
+coauthor_conflicts.csv
+duplicate_accounts.csv
+pc_roster_pruned.csv
+pc_roster_missing.csv
+assignment*.txt
+area_chair_assignment*.txt
 abstract-evaluation*.csv
 
-# Affiliation -> country layer and the DBLP affiliation notes behind it: both
-# are derived from real PC, area-chair and reserve identities.
-affiliation_countries.csv
-dblp_affiliations.json
-
-# Test fixture with a placeholder author email, not core project data
-hpca2027-data.json
-
-# Unrelated personal / local working files — never project code
+# Optional local comparison datasets.
 china_faculty.csv
 china_faculty.xlsx
 nonchina_faculty.csv
 nonchina_faculty.xlsx
-newresume.txt
-resume_codex.txt
 
-# Local tooling / session artifacts
+# Local tooling, secrets, and session artifacts.
 .env
 .env~
 .env.*
 restart.txt
 codex_resume.txt
 resume_claude.txt
+resume_codex.txt
+newresume.txt
 prompt_*.txt
 .claude/
 __pycache__/
 *.pyc
-# Atomic-write scratch files (tmp + replace); left behind only by a crash
 *.tmp
-# Editor backups
 *~
 \#*\#
 .~lock.*\#

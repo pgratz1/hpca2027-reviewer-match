@@ -15,37 +15,51 @@ from unittest import mock
 import numpy as np
 import requests
 
-import affiliation_country
-import assign_reviewers
-import assign_area_chairs
-import area_chairs
-import build_affiliation_countries
-import build_fingerprints
-import build_dblp_snapshot_cache
-import build_reserve_reviewer_info
-import reserve_reviewers
-import resolve_reserve_pids
-import classify_reviewers
-import compare_abstract_rankings
-import dblp
-import enrich_publications
-import estimate_reserve_need
-import make_smoke_dataset
-import paper_matching
-import fingerprint
-import resolve_trc_members
-import score_abstract_evaluation
-import audit_pc_roster
-import find_duplicate_accounts
-import pc_membership
-import reviewers as reviewers_mod
-import roster as roster_mod
-from reviewers import Reviewer, _parse_override_cap
+from reviewer_match import affiliation_country
+from reviewer_match import coauthor_coi
+from scripts import assign_reviewers
+from scripts import assign_area_chairs
+from reviewer_match import area_chairs
+from scripts import build_affiliation_countries
+from scripts import build_fingerprints
+from scripts import build_dblp_snapshot_cache
+from scripts import build_reserve_reviewer_info
+from reviewer_match import reserve_reviewers
+from scripts import resolve_reserve_pids
+from scripts import classify_reviewers
+from scripts import compare_abstract_rankings
+from reviewer_match import dblp
+from scripts import enrich_publications
+from scripts import estimate_reserve_need
+from scripts import make_smoke_dataset
+from reviewer_match import paper_matching
+from reviewer_match import fingerprint
+from reviewer_match import paths
+from scripts import resolve_trc_members
+from scripts import score_abstract_evaluation
+from scripts import audit_pc_roster
+from scripts import find_duplicate_accounts
+from reviewer_match import pc_membership
+from reviewer_match import reviewers as reviewers_mod
+from reviewer_match import roster as roster_mod
+from reviewer_match.reviewers import Reviewer, _parse_override_cap
 
 PCINFO_FIELDS = [
     "given_name", "family_name", "email", "affiliation", "orcid", "country",
     "disabled", "roles", "tags",
 ]
+
+
+class RepositoryPathTests(unittest.TestCase):
+    def test_project_root_is_derived_from_the_package(self):
+        expected = Path(__file__).resolve().parents[1]
+        self.assertEqual(expected, paths.PROJECT_ROOT)
+
+    def test_default_artifacts_are_separated_by_role(self):
+        self.assertEqual(paths.INPUT_DIR, Path(assign_reviewers.DEFAULT_DATA).parent)
+        self.assertEqual(paths.CURATED_DIR, Path(reviewers_mod.DEFAULT_OVERRIDES).parent)
+        self.assertEqual(paths.CACHE_DIR, Path(assign_reviewers.DEFAULT_FINGERPRINT_CACHE).parent)
+        self.assertEqual(paths.REPORT_DIR, Path(classify_reviewers.DEFAULT_OUT).parent)
 
 
 def write_pcinfo(path, accounts):
@@ -1316,6 +1330,7 @@ SNAPSHOT_FIXTURE = """<?xml version="1.0" encoding="ISO-8859-1"?>
 <inproceedings key="conf/isca/A1">
 <author>Fran&ccedil;ois Alpha</author>
 <author>Mei Lam 0001</author>
+<author>Zoe Outsider</author>
 <title>A <i>conference</i> paper.</title>
 <booktitle>ISCA</booktitle>
 <year>2025</year>
@@ -1420,6 +1435,41 @@ class DblpSnapshotTests(unittest.TestCase):
         self.assertEqual({"c": ["snap"]}, gaps)
         merged = {**gaps, **{"a": ["colleague"]}}
         self.assertEqual(["colleague"], merged["a"])
+
+    def coauthors(self, wanted, cutoff=None):
+        names = build_dblp_snapshot_cache.collect_names(self.path, set(wanted))
+        by_name = {n: pid for pid, spellings in names.items() for n in spellings}
+        found = {}
+        build_dblp_snapshot_cache.collect_publications(
+            self.path, by_name, coauthors=found, coauthor_cutoff=cutoff
+        )
+        return found
+
+    def test_coauthors_are_collected_without_a_second_pass(self):
+        found = self.coauthors({"1/Alpha", "2/Beta"})
+        self.assertEqual({"Mei Lam 0001", "Zoe Outsider"}, set(found["1/Alpha"]))
+        self.assertEqual([[2025, "A conference paper."]], found["1/Alpha"]["Zoe Outsider"])
+
+    def test_an_alias_of_the_owner_is_not_one_of_their_coauthors(self):
+        # "F. Alpha" is 1/Alpha's own second spelling. Matching on the name
+        # string alone would make them their own co-author on every paper.
+        found = self.coauthors({"1/Alpha", "2/Beta"})
+        self.assertNotIn("F. Alpha", found["1/Alpha"])
+        self.assertNotIn("François Alpha", found["1/Alpha"])
+
+    def test_a_coauthor_outside_the_cutoff_is_not_kept(self):
+        self.assertEqual({}, self.coauthors({"1/Alpha", "2/Beta"}, cutoff=2026))
+
+    def test_collecting_coauthors_does_not_change_the_publication_records(self):
+        # The record shape is a contract with the live fetch and with the
+        # fingerprint key; the co-author sink must stay strictly beside it.
+        names = build_dblp_snapshot_cache.collect_names(self.path, {"1/Alpha"})
+        by_name = {n: pid for pid, spellings in names.items() for n in spellings}
+        plain = build_dblp_snapshot_cache.collect_publications(self.path, by_name)
+        withco = build_dblp_snapshot_cache.collect_publications(
+            self.path, by_name, coauthors={}, coauthor_cutoff=2000
+        )
+        self.assertEqual(plain, withco)
 
 
 class BackoffTests(unittest.TestCase):
@@ -1718,6 +1768,253 @@ class OwnPaperConflictTests(unittest.TestCase):
     def test_a_malformed_nomination_line_is_ignored_not_guessed_at(self):
         p = self.paper(reserve_reviewer="Just A Name\nNo Email / Somewhere\n")
         self.assertEqual(set(), paper_matching.own_paper_conflicts(p))
+
+    def test_a_derived_conflict_excludes_just_as_a_declared_one_does(self):
+        # The hook the co-author layer enters through. Nothing downstream in
+        # assign_reviewers re-checks COI, so if this keyword stops being
+        # honoured the layer silently becomes a report and nothing more.
+        r = reviewer()
+        p = self.paper(pid=3, authors=[{"email": "someone@else.edu"}])
+        args = ([r.email], np.ones((1, 3), dtype=np.float32),
+                np.ones(3, dtype=np.float32), {r.email: r})
+        self.assertEqual([r.email], [
+            e for e, _ in paper_matching.eligible_scores(p, *args, area_gate=False)
+        ])
+        self.assertEqual([], paper_matching.eligible_scores(
+            p, *args, area_gate=False, extra_conflicts={r.email.upper()}
+        ))
+
+
+class CoauthorNameMatchTests(unittest.TestCase):
+    """coauthor_coi.names_match: who counts as the same person, and who doesn't."""
+
+    def match(self, one, other):
+        return coauthor_coi.names_match(
+            pc_membership.token_set(one), pc_membership.token_set(other)
+        )
+
+    def test_the_same_name_matches_exactly(self):
+        self.assertEqual("exact", self.match("Onur Mutlu", "onur mutlu"))
+
+    def test_a_spelled_out_middle_name_still_matches(self):
+        # DBLP writes people out in full more often than HotCRP does; requiring
+        # equality here would miss the conflict entirely.
+        self.assertEqual("partial", self.match("David Albert Wood", "David Wood"))
+
+    def test_an_initial_is_dropped_rather_than_treated_as_a_name(self):
+        self.assertEqual("exact", self.match("Matthew D. Sinclair", "Matthew Sinclair"))
+
+    def test_dblps_homonym_suffix_is_not_part_of_the_name(self):
+        # Deliberately over-matching: two different people share this token set,
+        # and conflating them withholds a reviewer rather than missing a COI.
+        self.assertEqual("exact", self.match("Wei Zhang 0001", "Wei Zhang 0025"))
+
+    def test_accents_do_not_split_a_name_in_two(self):
+        self.assertEqual("exact", self.match("François Alpha", "Francois Alpha"))
+
+    def test_a_name_written_family_first_still_matches(self):
+        self.assertEqual("exact", self.match("Lam Mei", "Mei Lam"))
+
+    def test_one_shared_token_is_a_coincidence_not_a_person(self):
+        self.assertIsNone(self.match("Wei Zhang", "Wei Chen"))
+        self.assertIsNone(self.match("Onur Mutlu", "Onur Kayiran"))
+
+    def test_two_names_that_merely_overlap_do_not_match(self):
+        # Overlap is not containment: neither is a subset of the other, so this
+        # stays out even though two tokens are shared.
+        self.assertIsNone(self.match("Wei Zhang Chen", "Wei Zhang Liu"))
+
+    def test_a_short_name_inside_a_longer_one_matches_on_purpose(self):
+        # The cost of this rule. It is what catches a middle name spelled out,
+        # and it also marries a short name to an unrelated longer one that
+        # happens to contain it. Erring this way withholds a reviewer; erring
+        # the other way hands them a paper they are conflicted on.
+        self.assertEqual("partial", self.match("Jing Li", "Jing Li Wang Chen"))
+
+    def test_a_single_token_name_never_matches_anything(self):
+        # A lone surname would conflict a reviewer with every namesake alive.
+        self.assertIsNone(self.match("Mutlu", "Onur Mutlu"))
+        self.assertIsNone(self.match("Mutlu", "Mutlu"))
+
+
+class CoauthorConflictTests(unittest.TestCase):
+    """coauthor_coi: conflicts DBLP implies that nobody declared."""
+
+    def setUp(self):
+        self.reviewer = Reviewer(
+            email="rev@x.edu", first="Ada", last="Lovelace", dblp_url="",
+            pid="1/Ada", affiliation="X", primary="Memory", secondary="",
+            tertiary="", keywords="", tier="full", override_cap=None,
+        )
+        self.coauthors = {
+            "1/Ada": {
+                "Charles Babbage": [[2025, "An engine."], [2023, "Another engine."]],
+                "Old Colleague": [[2004, "Long ago."]],
+                "Ada Lovelace": [[2025, "An engine."]],
+            }
+        }
+
+    def paper(self, authors, **kwargs):
+        base = {
+            "pid": 7, "title": "A paper.", "topics": [], "contacts": [],
+            "pc_conflicts": {}, "reserve_reviewer": "",
+            "authors": [
+                {"given_name": g, "family_name": f, "email": e, "affiliation": "Y"}
+                for g, f, e in authors
+            ],
+        }
+        base.update(kwargs)
+        return base
+
+    def derive(self, paper, *, years=5, author_names=None):
+        index = coauthor_coi.build_index(
+            [self.reviewer], self.coauthors, years=years, current_year=2026
+        )
+        return index, coauthor_coi.derive_conflicts(
+            [paper], index, author_names or {}
+        )
+
+    def test_a_recent_coauthor_on_a_paper_conflicts_the_reviewer(self):
+        p = self.paper([("Charles", "Babbage", "cb@y.edu")])
+        _, derived = self.derive(p)
+        coi = derived[7]["rev@x.edu"]
+        self.assertEqual(("exact", 2, 2025, ""), (coi.match, coi.shared, coi.latest_year, coi.declared))
+        self.assertEqual("cb@y.edu", coi.author_email)
+
+    def test_a_coauthor_outside_the_window_does_not_conflict(self):
+        # dblp.filter_by_years' convention: five years in 2026 starts at 2022,
+        # so a 2004 paper is out and nothing fires.
+        p = self.paper([("Old", "Colleague", "oc@y.edu")])
+        self.assertEqual({}, self.derive(p)[1])
+
+    def test_widening_the_window_brings_the_old_coauthor_back(self):
+        p = self.paper([("Old", "Colleague", "oc@y.edu")])
+        self.assertIn("rev@x.edu", self.derive(p, years=25)[1][7])
+
+    def test_a_reviewer_is_not_their_own_coauthor(self):
+        # DBLP lists the owner among the authors of their own papers; without
+        # this every reviewer conflicts with every paper a namesake wrote.
+        p = self.paper([("Ada", "Lovelace", "someone.else@y.edu")])
+        _, derived = self.derive(p)
+        self.assertNotIn(7, derived)
+
+    def test_a_declared_conflict_is_marked_as_confirmation_not_news(self):
+        p = self.paper([("Charles", "Babbage", "cb@y.edu")],
+                       pc_conflicts={"REV@x.edu": True})
+        self.assertEqual("pc_conflicts", self.derive(p)[1][7]["rev@x.edu"].declared)
+
+    def test_a_reviewer_on_the_paper_is_marked_own_paper(self):
+        p = self.paper([("Charles", "Babbage", "cb@y.edu"),
+                        ("Ada", "L", "rev@x.edu")])
+        self.assertEqual("own_paper", self.derive(p)[1][7]["rev@x.edu"].declared)
+
+    def test_an_author_is_matched_under_their_dblp_spelling_too(self):
+        # The author calls themselves "C. Babbage" in HotCRP; DBLP knows them as
+        # "Charles Babbage". Their own declared DBLP link is what bridges the two.
+        p = self.paper([("C.", "Babbage", "cb@y.edu")],
+                       dblp="https://dblp.org/pid/9/CB.html")
+        self.assertEqual({}, self.derive(p)[1])
+        _, derived = self.derive(p, author_names={"9/CB": ["Charles Babbage"]})
+        self.assertEqual("exact", derived[7]["rev@x.edu"].match)
+
+    def test_a_reviewer_with_no_snapshot_entry_is_reported_not_silently_clean(self):
+        # The false negative that matters: no co-author data means every check
+        # passes, which is not the same as having no conflicts.
+        self.reviewer.pid = "404/Missing"
+        index, derived = self.derive(self.paper([("Charles", "Babbage", "cb@y.edu")]))
+        self.assertEqual({}, derived)
+        self.assertEqual({"rev@x.edu"}, index.uncovered)
+        self.assertEqual([self.reviewer], coauthor_coi.coverage_gap(index, [self.reviewer]))
+
+    def test_contacts_count_as_authors_for_this(self):
+        p = self.paper([("Someone", "Else", "se@y.edu")],
+                       contacts=[{"given_name": "Charles", "family_name": "Babbage",
+                                  "email": "cb@y.edu", "affiliation": "Y"}])
+        self.assertIn("rev@x.edu", self.derive(p)[1][7])
+
+
+class CoauthorIdentityTests(unittest.TestCase):
+    """coauthor_coi: DBLP's homonym numbering, where both sides are known.
+
+    "Wei Zhang" is 24 different researchers among this roster's co-authors.
+    Collapsing them conflicts a third of the committee with any paper one of
+    them wrote, and the collisions land almost entirely on names that romanise
+    into a small space.
+    """
+
+    def setUp(self):
+        # The reviewer wrote with Wei Zhang 0001, and with nobody else.
+        self.reviewer = Reviewer(
+            email="rev@x.edu", first="Ada", last="Lovelace", dblp_url="",
+            pid="1/Ada", affiliation="X", primary="Memory", secondary="",
+            tertiary="", keywords="", tier="full", override_cap=None,
+        )
+        self.coauthors = {"1/Ada": {"Wei Zhang 0001": [[2025, "A paper."]]}}
+
+    def paper(self, dblp=None):
+        p = {
+            "pid": 7, "title": "T", "topics": [], "contacts": [], "pc_conflicts": {},
+            "reserve_reviewer": "",
+            "authors": [{"given_name": "Wei", "family_name": "Zhang",
+                         "email": "wz@y.edu", "affiliation": "Y"}],
+        }
+        if dblp:
+            p["dblp"] = dblp
+        return p
+
+    def derive(self, paper, author_names, *, use_identity=True):
+        index = coauthor_coi.build_index(
+            [self.reviewer], self.coauthors, years=5, current_year=2026
+        )
+        return coauthor_coi.derive_conflicts(
+            [paper], index, author_names, use_identity=use_identity
+        )
+
+    def test_a_different_homonym_of_the_same_name_is_a_different_person(self):
+        p = self.paper(dblp="https://dblp.org/pid/9/WZ.html")
+        self.assertEqual({}, self.derive(p, {"9/WZ": ["Wei Zhang 0012"]}))
+
+    def test_the_same_homonym_still_conflicts(self):
+        p = self.paper(dblp="https://dblp.org/pid/9/WZ.html")
+        derived = self.derive(p, {"9/WZ": ["Wei Zhang 0001"]})
+        self.assertEqual("exact", derived[7]["rev@x.edu"].match)
+
+    def test_an_author_who_declared_no_dblp_page_keeps_the_permissive_reading(self):
+        # Not knowing which Wei Zhang someone is cannot be evidence that they
+        # are not this one. Roughly half the author slots are in this state,
+        # which is the real limit on how much identity matching can do.
+        self.assertIn("rev@x.edu", self.derive(self.paper(), {})[7])
+
+    def test_the_unnumbered_name_is_itself_an_identity(self):
+        # A bare "Wei Zhang" in DBLP is one specific person, not a wildcard.
+        p = self.paper(dblp="https://dblp.org/pid/9/WZ.html")
+        self.assertEqual({}, self.derive(p, {"9/WZ": ["Wei Zhang"]}))
+
+    def test_one_persons_two_spellings_are_not_read_as_two_people(self):
+        # The reason this compares the homonym number and not the raw string:
+        # accents and middle initials vary freely within one identity, and
+        # string inequality there would silently drop a real conflict.
+        self.reviewer.pid = "2/Bob"
+        self.coauthors = {"2/Bob": {"José García": [[2025, "A paper."]]}}
+        p = {
+            "pid": 7, "title": "T", "topics": [], "contacts": [], "pc_conflicts": {},
+            "reserve_reviewer": "", "dblp": "https://dblp.org/pid/9/JG.html",
+            "authors": [{"given_name": "Jose", "family_name": "Garcia",
+                         "email": "jg@y.edu", "affiliation": "Y"}],
+        }
+        derived = self.derive(p, {"9/JG": ["Jose A. Garcia"]})
+        self.assertIn("rev@x.edu", derived[7])
+
+    def test_the_numbering_can_be_ignored_for_a_comparison_run(self):
+        p = self.paper(dblp="https://dblp.org/pid/9/WZ.html")
+        names = {"9/WZ": ["Wei Zhang 0012"]}
+        self.assertEqual({}, self.derive(p, names))
+        self.assertIn("rev@x.edu", self.derive(p, names, use_identity=False)[7])
+
+    def test_identity_reads_the_suffix_and_nothing_else(self):
+        self.assertEqual("0012", coauthor_coi.identity("Wei Zhang 0012"))
+        self.assertEqual("", coauthor_coi.identity("Wei Zhang"))
+        self.assertEqual("", coauthor_coi.identity("Matthew D. Sinclair"))
 
 
 class ReservePidResolverTests(unittest.TestCase):

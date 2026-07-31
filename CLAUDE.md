@@ -6,13 +6,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The **HPCA 2027 reviewer–paper matching pipeline** — fully implemented and in
 active use by the PC chair during the submission window (paper registration
-deadline: July 25, 2026, so `hpca2027-data.json` is a moving snapshot).
+deadline: July 25, 2026, so `data/inputs/hpca2027-data.json` is a moving snapshot).
 It classifies PC members by seniority from DBLP history and assigns reviewers
 to papers by SPECTER2 embedding similarity under COI, area, load, and
 seniority constraints.
 
 **Read `README.md` first** — it documents every script, the start-to-finish
-workflow, and the data files. `hpca2027-matching-brief.md` is the original
+workflow, and the data files. `docs/hpca2027-matching-brief.md` is the original
 design brief, kept for history; where they disagree, the README and code win.
 `/home/pgratz/reviewer_match` is a symlink to this directory (the real path
 contains spaces and parentheses — always quote it in shell commands).
@@ -23,18 +23,18 @@ contains spaces and parentheses — always quote it in shell commands).
   adapters, numpy). `make` defaults to it; `requirements.txt` is
   documentation, not a reproducible installer.
 - `make` runs the whole pipeline (classify → abstract enrichment →
-  fingerprints → submitted-only `assignment.txt`)
+  fingerprints → submitted-only `outputs/assignments/assignment.txt`)
   and rebuilds only what's stale. Prefer it over invoking scripts by hand.
-- `make area-chairs` is deliberately separate: it requires `assignment.txt`,
+- `make area-chairs` is deliberately separate: it requires `outputs/assignments/assignment.txt`,
   builds 10-year chair fingerprints, and writes a chair-grouped
-  `area_chair_assignment.txt` under hard COIs and the closest feasible loads.
-- **`make pc-roster` cross-checks both rosters against `hpca2027-pcinfo.csv`**,
+  `outputs/assignments/area_chair_assignment.txt` under hard COIs and the closest feasible loads.
+- **`make pc-roster` cross-checks both rosters against `data/inputs/hpca2027-pcinfo.csv`**,
   the HotCRP user export, and should be run after every fresh export. Offline,
-  instant, read-only. It writes `pc_roster_pruned.csv` (roster rows the loaders
+  instant, read-only. It writes `outputs/reports/pc_roster_pruned.csv` (roster rows the loaders
   now drop, because HotCRP no longer marks them `pc`) and
-  `pc_roster_missing.csv` (PC accounts no roster explains). The membership check
+  `outputs/reports/pc_roster_missing.csv` (PC accounts no roster explains). The membership check
   itself is **on by default in every loader** — `make PC_CHECK=--no-pc-check`,
-  or `--no-pc-check` on `classify_reviewers.py`/`assign_reviewers.py`, turns it
+  or `--no-pc-check` on `scripts/classify_reviewers.py`/`scripts/assign_reviewers.py`, turns it
   off for when the export is staler than the rosters. A **missing export, or a
   truncated one in which nothing is marked `pc`, is a hard error**, not a
   silent skip: the alternative is pruning all ~460 reviewers and reporting every
@@ -44,10 +44,10 @@ contains spaces and parentheses — always quote it in shell commands).
   recruited. No GPU, no fingerprints, no network — pure arithmetic. Recruiting
   the reserves themselves happens outside this repo.
 - `make reserve-info` joins the HotCRP reserve upload
-  (`reserve_reviewer_upload.csv`) to the DBLP links in
-  `reserve_reviewers_vetting_final.xlsx` and writes `reserve_reviewer_info.csv`
+  (`data/inputs/reserve_reviewer_upload.csv`) to the DBLP links in
+  `data/inputs/reserve_reviewers_vetting_final.xlsx` and writes `outputs/reports/reserve_reviewer_info.csv`
   — the reserve-side identity layer. Also independent of the assignment. Rows
-  that fail a check are held back in `reserve_reviewer_unresolved.csv` rather
+  that fail a check are held back in `outputs/reports/reserve_reviewer_unresolved.csv` rather
   than fingerprinting the wrong person. **Always run it as
   `make reserve-info VERIFY=--verify`**: offline, a PID is only name-checked
   when the PID itself spells a name, and verifying the rest against DBLP caught
@@ -55,78 +55,111 @@ contains spaces and parentheses — always quote it in shell commands).
   overwrites that verified roster with the weaker offline result. The profile
   cache is warm, so a verified re-run costs 0 fetches.
 - `make dblp-snapshot` is the **preferred source of publications**: it reads a
-  local DBLP dump (`DBLP_SNAPSHOT`, default `dblp-2026-07-01.xml`, 5.2 GB,
-  gitignored) and writes `dblp_snapshot_cache.json` for every roster PID —
+  local DBLP dump (`DBLP_SNAPSHOT`, default `data/inputs/dblp-2026-07-01.xml`, 5.2 GB,
+  gitignored) and writes `data/cache/dblp_snapshot_cache.json` for every roster PID —
   offline, ~4 min, no rate limit. Run it before `make`, `make area-chairs` or
   `make reserves` and those need no network for DBLP at all. The dump has no
-  `pid` attributes, so `build_dblp_snapshot_cache.py` joins PID → name strings
+  `pid` attributes, so `scripts/build_dblp_snapshot_cache.py` joins PID → name strings
   (from `<www key="homepages/PID">` records, aliases included) → publications by
   exact name match; DBLP guarantees a name string identifies one person. The
   cache is consulted **only for PIDs the existing caches lack**
   (`dblp.snapshot_gaps`) — re-sourcing a cached person would change their
   publication list, which is part of the fingerprint key, and re-embed them for
   nothing. PIDs absent from the snapshot (anyone added after it was taken) are
-  reported and still use the live path.
+  reported and still use the live path. The same two passes also write
+  `data/cache/dblp_coauthors.json` (`{pid: {name: [[year, title]]}}`, 10-year
+  build window so the 5-year COI check can narrow without re-reading 5 GB) and
+  `data/cache/dblp_author_names.json` (`{pid: [spelling]}` for the PIDs
+  submission authors declare, 2,569 of 2,583 resolved). Both are separate files
+  for the reason `dblp_affiliations.json` is: **nothing may be added to the
+  publication record dict**, which is a contract with the live fetch and with
+  the fingerprint key — `tests/test_regressions.py` asserts its exact 5 keys.
 - `make affiliation-countries` enumerates every affiliation string across the
   submissions and all three rosters and resolves which country each institution
-  is in, writing `affiliation_countries.csv` with a **blank `country` column as
-  the to-do list** (the `dblp_overrides.csv` idiom — the generator writes only
+  is in, writing `data/curated/affiliation_countries.csv` with a **blank `country` column as
+  the to-do list** (the `data/curated/dblp_overrides.csv` idiom — the generator writes only
   `suggested`, never `country`, or the hand layer would outrank DBLP with a
   machine guess). Feeds the same-country cap; run `make dblp-snapshot` first,
-  since its `dblp_affiliations.json` is the strongest layer. `--validate
+  since its `data/cache/dblp_affiliations.json` is the strongest layer. `--validate
   CN=china_faculty.csv '!CN=nonchina_faculty.csv'` checks it against the old
   hand split — which turns out to be exactly the `.cn` email test (100%/0%), so
   it misfiles Chinese-institution reviewers who use gmail/qq addresses.
 - `make reserves` puts the reserve roster through the same three stages as the
   PC (enrich → fingerprints → classify) via `--role reserve`, writing
-  `reserve_fingerprints.json` and `reserve_seniority.csv`. Reserves never filled
-  in a form, so `reserve_reviewers.py` derives their areas from the HotCRP
+  `data/cache/reserve_fingerprints.json` and `outputs/reports/reserve_seniority.csv`. Reserves never filled
+  in a form, so `src/reviewer_match/reserve_reviewers.py` derives their areas from the HotCRP
   topics of the submissions they authored — without areas the area gate matches
-  them to nothing. `roster.py` maps role → loader for all three scripts.
+  them to nothing. `src/reviewer_match/roster.py` maps role → loader for all three scripts.
 - `make smoke` rehearses a full assignment over **both** rosters:
-  `make_smoke_dataset.py` writes `hpca2027-data-smoke.json` (a seeded 30% of the
+  `scripts/make_smoke_dataset.py` writes `data/cache/smoke/hpca2027-data-smoke.json` (a seeded 30% of the
   registered papers *marked withdrawn*, standing in for those never submitted),
-  then `assign_reviewers.py --include-reserves --reserve-cap 6` runs over it. The
+  then `scripts/assign_reviewers.py --include-reserves --reserve-cap 6` runs over it. The
   self-checks — over cap, blocking pairs, junior/out-of-area — are the pass/fail;
   the shortage count is a capacity statement, not a verdict.
 - **COI is a floor, not a full picture.** `paper_matching.own_paper_conflicts`
   treats authors, contacts, and `reserve_reviewer` nominees as conflicted, because
   authors have not yet been asked to declare conflicts against recently promoted
   PC and reserve reviewers. Coverage is uneven (reserves: median 1 declared
-  conflict per paper vs 7–8 for the PC), which `assign_reviewers.py` now prints,
-  and it makes any reserve-heavy result optimistic until the sweep runs.
+  conflict per paper vs 7–8 for the PC), which `scripts/assign_reviewers.py` now prints,
+  and it makes any reserve-heavy result optimistic until the sweep runs. The
+  derived co-author layer (step 3a) partly closes this — and closes it hardest
+  for reserves, who account for 8,234 of the 15,729 undeclared conflicts — but
+  it only sees co-authorship. Advisor/advisee, same-institution and funding ties
+  stay invisible; **it does not replace the sweep**.
+- `make coauthor-coi` writes `outputs/reports/coauthor_conflicts.csv`, one row
+  per conflict the co-author layer finds, with a `declared` column where an
+  **empty value means nobody recorded it**. Offline, ~6s, read-only. Needs
+  `data/cache/dblp_coauthors.json`, so run `make dblp-snapshot` first — and note
+  that a missing co-author cache is a **hard error** in `assign_reviewers.py`
+  and `assign_area_chairs.py`, not a silent skip, for the same reason the PC
+  check is: quietly dropping a COI layer is worse than failing. The
+  `reviewers_matched` column is the false-positive handle; the summary flags
+  names reaching 20+ reviewers that were almost never declared (13 today,
+  covering 678 undeclared conflicts) — reported, not filtered. What is left is
+  the residue homonym identity cannot reach: names whose paper-side authors
+  declared no DBLP page at all, overwhelmingly ones that romanise into a small
+  space. **The residual bias is directional** — papers with Chinese-affiliated
+  authors lose more reviewers to name collisions than others. Getting authors to
+  fill in the DBLP field shrinks it; more name matching will not.
+- **`assign_area_chairs.py` now applies all three COI layers**, not just
+  `pc_conflicts`. The `own_paper_conflicts` floor it had been missing changes
+  nothing on today's export (every chair authorship is already declared) but
+  should not depend on that. With only 15 chairs, tightening COI can make the
+  load bounds infeasible where the reviewer matcher would under-fill; that
+  surfaces as `ValueError`, which is the honest outcome.
 - `make complete-papers` and `make area-chairs-complete` retain the former
   completeness filter in separate `*-complete.txt` artifacts.
-- Library modules (imported, never run): `reviewers.py`, `dblp.py`,
-  `paper_matching.py`, `fingerprint.py`, `specter2_model.py`,
-  `reserve_reviewers.py`, `roster.py`, `affiliation_country.py`,
-  `pc_membership.py`. Runnable
-  scripts: `audit_pc_roster.py`, `find_duplicate_accounts.py`,
-  `audit_reserve_identities.py`, `classify_reviewers.py`, `build_fingerprints.py`,
-  `enrich_publications.py`, `assign_reviewers.py`, `score_papers.py`,
-  `nearest_neighbors.py`, `compare_abstract_rankings.py`,
-  `score_abstract_evaluation.py`, `assign_area_chairs.py`,
-  `estimate_reserve_need.py`, `build_reserve_reviewer_info.py`, `make_smoke_dataset.py`,
-  `resolve_reserve_pids.py`, `build_dblp_snapshot_cache.py`,
-  `build_affiliation_countries.py`,
-  `resolve_trc_members.py`, `main.py`.
+- Library modules (imported, never run): `src/reviewer_match/reviewers.py`, `src/reviewer_match/dblp.py`,
+  `src/reviewer_match/paper_matching.py`, `src/reviewer_match/fingerprint.py`, `src/reviewer_match/specter2_model.py`,
+  `src/reviewer_match/reserve_reviewers.py`, `src/reviewer_match/roster.py`, `src/reviewer_match/affiliation_country.py`,
+  `src/reviewer_match/pc_membership.py`, `src/reviewer_match/coauthor_coi.py`. Runnable
+  scripts: `scripts/audit_pc_roster.py`, `scripts/find_duplicate_accounts.py`,
+  `scripts/audit_coauthor_conflicts.py`,
+  `scripts/audit_reserve_identities.py`, `scripts/classify_reviewers.py`, `scripts/build_fingerprints.py`,
+  `scripts/enrich_publications.py`, `scripts/assign_reviewers.py`, `scripts/score_papers.py`,
+  `scripts/nearest_neighbors.py`, `scripts/compare_abstract_rankings.py`,
+  `scripts/score_abstract_evaluation.py`, `scripts/assign_area_chairs.py`,
+  `scripts/estimate_reserve_need.py`, `scripts/build_reserve_reviewer_info.py`, `scripts/make_smoke_dataset.py`,
+  `scripts/resolve_reserve_pids.py`, `scripts/build_dblp_snapshot_cache.py`,
+  `scripts/build_affiliation_countries.py`,
+  `scripts/resolve_trc_members.py`, `scripts/main.py`.
 
 ## Architecture (filter-then-rank, then constrained assignment)
 
-1. **Identity**: `dblp_overrides.csv` (email-keyed, hand-maintained) is the
+1. **Identity**: `data/curated/dblp_overrides.csv` (email-keyed, hand-maintained) is the
    single identity layer for the PC. Reserve reviewers, who never filled in the
-   acceptance form, get theirs from `reserve_reviewer_info.csv`, built from the
-   vetting workbook but overridden per-email by `reserve_dblp_overrides.csv`
-   (written by `resolve_reserve_pids.py`, finished by hand; a blank `dblp` cell
+   acceptance form, get theirs from `outputs/reports/reserve_reviewer_info.csv`, built from the
+   vetting workbook but overridden per-email by `data/curated/reserve_dblp_overrides.csv`
+   (written by `scripts/resolve_reserve_pids.py`, finished by hand; a blank `dblp` cell
    is a to-do marker, not a decision, and never masks the workbook).
    A filled `dblp` cell wins over the form's DBLP
-   column. `classify_reviewers.py` auto-appends blank stub rows for reviewers
+   column. `scripts/classify_reviewers.py` auto-appends blank stub rows for reviewers
    it can't resolve — the file doubles as the to-do list.
-1b. **Membership** is a *separate* authority from identity: `dblp_overrides.csv`
-   says which DBLP page a person is, `hpca2027-pcinfo.csv` (the HotCRP user
+1b. **Membership** is a *separate* authority from identity: `data/curated/dblp_overrides.csv`
+   says which DBLP page a person is, `data/inputs/hpca2027-pcinfo.csv` (the HotCRP user
    export) says whether they are still on the committee. Accepting an
    invitation is not the same as being on the PC — people are removed
-   afterwards and the form cannot know. `pc_membership.py` applies the check
+   afterwards and the form cannot know. `src/reviewer_match/pc_membership.py` applies the check
    inside `load_reviewers`, `load_reserve_reviewers` and `load_area_chairs`
    (not in `roster.load_roster`, which 7 of the 11 roster consumers bypass), so
    no two scripts can disagree about the committee. Two rules make it safe:
@@ -138,11 +171,11 @@ contains spaces and parentheses — always quote it in shell commands).
    ordinary. Matching is exact (email → name tokens → email local part) and
    never fuzzy; a false match keeps someone already on the roster, a false miss
    silently removes a real reviewer.
-2. **Seniority**: `classify_reviewers.py` → `reviewer_seniority.csv`
+2. **Seniority**: `scripts/classify_reviewers.py` → `outputs/reports/reviewer_seniority.csv`
    (senior ≥0.8 papers/yr over 15y in ISCA/MICRO/HPCA/ASPLOS; junior <20
    pubs overall; out-of-area ≥20 pubs but <5 target-venue career; typical
    otherwise — all flag-tunable, checked in that order). PC-service
-   overrides from `PCDB_with_emails.csv` (email-matched, promote-only)
+   overrides from `data/inputs/PCDB_with_emails.csv` (email-matched, promote-only)
    then make chairs, TopPicks PC/ERC members, and PC/ERC score ≥6
    senior, and juniors with score ≥2 typical.
 3. **Affinity**: SPECTER2 fingerprints for reviewers (recent DBLP
@@ -151,6 +184,39 @@ contains spaces and parentheses — always quote it in shell commands).
    COI is a hard filter and the area gate (reviewer primary/secondary ∩
    paper topics) governs the normal phases — neither is ever blended into
    the score, but the gate is released per-paper by the relaxation ladder.
+3a. **Derived co-author COI** (`--coauthor-years N`, **on by default at 5**;
+   `--no-coauthor-coi` is the off switch): a reviewer who co-authored a
+   publication with one of a paper's authors inside the window is conflicted
+   with it, declared or not. A third layer beside `pc_conflicts` and
+   `own_paper_conflicts`, and mostly redundant with them by design — 9,508 of
+   the 22,044 pairs it excludes are already declared, and the other 12,536 are
+   what `make coauthor-coi` itemises. Hard in all six phases, like COI itself,
+   because `eligible_scores` is the only place COI is applied and no phase
+   re-checks it. **Matching is on names and errs towards firing** at the user's
+   explicit direction: a withheld reviewer costs one slot out of hundreds, a
+   missed conflict costs the review. `exact` = equal token sets; `partial` =
+   strict subset sharing ≥2 tokens; <2 usable tokens never matches. Window
+   convention is `dblp.filter_by_years` (`current_year - years + 1`).
+   **The silent failure is a missing PID**: no co-author data means every check
+   passes, which is not the same as clean, so both the assignment and the audit
+   count the uncovered (0 of 695 today). Measured cost vs the layer off:
+   capacity identical (6,036 pairs, 2,448 unfilled), goodness unchanged at
+   0.965, seniority marginally better.
+   **Homonym identity** (`--no-coauthor-identity` restores the blunt reading):
+   `name_tokens` strips DBLP's "0012" suffix, which is what makes names
+   comparable but also collapses people DBLP already told apart — the most
+   collision-prone name in this data is 24 distinct identities. Where **both**
+   sides are identified, `coauthor_coi.identity` compares the suffix and lets
+   a different homonym through. It compares the **suffix, never the raw
+   string**: one person's spellings differ freely ("José García"/"Jose Garcia",
+   "David A. Wood"/"David Wood") and string inequality would read as two people
+   and drop a real conflict. `exact` matches only — across a `partial` match the
+   numbers are not comparable. Ceiling: only 529 of 5,162 author accounts
+   resolve to a numbered homonym, and an author who declared nothing keeps the
+   permissive reading (not knowing which homonym someone is is not evidence they
+   are not this one). Worth 3,473 pairs removed / 0 added, confirmation rate
+   38% → 43%. **Never name the flagged names in a committed file** — the repo is
+   public and naming them discloses who submitted.
 3b. **Same-country cap** (`--same-country-cap N`, **on by default at 2**): a
    paper whose authors are mostly from country C holds at most N reviewers
    affiliated in C. One rule for every country — **no country is named in the
@@ -165,10 +231,10 @@ contains spaces and parentheses — always quote it in shell commands).
    blocking-pair count, and the hard invariant that replaces it is
    `country_over == 0`. **Coverage is the thing to read**: an unplaced reviewer
    can never consume a cap, so uneven coverage exempts whoever the resolver
-   places worst. Before `affiliation_countries.csv` was filled, `.edu`/`.com`
+   places worst. Before `data/curated/affiliation_countries.csv` was filled, `.edu`/`.com`
    were generic while `.cn`/`.kr` were not, and US did not appear once among
    the majority countries.
-4. **Assignment**: `assign_reviewers.py` — phased paper-proposing deferred
+4. **Assignment**: `scripts/assign_reviewers.py` — phased paper-proposing deferred
    acceptance aiming for a full slate plus ≥1 senior, ≤1 junior, and ≤1
    out-of-area per paper. Papers that can't fill release constraints in
    order: area gate → junior/out-of-area caps (almost-nots only) → senior
@@ -199,15 +265,15 @@ large shortage/relaxation reports are expected, not a bug.
   escapes, and embedded newlines. `reviewers.load_reviewers` collapses
   duplicate form submissions to the latest per email and applies overrides.
 - **Never commit data.** Everything derived from real PC members (both form
-  CSVs, all caches, `dblp_overrides.csv`, `publication_exclusions.csv`,
+  CSVs, all caches, `data/curated/dblp_overrides.csv`, `data/curated/publication_exclusions.csv`,
   classifications, assignments, and retired report CSVs) is gitignored; only
   code and docs go to the GitHub remote. Check `git status` before committing.
 - Caches are incremental, versioned, and **content/policy-aware**: paper
   fingerprints include title/abstract/topics, model, and area weight;
   reviewer fingerprints include metadata, PID, selected publications and
   abstracts, model, and embedding flags. Transient DBLP/API failures remain
-  retryable. The DBLP caches (`dblp_cache.json`, `dblp_venue_cache.json`,
-  `reviewer_publications.json`, read-only `dblp_pubs_cache.json`) are expensive to refill — live DBLP fetches are
+  retryable. The DBLP caches (`data/cache/dblp_cache.json`, `data/cache/dblp_venue_cache.json`,
+  `data/cache/reviewer_publications.json`, read-only `data/inputs/dblp_pubs_cache.json`) are expensive to refill — live DBLP fetches are
   rate-limited (~3s jittered delay; on a 429 or a dropped connection,
   `dblp.get_with_retry` backs off from ≥15s, doubling with jitter, capped at
   `MAX_BACKOFF`, honouring `Retry-After` up to the same cap). The backoff index
@@ -217,26 +283,26 @@ large shortage/relaxation reports are expected, not a bug.
   and keep what they cached instead of grinding for hours and leaving reviewers
   looking publication-less. If a run dies that way, wait and re-run; the caches
   resume. Prefer a larger `--delay` for big first-time fetches. Never delete them;
-  `make clean-fingerprints` deliberately spares them. `dblp_profile_cache.json`
-  and `dblp_author_search_cache.json`, filled by `resolve_trc_members.py`, are
+  `make clean-fingerprints` deliberately spares them. `data/cache/dblp_profile_cache.json`
+  and `data/cache/dblp_author_search_cache.json`, filled by `scripts/resolve_trc_members.py`, are
   the same kind of cache.
 - `.env` may hold an optional `S2_API_KEY`; it and editor backup
   variants are ignored. Never print, inspect, or commit secret values.
-- `publication_exclusions.csv` is the hand-maintained, per-email DOI exclusion
+- `data/curated/publication_exclusions.csv` is the hand-maintained, per-email DOI exclusion
   layer for reviewer and area-chair fingerprints; exclusions never delete
   entries from the shared publication or abstract caches.
-- `affiliation_countries.csv` is the hand-maintained affiliation → ISO country
-  layer for the region cap, and `dblp_affiliations.json` the DBLP notes under
+- `data/curated/affiliation_countries.csv` is the hand-maintained affiliation → ISO country
+  layer for the region cap, and `data/cache/dblp_affiliations.json` the DBLP notes under
   it; both are gitignored, both derive from real identities.
-- `hpca2027-pcinfo.csv` is the HotCRP **user** export — names, emails, ORCIDs,
+- `data/inputs/hpca2027-pcinfo.csv` is the HotCRP **user** export — names, emails, ORCIDs,
   affiliations and declared collaborators, so among the most sensitive files
-  here — and, like `hpca2027-data.json`, a moving snapshot. It and the three
-  reports derived from it (`pc_roster_pruned.csv`, `pc_roster_missing.csv`,
-  `duplicate_accounts.csv`) are gitignored. A stale export is the failure mode
+  here — and, like `data/inputs/hpca2027-data.json`, a moving snapshot. It and the three
+  reports derived from it (`outputs/reports/pc_roster_pruned.csv`, `outputs/reports/pc_roster_missing.csv`,
+  `outputs/reports/duplicate_accounts.csv`) are gitignored. A stale export is the failure mode
   those reports exist to surface; note it can easily be *older* than the
   acceptance form, since form responses keep arriving.
 - A title-only comparison cache must use a distinct path such as
-  `fingerprints-title-only.json`; all `fingerprints-*.json` files are ignored.
+  `data/cache/fingerprints-title-only.json`; all `fingerprints-*.json` files are ignored.
 
 ## Conventions
 
@@ -250,6 +316,6 @@ large shortage/relaxation reports are expected, not a bug.
   verify with `cmp` after changes.
 - When experimenting, work on scratch copies (`--out`, `--fingerprint-cache`,
   `--data`, `--paper-cache` flags exist for this); never mutate the real
-  caches or `dblp_overrides.csv` in a test.
+  caches or `data/curated/dblp_overrides.csv` in a test.
 - Run `~/envs/hpca-matching/bin/python3 -m unittest tests.test_regressions`
   after changes, then run `make` for an end-to-end and self-check validation.
