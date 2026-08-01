@@ -27,7 +27,7 @@ import argparse
 import math
 import sys
 
-from scripts.assign_reviewers import reviewer_paper_cap
+from scripts.assign_reviewers import DEFAULT_REVIEWERS_PER_PAPER, reviewer_paper_cap
 from reviewer_match.paper_matching import PAPER_POLICIES, load_papers
 from reviewer_match.reviewers import load_reviewers
 
@@ -35,7 +35,6 @@ DEFAULT_CSV = input_path("HPCA'27 PC Member Acceptance Form (Responses) - Form R
 DEFAULT_DATA = input_path("hpca2027-data.json")
 
 DEFAULT_REVIEWS_PER_RESERVE = 4
-DEFAULT_REVIEWERS_PER_PAPER = 6
 DEFAULT_LIGHT_CAP = 7
 DEFAULT_FULL_CAP = 15
 

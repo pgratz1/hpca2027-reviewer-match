@@ -214,14 +214,17 @@ class AreaChairAssignmentTests(unittest.TestCase):
     def test_load_reviewer_assigned_pids(self):
         text = (
             "=== [2] Included\n"
-            "    assigned 6 of 6 requested\n"
+            "    assigned 5 of 5 requested\n"
             "=== [3] Empty\n"
-            "    assigned 0 of 6 requested\n"
+            "    assigned 0 of 5 requested\n"
+            # The surplus stage appends to this line; the count must still parse.
+            "=== [4] Boosted\n"
+            "    assigned 6 of 5 requested  (+1 surplus)\n"
         )
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "assignment.txt"
             path.write_text(text, encoding="utf-8")
-            self.assertEqual([2], assign_area_chairs.load_reviewer_assigned_pids(str(path)))
+            self.assertEqual([2, 4], assign_area_chairs.load_reviewer_assigned_pids(str(path)))
 
     def test_balanced_optimizer_finds_global_maximum(self):
         scores = {
@@ -802,6 +805,198 @@ class AssignmentPropertyTests(unittest.TestCase):
             [1], released_prefs, {1: 2 - len(slates[1])}, slates, used, caps, scores, set(caps)
         )
         self.assertEqual(["in_area", "near"], slates[1])
+
+
+class SurplusDistributionTests(unittest.TestCase):
+    """The stage that spends leftover capacity on the worst-matched papers."""
+
+    def stub_reviewer(self, name):
+        """The two report functions below read only .name and .primary."""
+        return argparse.Namespace(name=name, primary="Memory systems")
+
+    def surplus(self, prefs, slates, caps, scores, *, released=None, used=None,
+                base=1, surplus=1, capped=()):
+        """distribute_surplus over one pool, gated and released prefs the same
+        unless a test needs them to differ."""
+        used = {e: 0 for e in caps} if used is None else used
+        assigned_via = {}
+        pids = sorted(slates)
+        added, rounds = assign_reviewers.distribute_surplus(
+            pids, prefs, released if released is not None else prefs, slates, used,
+            caps, scores, assigned_via, capped,
+            base_target={pid: base for pid in pids}, surplus_per_paper=surplus,
+        )
+        return added, rounds, used, assigned_via
+
+    def test_the_worst_matched_paper_gets_the_only_spare_slot(self):
+        # Both papers are at target and both want `spare`, but only one slot
+        # exists. It has to go to the paper whose slate matches it worst.
+        scores = {("held1", 1): 0.90, ("held2", 2): 0.60,
+                  ("spare", 1): 0.50, ("spare", 2): 0.50}
+        added, _, _, _ = self.surplus(
+            {1: ["spare"], 2: ["spare"]}, {1: ["held1"], 2: ["held2"]},
+            {"held1": 1, "held2": 1, "spare": 1}, scores,
+            used={"held1": 1, "held2": 1, "spare": 0},
+        )
+        self.assertEqual({2: ["spare"]}, added)
+
+    def test_a_slot_the_worst_paper_cannot_use_flows_to_the_next_worst(self):
+        # Paper 2 is worst-matched but its only candidate is already at
+        # capacity, so its offer places nothing. The slot must not be lost with
+        # it: a later round has to reach paper 1.
+        scores = {("held1", 1): 0.90, ("held2", 2): 0.60,
+                  ("full", 2): 0.99, ("spare", 1): 0.50}
+        added, rounds, _, _ = self.surplus(
+            {1: ["spare"], 2: ["full"]}, {1: ["held1"], 2: ["held2"]},
+            {"held1": 1, "held2": 1, "full": 1, "spare": 1}, scores,
+            used={"held1": 1, "held2": 1, "full": 1, "spare": 0},
+        )
+        self.assertEqual({1: ["spare"]}, added)
+        self.assertEqual(2, rounds)  # round 1 drops paper 2, round 2 serves 1
+
+    def test_surplus_is_purely_additive(self):
+        # Nothing an earlier phase froze may move: every base slate stays a
+        # prefix of the final one, and capacity only ever gets spent.
+        scores = {("a", 1): 0.9, ("b", 1): 0.8, ("c", 1): 0.7,
+                  ("a", 2): 0.6, ("b", 2): 0.5, ("c", 2): 0.4}
+        slates = {1: ["a"], 2: ["b"]}
+        base = {pid: list(v) for pid, v in slates.items()}
+        used = {"a": 1, "b": 1, "c": 0}
+        self.surplus({1: ["c"], 2: ["c"]}, slates, {"a": 1, "b": 1, "c": 2},
+                     scores, used=used)
+        for pid, before in base.items():
+            self.assertEqual(before, slates[pid][:len(before)])
+        self.assertEqual(1, used["a"])
+        self.assertEqual(1, used["b"])
+
+    def test_a_paper_stops_at_the_ceiling(self):
+        # Capacity is abundant, so only the ceiling can stop the paper growing.
+        pool = {f"r{i}": 1 for i in range(6)}
+        scores = {(e, 1): 0.5 for e in pool}
+        for surplus, expected in ((1, 2), (2, 3)):
+            slates = {1: ["seed"]}
+            scores[("seed", 1)] = 0.9
+            self.surplus({1: sorted(pool)}, slates, {**pool, "seed": 1}, scores,
+                         used={**{e: 0 for e in pool}, "seed": 1}, surplus=surplus)
+            self.assertEqual(expected, len(slates[1]))
+
+    def test_the_class_caps_still_bind_a_surplus_pick(self):
+        # The junior slot is already spent by a frozen assignment, so the
+        # better-scoring junior must be passed over for the typical reviewer.
+        juniors = frozenset({"j1", "j2"})
+        scores = {("j1", 1): 0.9, ("j2", 1): 0.8, ("t1", 1): 0.7}
+        slates = {1: ["j1"]}
+        added, _, _, _ = self.surplus(
+            {1: ["j2", "t1"]}, slates, {"j1": 1, "j2": 1, "t1": 1}, scores,
+            used={"j1": 1, "j2": 0, "t1": 0}, capped=[(juniors, 1)],
+        )
+        self.assertEqual({1: ["t1"]}, added)
+
+    def test_spare_capacity_is_never_exceeded_and_the_loop_terminates(self):
+        rng = random.Random(20260801)
+        for _ in range(40):
+            n_papers = rng.randint(2, 6)
+            pool = {f"r{i}": rng.randint(1, 3) for i in range(rng.randint(2, 8))}
+            pids = list(range(1, n_papers + 1))
+            scores = {(e, pid): rng.random() for e in pool for pid in pids}
+            prefs = {pid: sorted(pool, key=lambda e: -scores[(e, pid)]) for pid in pids}
+            slates = {pid: [] for pid in pids}
+            used = {e: 0 for e in pool}
+            # Seed every paper to its base target of 1 so all are eligible.
+            for pid in pids:
+                pick = next((e for e in prefs[pid] if used[e] < pool[e]), None)
+                if pick is not None:
+                    slates[pid].append(pick)
+                    used[pick] += 1
+            spare_before = assign_reviewers.spare_capacity(pool, used)
+            added, rounds, used, _ = self.surplus(
+                prefs, slates, pool, scores, used=used, surplus=2,
+            )
+            placed = sum(len(v) for v in added.values())
+            self.assertLessEqual(placed, spare_before)
+            self.assertLessEqual(rounds, len(pids) + spare_before)
+            for e, n in used.items():
+                self.assertLessEqual(n, pool[e])
+            for pid in pids:
+                self.assertLessEqual(len(slates[pid]), 1 + 2)
+
+    def test_a_paper_under_its_target_is_not_offered_a_surplus_slot(self):
+        # Paper 1 never reached its target, so it is not a surplus candidate
+        # even with a free reviewer in reach — which is what keeps the shortage
+        # report, the relaxation report and the exit code honest.
+        scores = {("held", 2): 0.9, ("spare", 1): 0.8, ("spare", 2): 0.5}
+        slates = {1: [], 2: ["held"]}
+        added, _, _, _ = self.surplus(
+            {1: ["spare"], 2: ["spare"]}, slates, {"held": 1, "spare": 1}, scores,
+            used={"held": 1, "spare": 0},
+        )
+        self.assertEqual({2: ["spare"]}, added)
+        self.assertEqual([], slates[1])
+
+    def test_the_stage_is_off_at_zero(self):
+        scores = {("held", 1): 0.9, ("spare", 1): 0.8}
+        slates = {1: ["held"]}
+        added, rounds, used, _ = self.surplus(
+            {1: ["spare"]}, slates, {"held": 1, "spare": 1}, scores,
+            used={"held": 1, "spare": 0}, surplus=0,
+        )
+        self.assertEqual(({}, 0), (added, rounds))
+        self.assertEqual(["held"], slates[1])
+        self.assertEqual(0, used["spare"])
+
+    def test_no_round_runs_when_every_reviewer_is_at_capacity(self):
+        scores = {("held", 1): 0.9, ("full", 1): 0.8}
+        added, rounds, _, _ = self.surplus(
+            {1: ["full"]}, {1: ["held"]}, {"held": 1, "full": 1}, scores,
+            used={"held": 1, "full": 1},
+        )
+        self.assertEqual(({}, 0), (added, rounds))
+
+    def test_surplus_picks_stay_out_of_the_relaxation_report(self):
+        # An area-released surplus pick is an area release, but on a slot the
+        # paper was never owed; reporting it would imply a shortfall.
+        self.assertTrue(assign_reviewers.SURPLUS_PHASES.isdisjoint(
+            assign_reviewers.UNRELAXED_PHASES))
+        papers = [{"pid": 1, "title": "T"}]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _, relaxed = assign_reviewers.relaxation_report(
+                [], papers, {1: ["a", "b"]}, {1: 2},
+                {(1, "a"): "fill", (1, "b"): "surplus (area released)"},
+                {1: 0.9}, {("a", 1): 0.9, ("b", 1): 0.9},
+                {"a": self.stub_reviewer("A"), "b": self.stub_reviewer("B")}, None,
+            )
+        self.assertEqual(0, relaxed)
+
+    def test_surplus_report_prints_both_goodness_figures(self):
+        # The 6th reviewer scores below the slate that outbid it, so the
+        # full-slate mean DROPS. Both numbers have to be on the page or the
+        # report reads as if boosting made the paper worse.
+        papers = [{"pid": 1, "title": "T"}]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            placed = assign_reviewers.surplus_report(
+                papers, {1: ["b"]}, {1: 0.900}, {1: 0.850},
+                {("b", 1): 0.800}, {"b": self.stub_reviewer("B")}, None,
+                {(1, "b"): "surplus"},
+                reviewers_per_paper=5, surplus_per_paper=1,
+                spare_before=3, spare_after=2, rounds=1,
+            )
+        out = buf.getvalue()
+        self.assertEqual(1, placed)
+        self.assertIn("0.900 -> 0.850", out)
+        self.assertIn("3 slot(s) before, 2 after", out)
+
+    def test_surplus_report_names_the_leftover_capacity_when_off(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            placed = assign_reviewers.surplus_report(
+                [], {}, {}, {}, {}, {}, None, {},
+                reviewers_per_paper=5, surplus_per_paper=0,
+                spare_before=17, spare_after=17, rounds=0,
+            )
+        self.assertEqual(0, placed)
+        self.assertIn("17 reviewer-slot(s) left unspent", buf.getvalue())
 
 
 class ClassificationTests(unittest.TestCase):

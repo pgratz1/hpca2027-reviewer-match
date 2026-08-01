@@ -190,18 +190,19 @@ contains spaces and parentheses — always quote it in shell commands).
    with it, declared or not. A third layer beside `pc_conflicts` and
    `own_paper_conflicts`, and mostly redundant with them by design — 9,508 of
    the 22,044 pairs it excludes are already declared, and the other 12,536 are
-   what `make coauthor-coi` itemises. Hard in all six phases, like COI itself,
-   because `eligible_scores` is the only place COI is applied and no phase
-   re-checks it. **Matching is on names and errs towards firing** at the user's
+   what `make coauthor-coi` itemises. Hard in every phase, like COI itself —
+   including the surplus stage, which inherits it for free because
+   `eligible_scores` is the only place COI is applied and no phase re-checks it. **Matching is on names and errs towards firing** at the user's
    explicit direction: a withheld reviewer costs one slot out of hundreds, a
    missed conflict costs the review. `exact` = equal token sets; `partial` =
    strict subset sharing ≥2 tokens; <2 usable tokens never matches. Window
    convention is `dblp.filter_by_years` (`current_year - years + 1`).
    **The silent failure is a missing PID**: no co-author data means every check
    passes, which is not the same as clean, so both the assignment and the audit
-   count the uncovered (0 of 695 today). Measured cost vs the layer off:
-   capacity identical (6,036 pairs, 2,448 unfilled), goodness unchanged at
-   0.965, seniority marginally better.
+   count the uncovered (0 of 695 today). Measured cost vs the layer off — taken
+   at 6 reviewers/paper with no surplus stage, so it is a comparison between two
+   runs, not today's numbers: capacity identical (6,036 pairs, 2,448 unfilled),
+   goodness unchanged at 0.965, seniority marginally better.
    **Homonym identity** (`--no-coauthor-identity` restores the blunt reading):
    `name_tokens` strips DBLP's "0012" suffix, which is what makes names
    comparable but also collapses people DBLP already told apart — the most
@@ -224,8 +225,8 @@ contains spaces and parentheses — always quote it in shell commands).
    Affiliation country, **never nationality**; HK/MO/TW/SG are separate ISO
    codes and are never folded into CN. `--same-country-cap 0` admits no
    same-country reviewer (a real setting this roster satisfies);
-   `--no-same-country-cap` is the off switch. Hard in all six phases including
-   F3, so a paper under-fills rather than exceed it. Because a country class
+   `--no-same-country-cap` is the off switch. Hard in every phase including F3
+   and the surplus stage, so a paper under-fills rather than exceed it. Because a country class
    *crosses* the seniority classes, greedy choice stops being substitutable and
    stability is no longer guaranteed for capped papers — `Done.` splits the
    blocking-pair count, and the hard invariant that replaces it is
@@ -235,14 +236,35 @@ contains spaces and parentheses — always quote it in shell commands).
    were generic while `.cn`/`.kr` were not, and US did not appear once among
    the majority countries.
 4. **Assignment**: `scripts/assign_reviewers.py` — phased paper-proposing deferred
-   acceptance aiming for a full slate plus ≥1 senior, ≤1 junior, and ≤1
-   out-of-area per paper. Papers that can't fill release constraints in
-   order: area gate → junior/out-of-area caps (almost-nots only) → senior
-   requirement (almost-senior), every pool still ranked by fingerprint
-   similarity. Prints a criteria report, per-paper match goodness (mean
-   assigned-reviewer similarity, worst-first summary), a relaxation &
-   exclusion report, and self-checks (over-cap, blocking pairs,
-   junior/out-of-area policy) that must all be 0.
+   acceptance aiming for a full slate of `--reviewers-per-paper`
+   (`DEFAULT_REVIEWERS_PER_PAPER`, **5** since submissions closed) plus ≥1
+   senior, ≤1 junior, and ≤3 out-of-area per paper. Papers that can't fill
+   release constraints in order: area gate → junior/out-of-area caps
+   (almost-nots only) → senior requirement (almost-senior), every pool still
+   ranked by fingerprint similarity. Prints a criteria report, per-paper match
+   goodness (mean assigned-reviewer similarity, worst-first summary), a
+   relaxation & exclusion report, and self-checks (over-cap, blocking pairs,
+   junior/out-of-area policy, slate ceiling) that must all be 0.
+4a. **Surplus distribution** (`--surplus-per-paper N`, **on by default at 1**;
+   `0` is the off switch): `--reviewers-per-paper` is what every paper is
+   *guaranteed*, and whatever capacity the six phases leave unspent then goes,
+   one reviewer at a time, to the papers with the lowest match goodness. Rounds
+   re-rank by current goodness, offer the worst `spare` papers one slot each,
+   and take the gated pool then the area-released pool — F1 then F2 on a
+   one-slot target. Only papers that **reached** the base target are eligible; a
+   paper that places nothing is dropped so its slot flows to the next-worst one,
+   which is why a zero-placement round is productive and is deliberately *not* a
+   stop condition. COI, the same-country cap and the junior/out-of-area caps all
+   still bind; the F3 almost-not pools are **not** reused. **Purely additive** —
+   earlier phases are frozen — so `paper_target` stays the base target and no
+   report or exit code is affected: `--surplus-per-paper 0` reproduces the
+   pre-surplus output line for line, which is the regression check worth
+   keeping. Two things to expect in the output: goodness is a **mean**, so a
+   boosted paper's full-slate figure *drops* (the report prints base and full
+   side by side for exactly this reason); and the worst-matched papers are often
+   the ones that *cannot* take a surplus slot, because thin eligibility is what
+   made them worst-matched — on the 1192-paper submitted set, only 52 of the
+   worst 200 could be helped, while 427 of 530 spare slots were placed overall.
 
 **Policy:** every paper-side tool defaults to `--paper-policy registered`:
 every non-withdrawn record with ≥1 author, a title of ≥1 word that isn't just

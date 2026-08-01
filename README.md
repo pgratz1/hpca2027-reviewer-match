@@ -295,8 +295,8 @@ override column) and `--reviewers-per-paper`. Solved by paper-proposing
 deferred acceptance (Hospital/Residents stable matching), run in phases that
 enforce **seniority constraints** from `outputs/reports/reviewer_seniority.csv` — each paper
 should get ≥ `--min-seniors` (1) senior reviewers, ≤ `--max-juniors` (1)
-juniors, and ≤ `--max-out-of-area` (1) out-of-area reviewers — and a **full
-slate**. When the normal constraints can't fill a paper's slate or senior
+juniors, and ≤ `--max-out-of-area` (3) out-of-area reviewers — and a **full
+slate** of `--reviewers-per-paper` (5). When the normal constraints can't fill a paper's slate or senior
 slot, they are released per-paper in a fixed order, each relaxed pool still
 ranked by fingerprint similarity so match goodness holds up:
 
@@ -326,8 +326,52 @@ than the PC's total review capacity. `--no-seniority` skips the seniority
 constraints and criteria report (single-pass assignment; the area release
 for under-filled papers still applies).
 ```bash
-~/envs/hpca-matching/bin/python3 -m scripts.assign_reviewers --light-cap 7 --full-cap 15 --reviewers-per-paper 6
+~/envs/hpca-matching/bin/python3 -m scripts.assign_reviewers --light-cap 7 --full-cap 15 --reviewers-per-paper 5
 ```
+
+#### Surplus distribution
+
+**On by default at 1.** `--reviewers-per-paper` is the slate every paper is
+*guaranteed*; whatever reviewer capacity the six phases leave unspent is then
+handed out, one extra reviewer at a time, to the papers whose slates match them
+worst. `--surplus-per-paper N` sets how far above the target a single paper may
+go (a ceiling, not a second target); `0` leaves the capacity unspent.
+
+Rounds repeat until capacity runs out or nobody is left to help. Each one ranks
+the eligible papers by their *current* match goodness, offers the worst `spare`
+of them one reviewer each, and draws from the gated pool first and the
+area-released pool second — F1 then F2, on a one-slot target. Only papers that
+**reached** their base target are eligible: one still short failed the fill
+phases minutes earlier under the same rules and a strictly larger pool, so an
+offer could not place anything.
+
+A paper that places nothing is dropped from later rounds. That is what makes the
+slot **flow on to the next-worst paper**, and it is safe because reviewer
+capacity only shrinks while a failed paper's slate stands still — it would fail
+identically forever. It also means a round that places nothing is still
+productive, so the loop deliberately does *not* stop there; it stops when spare
+capacity is gone or no paper is eligible.
+
+What stays hard: COI (all three layers — the stage draws from the same
+`eligible_scores` preference lists, so it inherits this for free), the
+same-country cap, and the junior/out-of-area caps, whose counts keep including
+everything the earlier phases froze. The F3 *almost-not* pools are deliberately
+**not** reused: an extra reviewer nobody was owed is not worth breaking
+composition policy for.
+
+The stage is **purely additive** — every phase above it is frozen, so no
+existing assignment moves. `--reviewers-per-paper` therefore remains the only
+number the shortage report, the relaxation report, the criteria report and the
+`--paper-policy submitted` exit code are judged against, and no paper is ever
+reported short because a surplus slot went to another paper. Running with
+`--surplus-per-paper 0` reproduces the pre-surplus output line for line.
+
+One thing to read carefully: **match goodness is a mean**, and a surplus
+reviewer almost always scores below the slate that outbid it, so a paper that
+*gained* a review shows a *lower* full-slate goodness. The surplus report prints
+both figures per paper — goodness over the base slate, which is what compares
+against a run with the stage off, and over the full slate — precisely so this
+does not read as the assignment getting worse.
 
 #### Same-country cap
 
@@ -358,8 +402,9 @@ the other way (one placed author out of ten reading as 100%), a paper with fewer
 than `--region-min-resolved` (default 0.5) of its authors placed is **not capped
 at all** and is listed by name in the report.
 
-The cap is **hard in all six phases**, including the senior anchors and the
-`fill (cap relaxed)` phase where the junior and out-of-area caps break. A paper
+The cap is **hard in every phase**, including the senior anchors, the
+`fill (cap relaxed)` phase where the junior and out-of-area caps break, and the
+surplus distribution that spends what is left over afterwards. A paper
 under-fills rather than exceed it, and the shortfall shows up in the shortage
 report. `country_cap_report` prints, per country, how many papers were capped,
 how many sat at the cap, how many were **left short** by it, and how many
@@ -462,9 +507,11 @@ them (currently 0 of 695, so the roster is fully covered). And the dump is a
 fixed point in time, so co-authorships newer than it are invisible.
 
 Measured cost on the registered set with reserves, against the same run with the
-layer off: identical capacity (6,036 pairs assigned, 2,448 slots unfilled either
-way), mean match goodness unchanged at 0.965, and seniority marginally better
-(540 papers OK against 536). All the existing self-checks stay 0, and
+layer off — taken before the target moved to 5 and before surplus distribution
+existed, so read the figures as a comparison between the two runs, not as
+today's numbers: identical capacity (6,036 pairs assigned, 2,448 slots unfilled
+either way), mean match goodness unchanged at 0.965, and seniority marginally
+better (540 papers OK against 536). All the existing self-checks stay 0, and
 `co-authored assignments` joins them.
 
 ```bash

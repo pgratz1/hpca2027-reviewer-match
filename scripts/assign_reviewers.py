@@ -1,7 +1,7 @@
 """Solve a global, load-capped assignment of reviewers to every paper.
 
     python -m scripts.assign_reviewers
-    python -m scripts.assign_reviewers --light-cap 7 --full-cap 15 --reviewers-per-paper 6
+    python -m scripts.assign_reviewers --light-cap 7 --full-cap 15 --reviewers-per-paper 5
 
 Unlike score_papers.py's independent per-paper ranking, a per-reviewer paper
 cap only makes sense considered across ALL papers at once: if two papers
@@ -55,6 +55,19 @@ deferred-acceptance pass whose results are frozen before the next:
   F3. papers still under-filled may exceed the caps with "almost not junior"
       juniors (>= --almost-junior-pubs pubs overall) and "almost not
       out-of-area" reviewers (>= --almost-out-of-area-career career papers).
+
+Whatever reviewer capacity those phases leave unspent is then handed to the
+papers that need it most (--surplus-per-paper N, default 1; 0 switches the
+stage off). Rounds repeat: rank the papers that reached their target by current
+match goodness, offer the worst of them one extra reviewer each, take the gated
+pool first and the area-released pool second. A paper that cannot use its offer
+is dropped so the slot flows on to the next-worst paper. COI, the same-country
+cap and the junior/out-of-area caps all still bind -- the F3 relaxations are
+deliberately not reused, because a bonus slot is not worth breaking composition
+policy for. The stage is purely additive: every phase above is frozen, so
+--reviewers-per-paper stays the number the shortage, relaxation and criteria
+reports are judged against, and no paper is ever short because a surplus slot
+went elsewhere.
 
 The same-country cap (--same-country-cap N, default 2) is the one constraint no
 phase releases: a paper whose authors are mostly from country C holds at most N
@@ -118,6 +131,13 @@ DEFAULT_PAPER_CACHE = cache_path("paper_fingerprints.json")
 # Reviews a reserve reviewer takes, matching estimate_reserve_need.py's
 # --reviews-per-reserve, which is what the cohort was sized against.
 DEFAULT_RESERVE_CAP = 4
+
+# Reviewer slots every paper is guaranteed. estimate_reserve_need.py imports
+# this, so the cohort is always sized against the number an assignment aims for.
+DEFAULT_REVIEWERS_PER_PAPER = 5
+
+# Extra reviewers one paper may gain from capacity the fill phases left unspent.
+DEFAULT_SURPLUS_PER_PAPER = 1
 
 # A per-paper limit that doesn't name a paper doesn't bind it. An int keeps every
 # comparison integral -- no float('inf') leaking into counters or reports -- and
@@ -494,6 +514,101 @@ def assignment_phase(
     return held, prefs, cap
 
 
+def spare_capacity(reviewer_cap: dict[str, int], used: dict[str, int]) -> int:
+    """Reviewer-slots the whole candidate pool has still not spent."""
+    # .get, not [], so this stays callable with a plain dict for `used`.
+    return sum(reviewer_cap[e] - used.get(e, 0) for e in reviewer_cap)
+
+
+def distribute_surplus(
+    pids: list[int],
+    paper_prefs: dict[int, list[str]],
+    released_prefs: dict[int, list[str]],
+    slates: dict[int, list[str]],
+    used: dict[str, int],
+    reviewer_cap: dict[str, int],
+    score_lookup: dict[tuple[str, int], float],
+    assigned_via: dict[tuple[int, str], str],
+    capped: CappedClasses = (),
+    *,
+    base_target: dict[int, int],
+    surplus_per_paper: int,
+) -> tuple[dict[int, list[str]], int]:
+    """Spend leftover reviewer capacity on the worst-matched papers.
+
+    Returns ({pid: [added email]}, rounds run). Like every phase above it this
+    accumulates into `slates`, `used` and `assigned_via`, so it is purely
+    additive: earlier assignments are frozen and cannot be bumped, and the
+    class caps keep counting what those phases already placed.
+
+    Only papers that REACHED their base target are offered a slot. One that is
+    still short failed the fill phases minutes ago under these same rules and a
+    strictly larger pool, so an offer could not place anything — and skipping
+    them is what makes "no paper is short because a surplus slot went
+    elsewhere" true by construction rather than by convention.
+
+    Each round re-ranks by current match goodness and offers the worst `spare`
+    papers one reviewer each, gated pool first and area-released second. A paper
+    that places nothing is dropped for good: it has exhausted its preference
+    list, and since capacity only shrinks while its own slate stands still, it
+    would fail identically forever. Dropping it is precisely what lets the slot
+    flow on to the next-worst paper. So a round that places nothing is still
+    productive, and "stop when a round places nothing" would abandon capacity in
+    exactly the case this stage exists for. Termination does not need it: every
+    round either drops a paper or spends a slot, both finite and monotone.
+    """
+    added: dict[int, list[str]] = {}
+    rounds = 0
+    if surplus_per_paper <= 0:
+        return added, rounds
+
+    candidates = set(reviewer_cap)
+    eligible = {
+        pid for pid in pids
+        if base_target[pid] > 0 and len(slates[pid]) >= base_target[pid]
+    }
+    while eligible:
+        spare = spare_capacity(reviewer_cap, used)
+        if spare <= 0:
+            break
+        goodness = paper_goodness(slates, score_lookup)
+        # Worst-matched first, pid breaking ties — match_goodness_report's order.
+        ranked = sorted(
+            (pid for pid in eligible if goodness[pid] is not None),
+            key=lambda pid: (goodness[pid], pid),
+        )
+        chosen = ranked[:spare]
+        if not chosen:
+            break
+        rounds += 1
+        # `chosen`, not every pid: assignment_phase uses its pid list only to
+        # build prefs and seed the class counts, and a paper it never lists
+        # could not have been touched anyway. That keeps a round proportional
+        # to the papers actually being offered a slot.
+        held, _, _ = assignment_phase(
+            chosen, paper_prefs, {pid: 1 for pid in chosen}, slates, used,
+            reviewer_cap, score_lookup, candidates, capped,
+        )
+        still = [pid for pid in chosen if not held[pid]]
+        held_r: dict[int, list[str]] = {}
+        if still:
+            held_r, _, _ = assignment_phase(
+                still, released_prefs, {pid: 1 for pid in still}, slates, used,
+                reviewer_cap, score_lookup, candidates, capped,
+            )
+        for label, batch in (("surplus", held), ("surplus (area released)", held_r)):
+            for pid, emails in batch.items():
+                for e in emails:
+                    assigned_via[(pid, e)] = label
+                    added.setdefault(pid, []).append(e)
+        for pid in chosen:
+            if not held[pid] and not held_r.get(pid):
+                eligible.discard(pid)
+            elif len(slates[pid]) >= base_target[pid] + surplus_per_paper:
+                eligible.discard(pid)
+    return added, rounds
+
+
 def seniority_report(
     papers: list[dict],
     slates: dict[int, list[str]],
@@ -652,6 +767,81 @@ def match_goodness_report(papers: list[dict], goodness: dict[int, float | None])
 
 UNRELAXED_PHASES = frozenset({"senior anchor", "fill"})
 
+# Surplus picks get their own report, so the relaxation report stays a list of
+# papers that struggled. "surplus (area released)" really is an area release,
+# but on a slot the paper was never owed — reporting it as a relaxation would
+# imply a shortfall that does not exist.
+SURPLUS_PHASES = frozenset({"surplus", "surplus (area released)"})
+
+
+def surplus_report(
+    papers: list[dict],
+    added: dict[int, list[str]],
+    base_goodness: dict[int, float | None],
+    goodness: dict[int, float | None],
+    score_lookup: dict[tuple[str, int], float],
+    reviewers_by_email: dict,
+    seniority: dict[str, dict] | None,
+    assigned_via: dict[tuple[int, str], str],
+    *,
+    reviewers_per_paper: int,
+    surplus_per_paper: int,
+    spare_before: int,
+    spare_after: int,
+    rounds: int,
+) -> int:
+    """Itemize the papers that gained a reviewer from leftover capacity.
+
+    Prints goodness over the base slate beside goodness over the full slate,
+    because they move in opposite directions to the intuition: goodness is a
+    MEAN, and a surplus reviewer almost always scores below the slate that
+    outbid it, so a paper that gained a review shows a LOWER full-slate figure.
+    The base figure is the one comparable against a run with the stage off.
+    Returns the number of reviewer-slots placed.
+    """
+    placed = sum(len(v) for v in added.values())
+    print("\n=== Surplus distribution report ===")
+    if surplus_per_paper <= 0:
+        print(
+            f"Stage off (--surplus-per-paper 0). {spare_before} reviewer-slot(s) "
+            f"left unspent beyond the {reviewers_per_paper}-reviewer target."
+        )
+        return placed
+    print(
+        f"Target: up to {surplus_per_paper} reviewer(s) beyond the "
+        f"{reviewers_per_paper}-slot slate, offered worst-matched paper first in "
+        f"re-ranked rounds, under the same COI, same-country and junior/out-of-area "
+        f"rules as the main fill (the almost-not pools are not used). The base slate "
+        f"stays the contract: no paper is short, relaxed, or over target because of "
+        f"a surplus slot."
+    )
+    print(
+        f"Leftover capacity: {spare_before} slot(s) before, {spare_after} after. "
+        f"{placed} reviewer(s) placed on {len(added)} paper(s) over {rounds} round(s)."
+    )
+    if not placed:
+        return placed
+
+    by_pid = {p["pid"]: p for p in papers}
+    for pid in sorted(added, key=lambda pid: (base_goodness[pid], pid)):
+        p = by_pid[pid]
+        before, after = base_goodness[pid], goodness[pid]
+        print(f"  {before:.3f} -> {after:.3f}  [{pid}] {p['title']}")
+        for e in added[pid]:
+            r = reviewers_by_email[e]
+            cls = seniority[e]["class"] if seniority and e in seniority else "?"
+            label = assigned_via.get((pid, e), "surplus")
+            print(f"      {label:28s} {score_lookup[(e, pid)]:.3f}  {r.name} <{e}>  [{cls}]  ({r.primary})")
+
+    befores = [base_goodness[pid] for pid in added]
+    afters = [goodness[pid] for pid in added]
+    print(
+        f"Mean over the {len(added)} boosted paper(s): "
+        f"{sum(befores) / len(befores):.3f} base slate -> "
+        f"{sum(afters) / len(afters):.3f} with the surplus reviewer(s)."
+    )
+    return placed
+
 
 def relaxation_report(
     skipped: list[dict],
@@ -690,7 +880,7 @@ def relaxation_report(
         entries = []
         for e in paper_held[pid]:
             label = assigned_via.get((pid, e), "fill")
-            if label not in UNRELAXED_PHASES:
+            if label not in UNRELAXED_PHASES and label not in SURPLUS_PHASES:
                 entries.append((score_lookup[(e, pid)], e, label))
         missing = paper_target[pid] - len(paper_held[pid])
         if entries or missing > 0:
@@ -1143,7 +1333,14 @@ def main() -> int:
         "--paper-cache", default=DEFAULT_PAPER_CACHE, help="path to the writable paper fingerprint cache"
     )
     parser.add_argument(
-        "--reviewers-per-paper", type=int, default=6, help="target reviewer slots per paper (default: 6)"
+        "--reviewers-per-paper", type=int, default=DEFAULT_REVIEWERS_PER_PAPER,
+        help="target reviewer slots per paper (default: %(default)s)"
+    )
+    parser.add_argument(
+        "--surplus-per-paper", type=int, default=DEFAULT_SURPLUS_PER_PAPER, metavar="N",
+        help="extra reviewer(s) a paper may gain once the fill phases leave capacity "
+             "unspent, offered to the worst-matched papers first (default: %(default)s). "
+             "0 leaves the leftover capacity unspent"
     )
     parser.add_argument("--light-cap", type=int, default=7, help="max papers per light PC member (default: 7)")
     parser.add_argument("--full-cap", type=int, default=15, help="max papers per full PC member (default: 15)")
@@ -1270,6 +1467,8 @@ def main() -> int:
 
     if args.reviewers_per_paper < 0:
         parser.error("--reviewers-per-paper must be non-negative")
+    if args.surplus_per_paper < 0:
+        parser.error("--surplus-per-paper must be non-negative")
     if args.light_cap < 0 or args.full_cap < 0:
         parser.error("--light-cap and --full-cap must be non-negative")
     if args.area_weight <= 0:
@@ -1436,7 +1635,10 @@ def main() -> int:
     capped_pids = {pid for c in countries for pid in c.papers}
 
     pids = [p["pid"] for p in papers]
+    # The base target, and the only target any report or the exit code judges.
+    # A surplus slot rides on top of it and is never folded in.
     paper_target = {pid: args.reviewers_per_paper for pid in pids}
+    slate_ceiling = args.reviewers_per_paper + args.surplus_per_paper
     paper_prefs = {
         pid: [email for email, _ in sorted(eligible_by_pid[pid], key=lambda es: -es[1])] for pid in pids
     }
@@ -1472,6 +1674,9 @@ def main() -> int:
             for e in emails:
                 assigned_via[(pid, e)] = "fill (area released)"
         paper_held = slates
+        # No seniority data means no junior/out-of-area classes to cap, which is
+        # this branch's existing contract; the same-country cap still binds.
+        surplus_capped = country_capped
     else:
         pools, missing = seniority_pools(
             set(reviewer_cap), seniority, args.almost_senior_window,
@@ -1529,6 +1734,9 @@ def main() -> int:
             pools.almost_not_juniors | pools.almost_not_out_of_area, country_capped,
         )
         paper_held = slates
+        # Surplus picks answer to F1's caps, not F3's relaxations: an extra
+        # reviewer nobody was owed is not worth breaking composition policy for.
+        surplus_capped = capped
 
         # Self-check the class-cap logic where its guarantee holds: the F1
         # pass, in F1 terms (its own prefs, caps, and targets).
@@ -1551,6 +1759,20 @@ def main() -> int:
             crossing, held2, cap2, fill_target, score_lookup, capped, f1_seed
         ) if crossing else 0
 
+    # Spend whatever capacity the fill phases left on the worst-matched papers.
+    # Purely additive — every phase above is frozen — so the F1 self-check and
+    # every base-target report still describe the assignment they described
+    # before this ran. Snapshot goodness first: it is the figure comparable
+    # against a run with the stage off, and paper_held mutates underneath.
+    base_goodness = paper_goodness(paper_held, score_lookup)
+    spare_before = spare_capacity(reviewer_cap, used)
+    surplus_added, surplus_rounds = distribute_surplus(
+        pids, paper_prefs, released_prefs, paper_held, used, reviewer_cap,
+        score_lookup, assigned_via, surplus_capped,
+        base_target=paper_target, surplus_per_paper=args.surplus_per_paper,
+    )
+    spare_after = spare_capacity(reviewer_cap, used)
+
     # --- Report ---------------------------------------------------------------
     goodness = paper_goodness(paper_held, score_lookup)
     reviewer_load: dict[str, int] = defaultdict(int)
@@ -1558,10 +1780,14 @@ def main() -> int:
         pid = p["pid"]
         assigned = sorted(paper_held[pid], key=lambda e: -score_lookup[(e, pid)])
         under_filled = "  *** UNDER-FILLED ***" if len(assigned) < args.reviewers_per_paper else ""
+        # Mutually exclusive with the marker above, and the count stays the base
+        # target: assign_area_chairs.py reads this line's leading number.
+        extra = len(assigned) - args.reviewers_per_paper
+        surplus_note = f"  (+{extra} surplus)" if extra > 0 else ""
         g = goodness[pid]
         print(f"\n=== [{pid}] {p['title']}")
         print(f"    topics: {', '.join(p.get('topics', []))}")
-        print(f"    assigned {len(assigned)} of {args.reviewers_per_paper} requested{under_filled}")
+        print(f"    assigned {len(assigned)} of {args.reviewers_per_paper} requested{surplus_note}{under_filled}")
         print(f"    match goodness: {'n/a' if g is None else format(g, '.3f')}")
         for rank, email in enumerate(assigned, 1):
             r = reviewers_by_email[email]
@@ -1605,12 +1831,15 @@ def main() -> int:
             if sum(1 for e in paper_held[pid] if e in pools.out_of_area and e not in pools.almost_not_out_of_area)
             > args.max_out_of_area
         )
-        over_target = sum(1 for pid in pids if len(paper_held[pid]) > args.reviewers_per_paper)
         seniority_summary = (
             f"seniority: {ok_n} papers OK, {deg_n} degraded, {brk_n} breaking — see report above; "
-            f"{deep_junior_over} papers over the junior policy, {deep_oob_over} over the "
-            f"out-of-area policy, and {over_target} over target — should always be 0; "
+            f"{deep_junior_over} papers over the junior policy and {deep_oob_over} over the "
+            f"out-of-area policy — should always be 0; "
         )
+
+    # Not inside the seniority block: the surplus stage runs on both paths, so
+    # the ceiling it must respect has to be checked on both too.
+    over_ceiling = sum(1 for pid in pids if len(paper_held[pid]) > slate_ceiling)
 
     country_summary = ""
     if not args.no_same_country_cap:
@@ -1639,6 +1868,13 @@ def main() -> int:
     )
 
     match_goodness_report(papers, goodness)
+    surplus_placed = surplus_report(
+        papers, surplus_added, base_goodness, goodness, score_lookup,
+        reviewers_by_email, seniority, assigned_via,
+        reviewers_per_paper=args.reviewers_per_paper,
+        surplus_per_paper=args.surplus_per_paper,
+        spare_before=spare_before, spare_after=spare_after, rounds=surplus_rounds,
+    )
     n_excluded, n_relaxed = relaxation_report(
         skipped_papers, papers, paper_held, paper_target, assigned_via,
         goodness, score_lookup, reviewers_by_email, seniority,
@@ -1657,6 +1893,9 @@ def main() -> int:
         f"{seniority_summary}"
         f"{country_summary}"
         f"{coauthor_summary}"
+        f"{surplus_placed} surplus reviewer(s) on {len(surplus_added)} paper(s) with "
+        f"{spare_after} reviewer-slot(s) still unused, {over_ceiling} papers over the "
+        f"{slate_ceiling}-reviewer ceiling — should always be 0; "
         f"{n_excluded} papers excluded and {n_relaxed} relaxed — see relaxation report above; "
         f"{total_missing} reviewer-slot(s) unfilled — see shortage report above).",
         file=sys.stderr,
