@@ -464,7 +464,7 @@ def main() -> int:
 
     if args.verify:
         # Imported lazily: it pulls in requests, and the default run is offline.
-        from resolve_trc_members import DEFAULT_DELAY, Dblp
+        from scripts.resolve_trc_members import DEFAULT_DELAY, Dblp
 
         client = Dblp(
             args.profile_cache, args.search_cache,
