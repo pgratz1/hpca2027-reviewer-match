@@ -14,7 +14,7 @@ retryable, while successful and confirmed-missing results are reused.
 
 from __future__ import annotations
 
-from reviewer_match.paths import assignment_path, cache_path, curated_path, input_path, report_path, smoke_cache_path
+from reviewer_match.paths import assignment_path, cache_path, curated_path, input_path, report_path
 
 import argparse
 import datetime

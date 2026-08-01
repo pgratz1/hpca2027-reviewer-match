@@ -90,12 +90,11 @@ contains spaces and parentheses — always quote it in shell commands).
   in a form, so `src/reviewer_match/reserve_reviewers.py` derives their areas from the HotCRP
   topics of the submissions they authored — without areas the area gate matches
   them to nothing. `src/reviewer_match/roster.py` maps role → loader for all three scripts.
-- `make smoke` rehearses a full assignment over **both** rosters:
-  `scripts/make_smoke_dataset.py` writes `data/cache/smoke/hpca2027-data-smoke.json` (a seeded 30% of the
-  registered papers *marked withdrawn*, standing in for those never submitted),
-  then `scripts/assign_reviewers.py --include-reserves --reserve-cap 6` runs over it. The
-  self-checks — over cap, blocking pairs, junior/out-of-area — are the pass/fail;
-  the shortage count is a capacity statement, not a verdict.
+  Both artifacts are now **prerequisites of the main assignment**, which runs
+  `--include-reserves --reserve-cap $(RESERVE_CAP)` (default 6) — so `make
+  reserves` has to have run first, and a missing one is a named error pointing
+  at it rather than make's "No rule to make target". `make RESERVE_CAP=off`
+  assigns from the PC alone.
 - **COI is a floor, not a full picture.** `paper_matching.own_paper_conflicts`
   treats authors, contacts, and `reserve_reviewer` nominees as conflicted, because
   authors have not yet been asked to declare conflicts against recently promoted
@@ -139,7 +138,7 @@ contains spaces and parentheses — always quote it in shell commands).
   `scripts/enrich_publications.py`, `scripts/assign_reviewers.py`, `scripts/score_papers.py`,
   `scripts/nearest_neighbors.py`, `scripts/compare_abstract_rankings.py`,
   `scripts/score_abstract_evaluation.py`, `scripts/assign_area_chairs.py`,
-  `scripts/estimate_reserve_need.py`, `scripts/build_reserve_reviewer_info.py`, `scripts/make_smoke_dataset.py`,
+  `scripts/estimate_reserve_need.py`, `scripts/build_reserve_reviewer_info.py`,
   `scripts/resolve_reserve_pids.py`, `scripts/build_dblp_snapshot_cache.py`,
   `scripts/build_affiliation_countries.py`,
   `scripts/resolve_trc_members.py`, `scripts/main.py`.
@@ -236,7 +235,9 @@ contains spaces and parentheses — always quote it in shell commands).
    were generic while `.cn`/`.kr` were not, and US did not appear once among
    the majority countries.
 4. **Assignment**: `scripts/assign_reviewers.py` — phased paper-proposing deferred
-   acceptance aiming for a full slate of `--reviewers-per-paper`
+   acceptance over the PC **and, under `--include-reserves`, the reserve roster**
+   (the pool `make` now assigns from: 236 full + 223 light + 233 reserve),
+   aiming for a full slate of `--reviewers-per-paper`
    (`DEFAULT_REVIEWERS_PER_PAPER`, **5** since submissions closed) plus ≥1
    senior, ≤1 junior, and ≤3 out-of-area per paper. Papers that can't fill
    release constraints in order: area gate → junior/out-of-area caps
@@ -272,12 +273,15 @@ every non-withdrawn record with ≥1 author, a title of ≥1 word that isn't jus
 HotCRP `status` stays `draft` until the submission deadline, so content, not
 status, distinguishes a real registration from a placeholder. `--paper-policy
 submitted` selects exactly `status == "submitted"` regardless of any other
-field — switch to it (`make PAPER_POLICY=submitted`) once submissions are in;
-only under that policy must reviewer assignments be full and area-chair
-assignments cover the same paper set. `--paper-policy complete` retains the
-former pre-registration completeness checks in `*-complete.txt` artifacts.
-The registered set (~1400 papers) far exceeds total PC review capacity, so
-large shortage/relaxation reports are expected, not a bug.
+field; only under that policy must reviewer assignments be full and area-chair
+assignments cover the same paper set. **Submissions are in (1,192 papers), so
+the Makefile's `PAPER_POLICY` now defaults to `submitted`** and feeds every
+paper-side target — the scripts' own default stays `registered`, and `make
+PAPER_POLICY=registered` restores the pre-deadline view. `--paper-policy
+complete` retains the former pre-registration completeness checks in
+`*-complete.txt` artifacts. The registered set (~1400 papers) far exceeds total
+PC review capacity, so large shortage/relaxation reports are expected under
+that policy, not a bug.
 
 ## Data, caches, and PII
 

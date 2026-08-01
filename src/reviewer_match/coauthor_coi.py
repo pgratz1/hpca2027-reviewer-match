@@ -33,7 +33,7 @@ invisible either way; this does not replace the sweep.
 
 from __future__ import annotations
 
-from .paths import assignment_path, cache_path, curated_path, input_path, report_path, smoke_cache_path
+from .paths import assignment_path, cache_path, curated_path, input_path, report_path
 
 import datetime
 import json

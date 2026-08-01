@@ -5,9 +5,6 @@ data/curated/*
 !data/curated/.gitkeep
 data/cache/*
 !data/cache/.gitkeep
-!data/cache/smoke/
-data/cache/smoke/*
-!data/cache/smoke/.gitkeep
 
 # Generated human-facing artifacts.
 outputs/assignments/*

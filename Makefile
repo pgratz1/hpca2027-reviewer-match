@@ -1,6 +1,7 @@
 # HPCA 2027 reviewer-paper matching pipeline.
 #
 #   make                  rebuild stale state; final output below ASSIGNMENT_DIR
+#                         (submitted papers, PC + reserves — needs make reserves)
 #   make reserve-need     size the reserve-reviewer shortfall
 #   make reserve-info     resolve recruited reserves' DBLP identities
 #   make reserve-pids     propose DBLP pages for unresolved reserves
@@ -10,7 +11,6 @@
 #   make coauthor-coi     report conflicts DBLP implies but nobody declared
 #   make affiliation-countries  resolve affiliation countries
 #   make reserves         enrich, fingerprint, and classify reserves
-#   make smoke            rehearse a full assignment with withdrawn papers
 #   make clean            remove assignment outputs only
 #   make clean-fingerprints  remove embedding caches, never DBLP caches
 
@@ -19,7 +19,13 @@ ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 export PYTHONPATH := $(ROOT)/src:$(ROOT):$(PYTHONPATH)
 RUN = $(PYTHON) -m
 
-PAPER_POLICY ?= registered
+# Submissions are in, so the paper set is the submitted one and the reserve
+# roster is part of the pool. PAPER_POLICY=registered goes back to the
+# pre-deadline view; RESERVE_CAP=off assigns from the PC alone.
+PAPER_POLICY ?= submitted
+RESERVE_CAP ?= 6
+RESERVE_FLAG = $(if $(filter off,$(RESERVE_CAP)),,\
+                    --include-reserves --reserve-cap $(RESERVE_CAP))
 SAME_COUNTRY_CAP ?= 2
 REGION_FLAG = $(if $(filter off,$(SAME_COUNTRY_CAP)),--no-same-country-cap,\
                    --same-country-cap $(SAME_COUNTRY_CAP))
@@ -78,7 +84,7 @@ EMBED_LIBS = src/reviewer_match/fingerprint.py src/reviewer_match/specter2_model
 
 .DELETE_ON_ERROR:
 .PHONY: all enrich area-chairs reserve-need reserve-info reserve-pids reserves \
-	dblp-snapshot coauthor-coi affiliation-countries pc-roster duplicates smoke \
+	dblp-snapshot coauthor-coi affiliation-countries pc-roster duplicates \
 	complete-papers area-chairs-complete clean clean-fingerprints
 
 all: $(SENIORITY) enrich $(FINGERPRINTS)
@@ -132,24 +138,8 @@ reserves:
 	$(RUN) scripts.classify_reviewers --role reserve --csv $(RESERVE_INFO) --data $(DATA) \
 		$(PC_CHECK) --out $(RESERVE_SENIORITY)
 
-SMOKE_WITHDRAWN = 0.30
-SMOKE_RESERVE_CAP = 6
-SMOKE_DATA = $(CACHE_DIR)/smoke/hpca2027-data-smoke-$(SMOKE_WITHDRAWN).json
-SMOKE_OUT = $(ASSIGNMENT_DIR)/assignment-smoke-$(SMOKE_WITHDRAWN).txt
-
-$(SMOKE_DATA): scripts/make_smoke_dataset.py src/reviewer_match/paper_matching.py $(DATA)
-	$(RUN) scripts.make_smoke_dataset --data $(DATA) --out $@ --fraction $(SMOKE_WITHDRAWN)
-
 affiliation-countries: scripts/build_affiliation_countries.py src/reviewer_match/affiliation_country.py
 	$(RUN) scripts.build_affiliation_countries --data $(DATA)
-
-smoke: $(SMOKE_DATA)
-	@test -f $(RESERVE_FINGERPRINTS) || { echo "ERROR: $(RESERVE_FINGERPRINTS) not found; run make reserves first" >&2; exit 1; }
-	@test -f $(PCINFO) || { echo "ERROR: $(PCINFO) not found; download it from HotCRP, or pass PC_CHECK=--no-pc-check" >&2; exit 1; }
-	$(RUN) scripts.assign_reviewers --data $(SMOKE_DATA) --csv "$(CSV)" \
-		--include-reserves --reserve-cap $(SMOKE_RESERVE_CAP) \
-		$(PC_CHECK) $(REGION_FLAG) $(COAUTHOR_COI) > $(SMOKE_OUT)
-	@echo "wrote $(SMOKE_OUT)" >&2
 
 complete-papers: $(COMPLETE_ASSIGNMENT)
 
@@ -174,6 +164,12 @@ $(COAUTHORS):
 	@echo "       assign without the co-author COI: make COAUTHOR_COI=--no-coauthor-coi" >&2
 	@exit 1
 
+# Same idiom, for the reserve half of the pool: only reached when missing.
+$(RESERVE_FINGERPRINTS) $(RESERVE_SENIORITY):
+	@echo "ERROR: $@ not found; run make reserves, or" >&2
+	@echo "       assign from the PC alone: make RESERVE_CAP=off" >&2
+	@exit 1
+
 $(SENIORITY): scripts/classify_reviewers.py $(REVIEWER_LIBS) $(CSV_DEP) $(OVERRIDES) $(PCDB) $(PCINFO)
 	$(RUN) scripts.classify_reviewers --csv "$(CSV)" $(PC_CHECK) --out $@
 
@@ -182,10 +178,11 @@ $(FINGERPRINTS): $(PUBLICATIONS) $(ABSTRACTS) scripts/build_fingerprints.py $(RE
 
 $(ASSIGNMENT): scripts/assign_reviewers.py src/reviewer_match/paper_matching.py \
 	scripts/classify_reviewers.py src/reviewer_match/affiliation_country.py \
-	src/reviewer_match/coauthor_coi.py \
-	$(EMBED_LIBS) $(FINGERPRINTS) $(SENIORITY) $(DATA) $(COAUTHORS)
+	src/reviewer_match/coauthor_coi.py src/reviewer_match/reserve_reviewers.py \
+	$(EMBED_LIBS) $(FINGERPRINTS) $(SENIORITY) $(DATA) $(COAUTHORS) \
+	$(if $(RESERVE_FLAG),$(RESERVE_FINGERPRINTS) $(RESERVE_SENIORITY))
 	$(RUN) scripts.assign_reviewers --paper-policy $(PAPER_POLICY) --csv "$(CSV)" \
-		$(PC_CHECK) $(REGION_FLAG) $(COAUTHOR_COI) > $@
+		$(RESERVE_FLAG) $(PC_CHECK) $(REGION_FLAG) $(COAUTHOR_COI) > $@
 
 $(COMPLETE_ASSIGNMENT): scripts/assign_reviewers.py src/reviewer_match/paper_matching.py \
 	scripts/classify_reviewers.py src/reviewer_match/affiliation_country.py \

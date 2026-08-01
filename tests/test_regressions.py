@@ -31,7 +31,6 @@ from scripts import compare_abstract_rankings
 from reviewer_match import dblp
 from scripts import enrich_publications
 from scripts import estimate_reserve_need
-from scripts import make_smoke_dataset
 from reviewer_match import paper_matching
 from reviewer_match import fingerprint
 from reviewer_match import paths
@@ -1869,59 +1868,6 @@ class ReserveReviewerLoaderTests(unittest.TestCase):
 
         # And the conflict outranks the area match on their own paper.
         self.assertEqual([], paper_matching.eligible_scores(own, *args, area_gate=True))
-
-
-class SmokeDatasetTests(unittest.TestCase):
-    """make_smoke_dataset.py: the seeded stand-in for papers never submitted."""
-
-    def test_the_same_seed_reproduces_the_same_draw(self):
-        # Two assignment runs are only comparable if the paper set holds still.
-        pids = list(range(1, 101))
-        a = make_smoke_dataset.choose_withdrawn(pids, 0.30, 20260730)
-        b = make_smoke_dataset.choose_withdrawn(pids, 0.30, 20260730)
-        self.assertEqual(a, b)
-        self.assertEqual(30, len(a))
-        self.assertNotEqual(a, make_smoke_dataset.choose_withdrawn(pids, 0.30, 1))
-
-    def test_the_draw_does_not_depend_on_input_order(self):
-        # The export's order is incidental; sorting first keeps the draw a
-        # function of the seed and the paper set alone.
-        pids = list(range(1, 51))
-        forward = make_smoke_dataset.choose_withdrawn(pids, 0.20, 7)
-        backward = make_smoke_dataset.choose_withdrawn(list(reversed(pids)), 0.20, 7)
-        self.assertEqual(forward, backward)
-
-    def test_withdrawn_papers_are_marked_not_deleted(self):
-        # Marking means paper_matching's own _is_withdrawn drops them, so the
-        # smoke run exercises the real selection path rather than a test filter.
-        tmp = Path(tempfile.mkdtemp())
-        data, out = tmp / "in.json", tmp / "out.json"
-        papers = [
-            {"pid": i, "title": f"Paper {i}", "abstract": "One sentence. And two.",
-             "authors": [{"email": f"a{i}@x.edu"}], "topics": ["Memory Systems"],
-             "status": "draft"}
-            for i in range(1, 11)
-        ]
-        data.write_text(json.dumps(papers), encoding="utf-8")
-        argv = ["make_smoke_dataset.py", "--data", str(data), "--out", str(out),
-                "--fraction", "0.30", "--seed", "5"]
-        with mock.patch.object(sys, "argv", argv), contextlib.redirect_stderr(io.StringIO()):
-            make_smoke_dataset.main()
-
-        written = json.loads(out.read_text())
-        self.assertEqual(10, len(written), "papers must be marked, never dropped")
-        self.assertEqual(3, sum(1 for p in written if p.get("withdrawn")))
-        self.assertEqual(7, len(paper_matching.load_papers(str(out), paper_policy="registered")))
-
-    def test_it_refuses_to_overwrite_the_real_export(self):
-        tmp = Path(tempfile.mkdtemp())
-        data = tmp / "in.json"
-        data.write_text("[]", encoding="utf-8")
-        argv = ["make_smoke_dataset.py", "--data", str(data), "--out", str(data)]
-        with mock.patch.object(sys, "argv", argv), \
-                contextlib.redirect_stderr(io.StringIO()), \
-                self.assertRaises(SystemExit):
-            make_smoke_dataset.main()
 
 
 class OwnPaperConflictTests(unittest.TestCase):

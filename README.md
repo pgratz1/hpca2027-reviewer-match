@@ -74,9 +74,13 @@ required (a topicless paper simply relies on the area-gate release).
 Two alternate policies stay available: `--paper-policy submitted` selects
 exactly the records whose HotCRP `status` is `submitted`, ignoring all other
 metadata, and requires that every such paper receive a full reviewer slate
-and one area chair — switch to it once submissions are in. `--paper-policy
-complete` retains the older title-≥3-words/abstract/topics/authors and
-withdrawn checks.
+and one area chair. `--paper-policy complete` retains the older
+title-≥3-words/abstract/topics/authors and withdrawn checks.
+
+**Submissions are in, so `make` now passes `--paper-policy submitted`** —
+`PAPER_POLICY` defaults to `submitted` and feeds every paper-side target. The
+scripts themselves still default to `registered` when run by hand; `make
+PAPER_POLICY=registered` restores the pre-deadline view.
 
 ## Start-to-finish workflow
 
@@ -115,14 +119,16 @@ The equivalent manual commands, in dependency order:
 ```bash
 ~/envs/hpca-matching/bin/python3 -m scripts.classify_reviewers
 ~/envs/hpca-matching/bin/python3 -m scripts.build_fingerprints
-~/envs/hpca-matching/bin/python3 -m scripts.assign_reviewers > outputs/assignments/assignment.txt
+~/envs/hpca-matching/bin/python3 -m scripts.assign_reviewers \
+    --paper-policy submitted --include-reserves --reserve-cap 6 \
+    > outputs/assignments/assignment.txt
 ```
 
-Once HotCRP has real submissions, build the submitted-only assignment with
-`make PAPER_POLICY=submitted` (and `make PAPER_POLICY=submitted area-chairs`);
-`PAPER_POLICY` defaults to `registered` and feeds both targets. To reproduce
-the former completeness-based selection in its own artifacts, without
-overwriting `outputs/assignments/assignment.txt`:
+`make` passes those last two flags for you: the assignment runs over the
+submitted set with **both** rosters, reserves capped at `RESERVE_CAP` (default
+6), which means `make reserves` has to have run first. `make RESERVE_CAP=off`
+assigns from the PC alone. To reproduce the former completeness-based selection
+in its own artifacts, without overwriting `outputs/assignments/assignment.txt`:
 
 ```bash
 make complete-papers          # outputs/assignments/assignment-complete.txt
@@ -435,7 +441,6 @@ rule needs: no cap is ever exceeded, which must always be 0.
 ~/envs/hpca-matching/bin/python3 -m scripts.assign_reviewers --same-country-cap 3
 ~/envs/hpca-matching/bin/python3 -m scripts.assign_reviewers --no-same-country-cap
 make SAME_COUNTRY_CAP=3
-make smoke SAME_COUNTRY_CAP=off
 ```
 
 #### Derived co-author COI
@@ -773,33 +778,15 @@ drop every reserve row on any run that didn't also load them.
 Seniority uses the identical thresholds and the identical `classify()` as the
 PC, including the promote-only PCDB service overrides, so a reserve's
 senior/typical/junior/out-of-area class means exactly what a PC member's does.
-`scripts/assign_reviewers.py` knows `tier == "reserve"` takes `--reserve-cap` papers
-(default 4, matching `scripts/estimate_reserve_need.py`); reserves are not yet loaded
-into the assignment itself.
-
-### `scripts/make_smoke_dataset.py` + `make smoke` — rehearse a full assignment
-
-Registration is open, so the export holds far more papers than will ever need
-reviewing — about 1,414 pass the `registered` policy against a pool that can
-cover roughly 1,070. Assigning against all of them only measures the shortfall.
-
-`scripts/make_smoke_dataset.py` writes `data/cache/smoke/hpca2027-data-smoke.json`, a copy with a seeded
-random `--fraction` (default **0.30**) of the selectable papers *marked
-withdrawn* — not deleted, so `paper_matching`'s own `_is_withdrawn` drops them
-through the same path a real withdrawal takes. The seed is fixed, so two runs
-compare against an unmoving paper set; change `--fraction` to 0.25 for a tighter
-case.
-
-`make smoke` then runs the assignment over that set with **both** rosters
-(`--include-reserves`), reserves capped at 6 papers, writing
-`assignment-smoke.txt`.
+`scripts/assign_reviewers.py` loads them under `--include-reserves`, where
+`tier == "reserve"` takes `--reserve-cap` papers (default 4, matching
+`scripts/estimate_reserve_need.py`). The real assignment runs with them at a cap
+of 6; `make reserves` has to have run first, since the pool needs
+`data/cache/reserve_fingerprints.json` and `outputs/reports/reserve_seniority.csv`.
 ```bash
-make smoke                       # 30% withdrawn, reserves at 6
-make smoke SMOKE_WITHDRAWN=0.25  # tighter
+~/envs/hpca-matching/bin/python3 -m scripts.assign_reviewers \
+    --paper-policy submitted --include-reserves --reserve-cap 6
 ```
-**Read the self-checks, not the shortage count.** Over-cap, blocking pairs and
-the junior/out-of-area policy counts must all be 0 — those are the pass/fail. A
-shortage is a statement about capacity, not about the matcher.
 
 ### `scripts/audit_reserve_identities.py` — cross-check the reserves' DBLP pages
 

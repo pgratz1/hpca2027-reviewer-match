@@ -7,7 +7,7 @@ located by substring match on the header rather than by exact name.
 
 from __future__ import annotations
 
-from .paths import assignment_path, cache_path, curated_path, input_path, report_path, smoke_cache_path
+from .paths import assignment_path, cache_path, curated_path, input_path, report_path
 
 import csv
 import datetime

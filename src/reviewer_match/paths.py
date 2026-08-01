@@ -14,7 +14,6 @@ DATA_DIR = PROJECT_ROOT / "data"
 INPUT_DIR = DATA_DIR / "inputs"
 CURATED_DIR = DATA_DIR / "curated"
 CACHE_DIR = DATA_DIR / "cache"
-SMOKE_CACHE_DIR = CACHE_DIR / "smoke"
 
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
 ASSIGNMENT_DIR = OUTPUT_DIR / "assignments"
@@ -32,10 +31,6 @@ def curated_path(name: str) -> str:
 
 def cache_path(name: str) -> str:
     return str(CACHE_DIR / name)
-
-
-def smoke_cache_path(name: str) -> str:
-    return str(SMOKE_CACHE_DIR / name)
 
 
 def assignment_path(name: str) -> str:

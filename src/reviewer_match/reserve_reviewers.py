@@ -21,7 +21,7 @@ build_fingerprints.py, classify_reviewers.py — takes a reserve unchanged.
 
 from __future__ import annotations
 
-from .paths import assignment_path, cache_path, curated_path, input_path, report_path, smoke_cache_path
+from .paths import assignment_path, cache_path, curated_path, input_path, report_path
 
 import csv
 from collections import Counter, defaultdict
