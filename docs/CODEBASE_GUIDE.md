@@ -31,8 +31,10 @@ HotCRP JSON --> src/reviewer_match/paper_matching.py --> data/cache/paper_finger
 `make` encodes this dependency order and is the preferred entry point.
 After the reviewer assignment exists, `make area-chairs` runs the independent
 chair enrichment, fingerprint, and assignment path.
-Both honor `PAPER_POLICY` (default `registered`); use
-`make PAPER_POLICY=submitted` once HotCRP has real submissions.
+Both honor `PAPER_POLICY` (currently defaulting to `submitted`); use
+`make PAPER_POLICY=registered` to restore the pre-deadline registered-paper view.
+The default reviewer assignment includes the prepared reserve roster at cap 6;
+`make RESERVE_CAP=off` assigns from the PC alone.
 `make complete-papers` and `make area-chairs-complete` produce separate
 legacy-policy artifacts without overwriting those defaults.
 
@@ -58,7 +60,7 @@ legacy-policy artifacts without overwriting those defaults.
 - `scripts/build_fingerprints.py` orchestrates researcher fetching and encoding for reviewer and area-chair form schemas. Researchers without usable recent publications receive an area-only vector. Cache entries are keyed by normalized email and record schema/provenance, selected publications and abstracts, PID presence, and DBLP fetch completeness. `--no-abstracts` builds a controlled title-only baseline when paired with a separate cache path.
 - `src/reviewer_match/paper_matching.py` represents each paper with two documents: title plus abstract, and the topic list. Their pooled vector is normalized, so dot products against reviewer vectors are cosine similarities.
 - `scripts/assign_area_chairs.py` independently assigns reviewer-assigned papers to accepted area chairs. It reuses the publication and paper caches, excludes HotCRP conflicts, and maximizes global SPECTER2 affinity within a ±10% chair-load band or the closest integer balance when that band is infeasible.
-- `scripts/estimate_reserve_need.py` sizes the reserve-reviewer cohort and uses no embeddings at all: arithmetic over the selected papers and the PC's per-member caps, producing a floor on the cohort size, since it ignores COI and the area gate. Recruiting the reserves is done outside this repo, so nothing here consumes a reserve list.
+- `scripts/estimate_reserve_need.py` sizes the reserve-reviewer cohort and uses no embeddings at all: arithmetic over the selected papers and the PC's per-member caps, producing a floor on the cohort size, since it ignores COI and the area gate. Recruiting happens outside this repo; once recruited, `make reserves` enriches, fingerprints, and classifies the reserve roster, and the default assignment includes it.
 - `data/curated/publication_exclusions.csv` provides reversible per-email DOI exclusions before reviewer or area-chair publication embeddings are pooled; the exclusion list participates in fingerprint freshness through the filtered publication content.
 
 All fingerprint caches store versioned provenance keys. Paper keys cover title, abstract, topics, area weight, and model identifiers. Researcher keys cover identity, declared metadata, the post-exclusion publication set and abstracts, embedding policy, and model identifiers. Legacy entries rebuild once, and transient DBLP/API failures remain marked for retry. `make clean-fingerprints` remains available when an explicit full rebuild is desired.

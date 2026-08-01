@@ -99,6 +99,8 @@ def main() -> int:
     parser.add_argument("--no-pc-check", action="store_true",
                         help="skip the HotCRP PC-membership check on the rosters")
     args = parser.parse_args()
+    if args.coauthor_years <= 0:
+        parser.error("--coauthor-years must be greater than 0")
 
     try:
         coauthors = coauthor_coi.load_coauthors(args.coauthor_cache)

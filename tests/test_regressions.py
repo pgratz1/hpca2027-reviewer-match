@@ -36,6 +36,7 @@ from reviewer_match import fingerprint
 from reviewer_match import paths
 from scripts import resolve_trc_members
 from scripts import score_abstract_evaluation
+from scripts import audit_coauthor_conflicts
 from scripts import audit_pc_roster
 from scripts import find_duplicate_accounts
 from reviewer_match import pc_membership
@@ -254,6 +255,56 @@ class AreaChairAssignmentTests(unittest.TestCase):
     def test_load_bounds_use_closest_integer_balance_when_tolerance_is_infeasible(self):
         self.assertEqual((3, 4), assign_area_chairs.load_bounds(56, 15, 0.10))
 
+    def test_zero_load_chair_is_reported_without_crashing(self):
+        chairs = [
+            area_chairs.AreaChair(
+                email=email, first=email[0].upper(), last="Chair", dblp_url="",
+                pid=f"1/{email[0].upper()}", affiliation="Example", primary="Memory",
+                secondary="", tertiary="", keywords="",
+            )
+            for email in ("a@example.com", "b@example.com")
+        ]
+        paper = {
+            "pid": 1, "title": "A submitted paper", "abstract": "One. Two.",
+            "topics": ["Memory"], "authors": [{"email": "author@example.com"}],
+            "status": "submitted", "pc_conflicts": {},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            assignment = Path(tmp) / "assignment.txt"
+            assignment.write_text(
+                "=== [1] A submitted paper\n    assigned 1 of 1 requested\n",
+                encoding="utf-8",
+            )
+            data = Path(tmp) / "papers.json"
+            data.write_text(json.dumps([paper]), encoding="utf-8")
+            chair_cache = Path(tmp) / "chairs.json"
+            chair_cache.write_text(json.dumps({
+                "a@example.com": {"vector": [1.0, 0.0]},
+                "b@example.com": {"vector": [0.0, 1.0]},
+            }), encoding="utf-8")
+            paper_cache = Path(tmp) / "papers-cache.json"
+            paper_cache.write_text(json.dumps({"1": {"vector": [1.0, 0.0]}}), encoding="utf-8")
+
+            argv = [
+                "assign_area_chairs.py", "--reviewer-assignment", str(assignment),
+                "--data", str(data), "--paper-policy", "submitted",
+                "--fingerprint-cache", str(chair_cache), "--paper-cache", str(paper_cache),
+                "--no-coauthor-coi",
+            ]
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(assign_area_chairs, "load_roster", return_value=chairs),
+                mock.patch.object(assign_area_chairs, "build_paper_fingerprints"),
+                mock.patch.object(assign_area_chairs, "chair_conflicts", return_value={1: set()}),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                self.assertEqual(0, assign_area_chairs.main())
+
+        self.assertIn("assigned 0 papers; mean affinity n/a", stdout.getvalue())
+        self.assertIn("loads 0..1", stderr.getvalue())
+
 
 class FingerprintCacheTests(unittest.TestCase):
     def test_publication_exclusions_are_normalized_and_person_specific(self):
@@ -373,6 +424,72 @@ class FingerprintCacheTests(unittest.TestCase):
                 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                     self.assertEqual(build_fingerprints.main(), 0)
                 load_model.assert_not_called()
+
+    def test_confirmed_no_content_removes_a_stale_fingerprint(self):
+        r = reviewer(pid=None)
+        r.primary = r.secondary = r.tertiary = r.keywords = ""
+        with tempfile.TemporaryDirectory() as td:
+            cache = Path(td) / "fingerprints.json"
+            cache.write_text(json.dumps({
+                r.email: {
+                    "vector": [1.0] * 768,
+                    "fingerprint_key": "stale",
+                    "dblp_fetch_complete": True,
+                }
+            }), encoding="utf-8")
+            with (
+                mock.patch.object(build_fingerprints, "load_roster", return_value=[r]),
+                mock.patch.object(build_fingerprints, "load_cache", return_value={}),
+                mock.patch.object(build_fingerprints, "load_colleague_cache", return_value={}),
+                mock.patch.object(
+                    build_fingerprints.specter2_model, "load_model",
+                    return_value=(FakeTokenizer(), object()),
+                ),
+                mock.patch.object(
+                    build_fingerprints.specter2_model, "encode_texts",
+                    return_value=np.empty((0, 768), dtype=np.float32),
+                ),
+                mock.patch.object(sys, "argv", [
+                    "build_fingerprints.py", "--fingerprint-cache", str(cache),
+                    "--device", "cpu",
+                ]),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                self.assertEqual(0, build_fingerprints.main())
+            self.assertNotIn(r.email, json.loads(cache.read_text(encoding="utf-8")))
+
+    def test_transient_fetch_failure_preserves_last_known_good_fingerprint(self):
+        r = reviewer()
+        with tempfile.TemporaryDirectory() as td:
+            cache = Path(td) / "fingerprints.json"
+            original = {
+                "vector": [1.0] * 768,
+                "fingerprint_key": "old",
+                "dblp_fetch_complete": True,
+            }
+            cache.write_text(json.dumps({r.email: original}), encoding="utf-8")
+
+            def fail_fetch(pids, **kwargs):
+                kwargs["on_error"](pids[0], RuntimeError("temporary"))
+                return {}
+
+            with (
+                mock.patch.object(build_fingerprints, "load_roster", return_value=[r]),
+                mock.patch.object(build_fingerprints, "load_cache", return_value={}),
+                mock.patch.object(build_fingerprints, "load_colleague_cache", return_value={}),
+                mock.patch.object(build_fingerprints, "fetch_titles_for_pids", side_effect=fail_fetch),
+                mock.patch.object(sys, "argv", [
+                    "build_fingerprints.py", "--fingerprint-cache", str(cache),
+                    "--device", "cpu",
+                ]),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                self.assertEqual(0, build_fingerprints.main())
+            retained = json.loads(cache.read_text(encoding="utf-8"))[r.email]
+            self.assertEqual(original["vector"], retained["vector"])
+            self.assertFalse(retained["dblp_fetch_complete"])
 
 
 class PaperCacheTests(unittest.TestCase):
@@ -523,6 +640,41 @@ class ReportingAndValidationTests(unittest.TestCase):
     def test_negative_csv_override_cap_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "non-negative"):
             _parse_override_cap("person@example.com", "-1")
+
+    def test_nonpositive_coauthor_windows_are_rejected_before_io(self):
+        commands = (
+            assign_reviewers,
+            assign_area_chairs,
+            audit_coauthor_conflicts,
+            build_dblp_snapshot_cache,
+        )
+        for command in commands:
+            for value in ("0", "-1"):
+                with self.subTest(command=command.__name__, value=value):
+                    with (
+                        mock.patch.object(sys, "argv", [
+                            f"{command.__name__}.py", "--coauthor-years", value,
+                        ]),
+                        contextlib.redirect_stderr(io.StringIO()),
+                        self.assertRaises(SystemExit) as raised,
+                    ):
+                        command.main()
+                    self.assertEqual(2, raised.exception.code)
+
+    def test_negative_reserve_cap_is_rejected_before_io(self):
+        with (
+            mock.patch.object(sys, "argv", ["assign_reviewers.py", "--reserve-cap", "-1"]),
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            assign_reviewers.main()
+        self.assertEqual(2, raised.exception.code)
+
+    def test_zero_reserve_cap_is_valid(self):
+        self.assertEqual(0, assign_reviewers.reviewer_paper_cap(
+            type("Reserve", (), {"override_cap": None, "tier": "reserve"})(),
+            light_cap=7, full_cap=15, reserve_cap=0,
+        ))
 
     def test_fetch_failure_is_not_an_identity_stub_candidate(self):
         # A PCDB-promoted reviewer without a PID still needs identity work.
@@ -2014,6 +2166,15 @@ class CoauthorConflictTests(unittest.TestCase):
         return index, coauthor_coi.derive_conflicts(
             [paper], index, author_names or {}
         )
+
+    def test_nonpositive_window_is_rejected_by_core_index(self):
+        for years in (0, -1):
+            with self.subTest(years=years), self.assertRaisesRegex(
+                ValueError, "greater than 0"
+            ):
+                coauthor_coi.build_index(
+                    [self.reviewer], self.coauthors, years=years, current_year=2026
+                )
 
     def test_a_recent_coauthor_on_a_paper_conflicts_the_reviewer(self):
         p = self.paper([("Charles", "Babbage", "cb@y.edu")])

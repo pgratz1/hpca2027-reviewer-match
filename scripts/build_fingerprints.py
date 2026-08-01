@@ -364,6 +364,12 @@ def main() -> int:
             # zero vector that would silently score against every paper.
             if not reviewer_weights:
                 no_content.append(r)
+                # A previous run may have cached a usable vector before the
+                # roster or publication evidence changed. Confirmed absence of
+                # all content invalidates that vector; leaving it in the cache
+                # would make the warning below false and keep the researcher
+                # eligible for assignment with stale evidence.
+                fp_cache.pop(r.email, None)
                 continue
             fingerprint_vec = fp.pool(reviewer_vectors, reviewer_weights)
             if n_titles_used[i] == 0:

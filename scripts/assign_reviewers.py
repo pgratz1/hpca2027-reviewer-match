@@ -1490,12 +1490,16 @@ def main() -> int:
         parser.error("--surplus-per-paper must be non-negative")
     if args.light_cap < 0 or args.full_cap < 0:
         parser.error("--light-cap and --full-cap must be non-negative")
+    if args.reserve_cap < 0:
+        parser.error("--reserve-cap must be non-negative")
     if args.area_weight <= 0:
         parser.error("--area-weight must be greater than 0")
     if args.min_seniors < 0 or args.max_juniors < 0 or args.max_out_of_area < 0:
         parser.error("--min-seniors, --max-juniors, and --max-out-of-area must be non-negative")
     if args.same_country_cap < 0:
         parser.error("--same-country-cap must be non-negative")
+    if args.coauthor_years <= 0:
+        parser.error("--coauthor-years must be greater than 0")
     if not 0 < args.region_majority <= 1:
         parser.error("--region-majority must be greater than 0 and at most 1")
     if not 0 <= args.region_min_resolved <= 1:

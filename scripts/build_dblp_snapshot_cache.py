@@ -319,6 +319,8 @@ def main() -> int:
     parser.add_argument("--role", action="append", choices=ROLES, default=None,
                         help="roster to cover; repeatable (default: all three)")
     args = parser.parse_args()
+    if args.coauthor_years <= 0:
+        parser.error("--coauthor-years must be greater than 0")
 
     if not Path(args.snapshot).exists():
         raise SystemExit(f"{args.snapshot}: not found")

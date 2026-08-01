@@ -292,6 +292,8 @@ def main() -> int:
         parser.error("--load-tolerance must be at least 0 and less than 1")
     if args.area_weight <= 0:
         parser.error("--area-weight must be greater than 0")
+    if args.coauthor_years <= 0:
+        parser.error("--coauthor-years must be greater than 0")
 
     try:
         assigned_pids = load_reviewer_assigned_pids(args.reviewer_assignment)
@@ -407,11 +409,15 @@ def main() -> int:
     for email in sorted(chair_emails, key=lambda e: (chairs_by_email[e].name.lower(), e)):
         chair = chairs_by_email[email]
         pids = sorted(by_chair[email])
-        mean_score = sum(scores[(pid, email)] for pid in pids) / len(pids)
+        mean_score = (
+            sum(scores[(pid, email)] for pid in pids) / len(pids)
+            if pids else None
+        )
+        mean_label = "n/a" if mean_score is None else f"{mean_score:.3f}"
         print(f"\n=== {chair.name} <{email}>")
         print(
             f"    primary area: {chair.primary}\n"
-            f"    assigned {loads[email]} papers; mean affinity {mean_score:.3f}"
+            f"    assigned {loads[email]} papers; mean affinity {mean_label}"
         )
         for pid in pids:
             paper = papers_by_pid[pid]
@@ -435,7 +441,8 @@ def main() -> int:
 
     print(
         f"Done. Assigned {len(papers)} papers to {len(chair_emails)} area chairs; "
-        f"loads {min(loads.values())}..{max(loads.values())}, "
+        f"loads {min(loads[email] for email in chair_emails)}.."
+        f"{max(loads[email] for email in chair_emails)}, "
         f"mean affinity {sum(assigned_scores) / len(assigned_scores):.3f}.",
         file=sys.stderr,
     )

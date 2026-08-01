@@ -215,6 +215,8 @@ def build_index(
     `dblp.filter_by_years`' convention: the cutoff is
     `current_year - years + 1`, so five years in 2026 means 2022 onwards.
     """
+    if years <= 0:
+        raise ValueError("co-author window must be greater than 0 years")
     if current_year is None:
         current_year = datetime.date.today().year
     cutoff = current_year - years + 1
