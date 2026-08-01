@@ -46,15 +46,46 @@ def load_roster(
     `pcinfo_path` reaches all three loaders, because the HotCRP membership
     check is only worth anything if every role is held to it — one branch
     skipping the gate is how two scripts end up with different committees.
+
+    The area-chair roster is the one that draws on the others: an account HotCRP
+    tags `~~area-chairs` but that never returned the form still needs a DBLP
+    identity and areas before it can be fingerprinted, and the PC form or the
+    reserve roster already has them. Composing that here rather than inside
+    `load_area_chairs` keeps the heavier roster reads out of the loader and out
+    of `audit_pc_roster.py`, which wants the form exactly as submitted.
     """
     if role not in ROLES:
         raise ValueError(f"unknown role {role!r}; expected one of {', '.join(ROLES)}")
     path = csv_path or DEFAULT_ROSTERS[role]
     if role == "area-chair":
-        return load_area_chairs(path, pcinfo_path=pcinfo_path)
+        return load_area_chairs(
+            path, pcinfo_path=pcinfo_path,
+            supplement=_profile_donors(data_path, pcinfo_path) if pcinfo_path else None,
+        )
     if role == "reserve":
         return load_reserve_reviewers(path, data_path, pcinfo_path=pcinfo_path)
     return load_reviewers(path, pcinfo_path=pcinfo_path)
+
+
+def _profile_donors(data_path: str, pcinfo_path: str | None):
+    """Roster records a tagged-but-formless area chair can borrow a profile from.
+
+    Read without the membership gate: these are only ever a source of someone's
+    DBLP page and areas, never a claim that they are on the committee, and the
+    tag already settled that. A roster that cannot be read is not fatal — the
+    tagged person is simply reported as unprofiled, which is the same outcome as
+    being on no roster at all.
+    """
+    donors = []
+    for load, args in (
+        (load_reviewers, (DEFAULT_CSV,)),
+        (load_reserve_reviewers, (DEFAULT_INFO, data_path)),
+    ):
+        try:
+            donors.extend(load(*args, pcinfo_path=None))
+        except (FileNotFoundError, ValueError):
+            continue
+    return donors
 
 
 def role_label(role: str) -> str:

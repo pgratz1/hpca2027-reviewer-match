@@ -32,7 +32,9 @@ import numpy as np
 
 from reviewer_match import coauthor_coi
 from reviewer_match import fingerprint as fp
-from reviewer_match.area_chairs import AreaChair, load_area_chairs
+from reviewer_match import pc_membership
+from reviewer_match.area_chairs import AreaChair
+from reviewer_match.roster import load_roster
 from reviewer_match.paper_matching import (
     PAPER_POLICIES,
     build_paper_fingerprints,
@@ -273,6 +275,17 @@ def main() -> int:
         "--no-coauthor-identity", action="store_true",
         help="ignore DBLP's homonym numbering (see assign_reviewers.py)"
     )
+    parser.add_argument(
+        "--pcinfo", default=pc_membership.DEFAULT_PCINFO,
+        help="HotCRP user export; also the source of the `~~area-chairs` tag, "
+             "which adds chairs the acceptance form never collected "
+             "(default: %(default)s)"
+    )
+    parser.add_argument(
+        "--no-pc-check", action="store_true",
+        help="skip the HotCRP membership check, for an export staler than the "
+             "rosters. Also disables tag-sourced chairs, since both read the export"
+    )
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
     if not 0 <= args.load_tolerance < 1:
@@ -310,7 +323,17 @@ def main() -> int:
             return 1
     papers = [papers_by_pid[pid] for pid in assigned_pids]
 
-    chairs = load_area_chairs(args.csv)
+    # Through load_roster, not load_area_chairs, so the chair pool here is the
+    # same one enrichment and fingerprinting built: the form plus any account
+    # HotCRP tags `~~area-chairs` whose profile another roster can supply.
+    try:
+        chairs = load_roster(
+            "area-chair", args.csv, args.data,
+            pcinfo_path=None if args.no_pc_check else args.pcinfo,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
     chairs_by_email: dict[str, AreaChair] = {chair.email: chair for chair in chairs}
     chair_cache = fp.load_fingerprint_cache(args.fingerprint_cache)
     chair_emails = sorted(email for email in chairs_by_email if email in chair_cache)

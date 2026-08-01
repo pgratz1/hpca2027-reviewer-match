@@ -43,6 +43,7 @@ ASSIGNMENT_DIR = outputs/assignments
 CSV = $(INPUT_DIR)/HPCA'27 PC Member Acceptance Form (Responses) - Form Responses 1.csv
 CSV_DEP = data/inputs/HPCA'27\ PC\ Member\ Acceptance\ Form\ (Responses)\ -\ Form\ Responses\ 1.csv
 AREA_CHAIR_CSV = $(INPUT_DIR)/Area Chair Acceptance Form (Responses) - Form Responses 1.csv
+AREA_CHAIR_CSV_DEP = data/inputs/Area\ Chair\ Acceptance\ Form\ (Responses)\ -\ Form\ Responses\ 1.csv
 DATA = $(INPUT_DIR)/hpca2027-data.json
 PCINFO = $(INPUT_DIR)/hpca2027-pcinfo.csv
 PCDB = $(INPUT_DIR)/PCDB_with_emails.csv
@@ -77,6 +78,10 @@ AREA_CHAIR_YEARS = 10
 # The derived co-author COI is on by default, like the same-country cap. Set
 # COAUTHOR_COI=--no-coauthor-coi to assign without it.
 COAUTHOR_COI ?=
+
+# Area chairs are kept out of the reviewer pool by default. Set
+# AREA_CHAIR_CHECK=--no-area-chair-exclusion to assign papers to them anyway.
+AREA_CHAIR_CHECK ?=
 
 REVIEWER_LIBS = src/reviewer_match/reviewers.py src/reviewer_match/dblp.py \
 	src/reviewer_match/pc_membership.py src/reviewer_match/paths.py
@@ -179,17 +184,23 @@ $(FINGERPRINTS): $(PUBLICATIONS) $(ABSTRACTS) scripts/build_fingerprints.py $(RE
 $(ASSIGNMENT): scripts/assign_reviewers.py src/reviewer_match/paper_matching.py \
 	scripts/classify_reviewers.py src/reviewer_match/affiliation_country.py \
 	src/reviewer_match/coauthor_coi.py src/reviewer_match/reserve_reviewers.py \
+	src/reviewer_match/area_chairs.py src/reviewer_match/pc_membership.py \
 	$(EMBED_LIBS) $(FINGERPRINTS) $(SENIORITY) $(DATA) $(COAUTHORS) \
+	$(AREA_CHAIR_CSV_DEP) $(PCINFO) \
 	$(if $(RESERVE_FLAG),$(RESERVE_FINGERPRINTS) $(RESERVE_SENIORITY))
 	$(RUN) scripts.assign_reviewers --paper-policy $(PAPER_POLICY) --csv "$(CSV)" \
-		$(RESERVE_FLAG) $(PC_CHECK) $(REGION_FLAG) $(COAUTHOR_COI) > $@
+		--area-chair-csv "$(AREA_CHAIR_CSV)" \
+		$(RESERVE_FLAG) $(PC_CHECK) $(AREA_CHAIR_CHECK) $(REGION_FLAG) $(COAUTHOR_COI) > $@
 
 $(COMPLETE_ASSIGNMENT): scripts/assign_reviewers.py src/reviewer_match/paper_matching.py \
 	scripts/classify_reviewers.py src/reviewer_match/affiliation_country.py \
 	src/reviewer_match/coauthor_coi.py \
-	$(EMBED_LIBS) $(FINGERPRINTS) $(SENIORITY) $(DATA) $(COAUTHORS)
+	src/reviewer_match/area_chairs.py src/reviewer_match/pc_membership.py \
+	$(EMBED_LIBS) $(FINGERPRINTS) $(SENIORITY) $(DATA) $(COAUTHORS) \
+	$(AREA_CHAIR_CSV_DEP) $(PCINFO)
 	$(RUN) scripts.assign_reviewers --paper-policy complete --csv "$(CSV)" \
-		$(PC_CHECK) $(REGION_FLAG) $(COAUTHOR_COI) > $@
+		--area-chair-csv "$(AREA_CHAIR_CSV)" \
+		$(PC_CHECK) $(AREA_CHAIR_CHECK) $(REGION_FLAG) $(COAUTHOR_COI) > $@
 
 clean:
 	rm -f $(ASSIGNMENT) $(AREA_CHAIR_ASSIGNMENT) $(COMPLETE_ASSIGNMENT) $(AREA_CHAIR_COMPLETE)

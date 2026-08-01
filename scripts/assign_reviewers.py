@@ -29,6 +29,11 @@ published with one of its authors (`coauthor_coi`, on by default, disable with
 matters because the sweep has not reached the reviewers added most recently —
 see the two conflict reports the run prints.
 
+Area chairs are excluded from the pool outright (--no-area-chair-exclusion turns
+it off): an area chair chairs papers and reviews none. Membership is the union
+of HotCRP's `~~area-chairs` tag and the area-chair acceptance form, because each
+source has been observed to catch people the other misses.
+
 Seniority constraints (needs reviewer_seniority.csv from classify_reviewers.py;
 skip them all with --no-seniority): every paper should get at least
 --min-seniors senior reviewers, at most --max-juniors juniors, and at most
@@ -118,6 +123,8 @@ from reviewer_match.paper_matching import (
     load_papers,
 )
 from reviewer_match import pc_membership
+from reviewer_match.area_chairs import area_chair_emails, drop_area_chairs
+from reviewer_match.roster import DEFAULT_AREA_CHAIR_CSV
 from reviewer_match.reserve_reviewers import DEFAULT_DATA as DEFAULT_RESERVE_DATA
 from reviewer_match.reserve_reviewers import DEFAULT_INFO as DEFAULT_RESERVE_INFO
 from reviewer_match.reserve_reviewers import load_reserve_reviewers
@@ -1432,6 +1439,18 @@ def main() -> int:
         help="calendar years of co-authorship that conflict (default: %(default)s)"
     )
     parser.add_argument(
+        "--area-chair-csv", default=DEFAULT_AREA_CHAIR_CSV,
+        help="area-chair acceptance form, one half of the area-chair check "
+             "(default: %(default)s)"
+    )
+    parser.add_argument(
+        "--no-area-chair-exclusion", action="store_true",
+        help="assign papers to area chairs too. On by default: an area chair "
+             "chairs papers and reviews none, and the check is the union of the "
+             "HotCRP `~~area-chairs` tag and the acceptance form, because each "
+             "source catches people the other misses"
+    )
+    parser.add_argument(
         "--coauthor-cache", default=coauthor_coi.DEFAULT_COAUTHORS,
         help="co-author cache from make dblp-snapshot (default: %(default)s)"
     )
@@ -1560,6 +1579,45 @@ def main() -> int:
               f"{len(reserve_fp)} fingerprinted, {len(reserve_seniority)} classified "
               f"(cap {args.reserve_cap} papers each)", file=sys.stderr)
 
+    # An area chair chairs papers and reviews none. This has to run after the
+    # reserve merge above, not inside the PC load: a reserve can be an area
+    # chair too (one is today), and `reviewers_by_email.update(...)` would put
+    # them straight back. Everything downstream draws from this dict, so it is
+    # the one place the rule needs stating.
+    area_chairs_dropped: list[str] = []
+    if not args.no_area_chair_exclusion:
+        index = None
+        try:
+            index = pc_membership.load_pc_accounts(args.pcinfo)
+        except (FileNotFoundError, ValueError) as exc:
+            # --no-pc-check exists for an export staler than the rosters, which
+            # is about pruning people off a roster. A stale export's tags are
+            # still good evidence someone is a chair, so the tag half survives
+            # it; only a missing or truncated file forces the form-only reading.
+            print(f"WARNING: {exc.__class__.__name__} reading {args.pcinfo}; the "
+                  f"area-chair check falls back to the acceptance form alone and "
+                  f"cannot see the `~~area-chairs` tag", file=sys.stderr)
+        try:
+            chair_emails = area_chair_emails(
+                args.area_chair_csv, pcinfo_path=args.pcinfo if index else None
+            )
+        except FileNotFoundError:
+            parser.error(
+                f"{args.area_chair_csv}: not found, so area chairs cannot be kept out "
+                f"of the reviewer pool; download the acceptance form, or pass "
+                f"--no-area-chair-exclusion to assign papers to them anyway"
+            )
+        area_chairs_dropped = drop_area_chairs(reviewers_by_email, chair_emails, index)
+        if area_chairs_dropped:
+            shown = ", ".join(area_chairs_dropped[:5])
+            more = f", +{len(area_chairs_dropped) - 5} more" if len(area_chairs_dropped) > 5 else ""
+            print(f"Area chairs excluded from the reviewer pool: "
+                  f"{len(area_chairs_dropped)} of {len(chair_emails)} ({shown}{more})",
+                  file=sys.stderr)
+        else:
+            print(f"Area-chair check: none of the {len(chair_emails)} area chairs "
+                  f"was in the reviewer pool", file=sys.stderr)
+
     candidate_emails = [e for e in reviewer_fp if e in reviewers_by_email]
     candidate_matrix = np.array([reviewer_fp[e]["vector"] for e in candidate_emails], dtype=np.float32)
 
@@ -1612,6 +1670,16 @@ def main() -> int:
             reviewer_cap[email] = reviewer_paper_cap(
                 reviewers_by_email[email], args.light_cap, args.full_cap, args.reserve_cap
             )
+
+    if area_chairs_dropped:
+        # On stdout as well as stderr: assignment.txt is the archived artifact,
+        # and every other hard filter leaves its evidence there.
+        print(f"\n=== Area chairs excluded from the reviewer pool ===")
+        print(f"{len(area_chairs_dropped)} area chair(s) hold no reviews, by the rule "
+              f"that an area chair chairs papers and reviews none. Membership is the "
+              f"union of the HotCRP `~~area-chairs` tag and the acceptance form.")
+        for email in area_chairs_dropped:
+            print(f"  {email}")
 
     report_conflict_coverage(papers, reviewers_by_email)
     if coauthor_index is not None:
@@ -1866,6 +1934,11 @@ def main() -> int:
     coauthor_summary = "" if args.no_coauthor_coi else (
         f"{coauthor_violations} co-authored assignments — should always be 0; "
     )
+    chairs_assigned = sum(1 for email in reviewer_load if email in set(area_chairs_dropped))
+    area_chair_summary = "" if args.no_area_chair_exclusion else (
+        f"{len(area_chairs_dropped)} area chair(s) excluded from the pool, "
+        f"{chairs_assigned} still assigned — should always be 0; "
+    )
 
     match_goodness_report(papers, goodness)
     surplus_placed = surplus_report(
@@ -1893,6 +1966,7 @@ def main() -> int:
         f"{seniority_summary}"
         f"{country_summary}"
         f"{coauthor_summary}"
+        f"{area_chair_summary}"
         f"{surplus_placed} surplus reviewer(s) on {len(surplus_added)} paper(s) with "
         f"{spare_after} reviewer-slot(s) still unused, {over_ceiling} papers over the "
         f"{slate_ceiling}-reviewer ceiling — should always be 0; "

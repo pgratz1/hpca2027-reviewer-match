@@ -185,7 +185,7 @@ def missing_category(acct, declined, by_tokens, by_local) -> tuple[str, str]:
         return "sysadmin", "administrative account"
     if acct.disabled:
         return "disabled", "account is disabled"
-    if any(t.endswith("area-chairs") for t in tags):
+    if acct.is_area_chair:
         return "area-chair", "tagged as an area chair"
 
     hits = by_tokens.get(acct.tokens) or by_local.get(acct.local) or []
@@ -228,6 +228,67 @@ def collect_missing(index, form_csv, ac_csv, upload_path, data_path,
             "category": category, "detail": detail,
         })
     return sorted(missing, key=lambda r: r["email"].lower())
+
+
+def collect_area_chairs(index, ac_csv, form_csv, data_path, reserve_info) -> dict:
+    """Reconcile HotCRP's `~~area-chairs` tag against the acceptance form.
+
+    A separate question from the two the rest of this script answers, and it
+    cannot ride on `missing_category`: that only ever sees PC accounts no roster
+    explains, and an area chair is almost always on some roster, so its
+    `area-chair` branch fires for nobody.
+
+    Both directions of disagreement cost something. Tagged with no form row and
+    the chair assignment has no research profile to work from, so they chair
+    nothing while also being barred from reviewing. On the form but untagged and
+    the tag half of the reviewer-pool exclusion cannot see them.
+    """
+    tagged = {a.email.lower() for a in index.accounts if a.is_area_chair}
+    chairs = load_area_chairs(ac_csv, pcinfo_path=None)
+    on_form = {c.email.lower() for c in chairs}
+
+    pool = {r.email.lower() for r in load_reviewers(form_csv, pcinfo_path=None)}
+    pool |= {r.email.lower() for r in reserve_reviewers.load_reserve_reviewers(
+        reserve_info, data_path, pcinfo_path=None)}
+
+    return {
+        "tagged": sorted(tagged),
+        "on_form": sorted(on_form),
+        "union": sorted(tagged | on_form),
+        "tag_only": sorted(tagged - on_form),
+        "form_only": sorted(on_form - tagged),
+        "in_reviewer_pool": sorted((tagged | on_form) & pool),
+    }
+
+
+def report_area_chairs(ac: dict) -> None:
+    """The tag-vs-form reconciliation, as advice rather than a verdict."""
+    print(f"\n{len(ac['union'])} area chairs: {len(ac['tagged'])} tagged "
+          f"`~~area-chairs` in the export, {len(ac['on_form'])} on the acceptance "
+          f"form.", file=sys.stderr)
+
+    if ac["tag_only"]:
+        print(f"    {len(ac['tag_only'])} tagged with no accepted form row. Their DBLP "
+              f"page and areas are borrowed from whichever other roster has them; "
+              f"anyone on no roster cannot chair at all:", file=sys.stderr)
+        for email in ac["tag_only"]:
+            print(f"        {email}", file=sys.stderr)
+    if ac["form_only"]:
+        print(f"    {len(ac['form_only'])} accepted but untagged. Tag them in HotCRP, "
+              f"or the tag half of the reviewer-pool exclusion cannot see them:",
+              file=sys.stderr)
+        for email in ac["form_only"]:
+            print(f"        {email}", file=sys.stderr)
+    if not ac["tag_only"] and not ac["form_only"]:
+        print("    The tag and the form agree exactly.", file=sys.stderr)
+
+    n = len(ac["in_reviewer_pool"])
+    if n:
+        # The tripwire: if this rises between exports, somebody was made a chair
+        # after being staffed with reviews, and the assignment is stale.
+        print(f"    {n} of them {'is' if n == 1 else 'are'} also on a reviewer roster; "
+              f"assign_reviewers.py drops {'it' if n == 1 else 'them'} from the pool. "
+              f"Re-run the assignment if it predates the tag.", file=sys.stderr)
 
 
 def report(pruned: list[dict], missing: list[dict], pruned_path: str,
@@ -331,9 +392,13 @@ def main() -> int:
     missing = collect_missing(index, args.csv, args.area_chair_csv, args.upload,
                               args.data, args.reserve_info)
 
+    area_chairs = collect_area_chairs(index, args.area_chair_csv, args.csv,
+                                      args.data, args.reserve_info)
+
     write_csv(args.pruned, PRUNED_FIELDS, pruned)
     write_csv(args.missing, MISSING_FIELDS, missing)
     report(pruned, missing, args.pruned, args.missing)
+    report_area_chairs(area_chairs)
     return 0
 
 

@@ -160,6 +160,22 @@ class Account:
         """
         return on_pc(self.roles) and not self.disabled
 
+    @property
+    def is_area_chair(self) -> bool:
+        """Tagged an area chair in HotCRP, and so barred from reviewing.
+
+        The tag is written `~~area-chairs` -- HotCRP's twiddle form, for a tag
+        only the chairs can see -- so the test is `endswith`, never `==`, which
+        would match nobody. Other twiddle tags exist on this export
+        (`~~rr-batch2`), so the leading marker cannot be assumed away.
+
+        A hypothetical `~~sub-area-chairs` would match too. That errs towards
+        excluding someone from the reviewer pool, which is the safe direction:
+        a withheld reviewer costs one slot out of thousands, while a missed
+        chair breaks the rule that an area chair reviews nothing.
+        """
+        return any(t.endswith("area-chairs") for t in self.tags.split())
+
 
 # ---------------------------------------------------------------------------
 # Name comparison (fuzzy; used by find_duplicate_accounts.py, not by the gate)

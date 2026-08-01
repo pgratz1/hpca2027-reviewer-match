@@ -217,6 +217,23 @@ contains spaces and parentheses — always quote it in shell commands).
    are not this one). Worth 3,473 pairs removed / 0 added, confirmation rate
    38% → 43%. **Never name the flagged names in a committed file** — the repo is
    public and naming them discloses who submitted.
+3c. **Area chairs are not reviewers** (`--no-area-chair-exclusion` is the off
+   switch; `make AREA_CHAIR_CHECK=--no-area-chair-exclusion`): every area chair
+   is removed from the pool before any phase runs. Membership is the **union of
+   HotCRP's `~~area-chairs` tag and the acceptance form** — 21 and 18 today,
+   union 21 — because each source has been seen to catch people the other
+   misses. Applied **after the reserve merge**, not to the PC roster alone: one
+   of the six excluded is a reserve, and `reviewers_by_email.update()` would put
+   them straight back. Resolved through `pc_membership`'s email → name →
+   local-part ladder, so a second address does not evade it. A missing
+   acceptance form is a **hard error** for the same reason a missing export is.
+   `Account.is_area_chair` is the single definition of the tag test — `endswith`,
+   never `==`, because HotCRP writes twiddle tags. The **chair roster follows the
+   tag too**: `load_area_chairs` takes a `supplement` of PC/reserve records so a
+   tagged account that never returned the form still chairs, borrowing its PID
+   and areas; `roster.load_roster` composes that, so enrich, fingerprint and
+   assign all see one roster. Anyone tagged and on no roster is reported, never
+   silently emitted.
 3b. **Same-country cap** (`--same-country-cap N`, **on by default at 2**): a
    paper whose authors are mostly from country C holds at most N reviewers
    affiliated in C. One rule for every country — **no country is named in the

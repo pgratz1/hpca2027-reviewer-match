@@ -2900,6 +2900,185 @@ class ReviewerLoaderTests(unittest.TestCase):
         self.assertNotIn("typo", stderr.getvalue())
 
 
+class AreaChairExclusionTests(unittest.TestCase):
+    """An area chair chairs papers and reviews none.
+
+    Membership is the union of HotCRP's `~~area-chairs` tag and the acceptance
+    form. On the live export those are 21 and 18 people; the union is 21 and
+    each source has been observed to catch someone the other missed, so neither
+    alone is sufficient.
+    """
+
+    AC_HEADERS = [
+        "Timestamp", "Please confirm your HotCRP email address",
+        "Area Chair membership", "First Name", "Last Name",
+        "Enter your DBLP Link", "institutional affiliation",
+        "primary area", "keywords", "secondary area",
+    ]
+    ACCEPT = "Yes, I accept the role of being an Area Chair for HPCA 2027"
+
+    def ac_row(self, email, membership=None, first="Ada", last="Lovelace"):
+        return ["07/01/2026 10:00:00", email, membership or self.ACCEPT, first, last,
+                "https://dblp.org/pid/1/Test", "Example", "Memory", "caches", "Security"]
+
+    def chair_emails(self, form_rows, accounts):
+        """The exclusion set, from a fake form and a fake user export."""
+        tmp = Path(tempfile.mkdtemp())
+        form = tmp / "chairs.csv"
+        with form.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(self.AC_HEADERS)
+            writer.writerows(form_rows)
+        pcinfo = write_pcinfo(tmp / "pcinfo.csv", accounts)
+        with contextlib.redirect_stderr(io.StringIO()):
+            return area_chairs.area_chair_emails(
+                str(form), str(tmp / "missing.csv"), pcinfo_path=str(pcinfo)
+            )
+
+    def person(self, email, first="Ada", last="Lovelace", tier="full"):
+        return Reviewer(
+            email=email, first=first, last=last, dblp_url="", pid="1/Test",
+            affiliation="Example", primary="Memory", secondary="", tertiary="",
+            keywords="", tier=tier, override_cap=None,
+        )
+
+    def test_the_tag_and_the_form_each_catch_someone_the_other_misses(self):
+        # The whole requirement in one test. Both directions have occurred on
+        # the live data: accounts tagged in HotCRP that never returned the form,
+        # and a form signatory the tag did not yet cover.
+        found = self.chair_emails(
+            [self.ac_row("onform@a.edu"), self.ac_row("both@a.edu")],
+            [pc_account("tagged@a.edu", "Grace", "Hopper", tags="pc-full ~~area-chairs"),
+             pc_account("both@a.edu", "Ada", "Lovelace", tags="pc-full ~~area-chairs"),
+             pc_account("onform@a.edu", "Ada", "Lovelace", tags="pc-full"),
+             pc_account("neither@a.edu", "Alan", "Turing", tags="pc-light")],
+        )
+        self.assertEqual({"onform@a.edu", "both@a.edu", "tagged@a.edu"}, found)
+
+    def test_a_twiddle_tag_is_recognised_and_another_twiddle_tag_is_not(self):
+        # HotCRP writes the chair-only tag as `~~area-chairs`, so the test is
+        # endswith, never ==, which would match nobody. `~~rr-batch2` on the
+        # real export proves other twiddle tags exist.
+        self.assertTrue(pc_membership.Account({"tags": "pc-full ~~area-chairs"}).is_area_chair)
+        self.assertFalse(pc_membership.Account({"tags": "pc-full ~~rr-batch2"}).is_area_chair)
+        self.assertFalse(pc_membership.Account({"tags": "pc-full"}).is_area_chair)
+        self.assertFalse(pc_membership.Account({"tags": ""}).is_area_chair)
+
+    def test_the_area_chair_tag_has_one_definition(self):
+        # pc_membership owns the test; audit_pc_roster.missing_category must not
+        # grow a second copy that can drift from it.
+        acct = pc_membership.Account(
+            {"email": "c@a.edu", "roles": "pc", "tags": "pc-full ~~area-chairs"}
+        )
+        self.assertTrue(acct.is_area_chair)
+        self.assertEqual("area-chair", audit_pc_roster.missing_category(acct, set(), {}, {})[0])
+
+    def test_an_area_chair_is_dropped_from_the_reviewer_pool(self):
+        pool = {"chair@a.edu": self.person("chair@a.edu"),
+                "reviewer@a.edu": self.person("reviewer@a.edu")}
+        dropped = area_chairs.drop_area_chairs(pool, {"chair@a.edu"})
+        self.assertEqual(["chair@a.edu"], dropped)
+        self.assertEqual(["reviewer@a.edu"], sorted(pool))
+
+    def test_a_reserve_area_chair_is_dropped_too(self):
+        # The ordering guard. Reserves are merged into reviewers_by_email AFTER
+        # the PC roster is built, so a filter applied to the PC load alone is
+        # undone by that merge. One person on the live data is exactly this
+        # case: tagged an area chair while sitting on the reserve roster.
+        pool = {"chair@a.edu": self.person("chair@a.edu", tier="reserve"),
+                "reserve@a.edu": self.person("reserve@a.edu", tier="reserve")}
+        dropped = area_chairs.drop_area_chairs(pool, {"chair@a.edu"})
+        self.assertEqual(["chair@a.edu"], dropped)
+        self.assertEqual(["reserve@a.edu"], sorted(pool))
+
+    def test_a_chair_reviewing_under_a_second_address_is_dropped(self):
+        # Accepting from one address while holding the HotCRP account under
+        # another is ordinary here. Comparing raw addresses would let a tagged
+        # chair keep reviewing under their other identity.
+        tmp = Path(tempfile.mkdtemp())
+        pcinfo = write_pcinfo(tmp / "pcinfo.csv", [
+            pc_account("ada@b.edu", "Ada", "Lovelace", tags="pc-full ~~area-chairs"),
+        ])
+        index = pc_membership.load_pc_accounts(str(pcinfo))
+        pool = {"ada@a.edu": self.person("ada@a.edu", "Ada", "Lovelace")}
+        dropped = area_chairs.drop_area_chairs(pool, {"ada@b.edu"}, index)
+        self.assertEqual(["ada@a.edu"], dropped)
+        self.assertEqual({}, pool)
+
+    def test_the_form_half_is_read_without_the_membership_gate(self):
+        # For a roster, a false prune drops someone no longer on the committee.
+        # For an exclusion set the safe direction inverts: a false prune
+        # silently readmits an area chair to the reviewer pool.
+        found = self.chair_emails(
+            [self.ac_row("chair@a.edu")],
+            [pc_account("someone@a.edu", "Alan", "Turing")],
+        )
+        self.assertIn("chair@a.edu", found)
+
+    def test_a_declined_area_chair_can_still_review(self):
+        # Reuses load_area_chairs' acceptance semantics rather than scraping
+        # addresses: declining to chair is not being a chair.
+        found = self.chair_emails(
+            [self.ac_row("no@a.edu", "No, I would prefer to be a PC full or light member")],
+            [pc_account("no@a.edu", "Ada", "Lovelace", tags="pc-full")],
+        )
+        self.assertEqual(set(), found)
+
+    def test_a_missing_area_chair_form_is_an_error_not_an_empty_set(self):
+        # Same reasoning as the missing user export: an empty exclusion set is
+        # indistinguishable from "no area chairs", and silently reinstates them.
+        tmp = Path(tempfile.mkdtemp())
+        pcinfo = write_pcinfo(tmp / "pcinfo.csv", [pc_account("a@a.edu")])
+        with self.assertRaises(FileNotFoundError):
+            area_chairs.area_chair_emails(
+                str(tmp / "absent.csv"), str(tmp / "missing.csv"), pcinfo_path=str(pcinfo)
+            )
+
+    def test_a_tagged_chair_with_no_form_row_borrows_a_profile(self):
+        # They are barred from reviewing either way, so without this they would
+        # do neither job. The profile comes from whichever roster has them --
+        # on the live data the PC form for one, the reserve roster for another.
+        tmp = Path(tempfile.mkdtemp())
+        form = tmp / "chairs.csv"
+        with form.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(self.AC_HEADERS)
+            writer.writerows([self.ac_row("onform@a.edu")])
+        pcinfo = write_pcinfo(tmp / "pcinfo.csv", [
+            pc_account("onform@a.edu", "Ada", "Lovelace", tags="pc-full ~~area-chairs"),
+            pc_account("tagged@a.edu", "Grace", "Hopper", tags="pc-full ~~area-chairs"),
+        ])
+        donor = self.person("tagged@a.edu", "Grace", "Hopper")
+        with contextlib.redirect_stderr(io.StringIO()):
+            chairs = area_chairs.load_area_chairs(
+                str(form), str(tmp / "missing.csv"),
+                pcinfo_path=str(pcinfo), supplement=[donor],
+            )
+        self.assertEqual(["onform@a.edu", "tagged@a.edu"], sorted(c.email for c in chairs))
+        borrowed = next(c for c in chairs if c.email == "tagged@a.edu")
+        self.assertEqual("1/Test", borrowed.pid)
+        self.assertEqual("Memory", borrowed.primary)
+
+    def test_a_tagged_chair_on_no_roster_is_reported_not_emitted(self):
+        # A record with no PID cannot be fingerprinted, so emitting one just
+        # moves the failure somewhere further from the cause.
+        tmp = Path(tempfile.mkdtemp())
+        form = tmp / "chairs.csv"
+        with form.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(self.AC_HEADERS)
+        pcinfo = write_pcinfo(tmp / "pcinfo.csv", [
+            pc_account("nowhere@a.edu", "Grace", "Hopper", tags="pc-full ~~area-chairs"),
+        ])
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            chairs = area_chairs.load_area_chairs(
+                str(form), str(tmp / "missing.csv"), pcinfo_path=str(pcinfo), supplement=[],
+            )
+        self.assertEqual([], chairs)
+        self.assertIn("nowhere@a.edu", stderr.getvalue())
+
+
 class RosterDispatchTests(unittest.TestCase):
     """roster.py: every script must agree on who is on the PC."""
 

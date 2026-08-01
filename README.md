@@ -443,6 +443,44 @@ rule needs: no cap is ever exceeded, which must always be 0.
 make SAME_COUNTRY_CAP=3
 ```
 
+#### Area chairs are not reviewers
+
+**On by default** (`--no-area-chair-exclusion` to disable, or
+`make AREA_CHAIR_CHECK=--no-area-chair-exclusion`). An area chair chairs papers
+and reviews none, so every area chair is removed from the reviewer pool before
+any phase runs.
+
+Membership is the **union of two sources**, because each one has been observed to
+catch people the other misses:
+
+- HotCRP's `~~area-chairs` tag in `data/inputs/hpca2027-pcinfo.csv`
+- the area-chair acceptance form
+
+On the current export those are 21 and 18 people and the union is 21; three
+tagged accounts never returned the form. The gap has run the other way too — a
+signatory the tag did not yet cover — which is why neither source alone is
+trusted. `make pc-roster` reports both directions, and the count of area chairs
+also sitting on a reviewer roster is the tripwire: if it rises between exports,
+someone was made a chair after being staffed with reviews and the assignment is
+stale.
+
+Two details worth knowing. The filter runs **after** reserves are merged into the
+pool, not on the PC roster alone — one of today's six excluded chairs is a
+reserve reviewer, and filtering earlier would be undone by the merge. And
+membership is resolved through the same email → name → local-part ladder the PC
+check uses (`src/reviewer_match/pc_membership.py`), so a chair who accepted from
+one address and reviews under another is still caught.
+
+A missing acceptance form is a **hard error**, for the same reason a missing user
+export is: an empty exclusion set is indistinguishable from "no area chairs" and
+would silently reinstate every one of them.
+
+The chair roster follows the tag too. An account tagged `~~area-chairs` that
+never returned the form still gets a chair assignment, with its DBLP page and
+areas borrowed from whichever roster does have it — the PC acceptance form or the
+reserve roster. Anyone tagged who is on no roster at all has no identity to work
+from, and is reported rather than silently skipped.
+
 #### Derived co-author COI
 
 **On by default, over the last 5 years** (`--coauthor-years`,
@@ -929,12 +967,17 @@ is left blank and reported with the pages that were considered. Two caches,
 ### `scripts/assign_area_chairs.py` — balanced area-chair assignment
 
 This is an independent workflow layered on the completed reviewer assignment.
-It loads accepted responses from the area-chair form, builds research
-fingerprints with the same DBLP-publication, Semantic Scholar abstract, and
-declared-area policy used for reviewers, and assigns every paper with at least
-one reviewer to one area chair. Pass it the same `--paper-policy` the
-reviewer assignment used; under `submitted`, that assignment must cover the
-complete submitted-paper set.
+It loads the chair roster, builds research fingerprints with the same
+DBLP-publication, Semantic Scholar abstract, and declared-area policy used for
+reviewers, and assigns every paper with at least one reviewer to one area chair.
+Pass it the same `--paper-policy` the reviewer assignment used; under
+`submitted`, that assignment must cover the complete submitted-paper set.
+
+The roster is the acceptance form **plus** any account HotCRP tags
+`~~area-chairs` that never returned it, whose DBLP page and areas are taken from
+the PC form or reserve roster instead — the same union the reviewer-pool
+exclusion uses, so the two can never disagree about who is a chair. That comes
+from the export, so `--no-pc-check` disables it along with the membership check.
 
 Conflicts are the same three layers the reviewer matcher applies — declared
 `pc_conflicts`, the `own_paper_conflicts` floor, and the derived co-author layer
@@ -946,7 +989,7 @@ authorship is declared), but the floor should not depend on the sweep being
 complete. The co-author layer excludes a further 389 chair-paper pairs, 131 of
 them declared nowhere.
 
-Fifteen chairs is a thin pool, so tightening COI can make the load bounds
+Twenty-odd chairs is a thin pool, so tightening COI can make the load bounds
 infeasible where the reviewer matcher would merely under-fill. That surfaces as
 a `ValueError` rather than a silently dropped conflict.
 
