@@ -261,6 +261,13 @@ def eligible_scores(
     This is the only place COI is applied. `assign_reviewers` builds its
     preference lists from what this returns and no later phase re-checks them,
     so a reviewer excluded here is unreachable even after every relaxation.
+
+    `pc_conflicts` is declared against whatever address HotCRP has the
+    reviewer's account under -- their `hotcrp_email`, not necessarily the
+    `candidate_emails` roster key -- so both are checked. Someone
+    `pc_membership` matched under a second address would otherwise have a
+    real declared conflict invisible here and only caught by HotCRP itself,
+    at upload, as a hard error.
     """
     conflicted = {e.lower() for e in paper.get("pc_conflicts", {})}
     conflicted |= own_paper_conflicts(paper)
@@ -269,10 +276,10 @@ def eligible_scores(
 
     eligible_idx = []
     for i, email in enumerate(candidate_emails):
-        if email in conflicted:
+        r = reviewers_by_email[email]
+        if email in conflicted or r.hotcrp_email.lower() in conflicted:
             continue
         if area_gate:
-            r = reviewers_by_email[email]
             areas = {a.lower() for a in (r.primary, r.secondary) if a}
             if not (areas & topic_set):
                 continue

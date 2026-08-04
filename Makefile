@@ -9,8 +9,10 @@
 #   make duplicates       list people holding two HotCRP accounts
 #   make dblp-snapshot    cache publications from the local DBLP dump
 #   make coauthor-coi     report conflicts DBLP implies but nobody declared
+#   make collaborator-coi report conflicts declared collaborators/affiliation imply
 #   make affiliation-countries  resolve affiliation countries
 #   make reserves         enrich, fingerprint, and classify reserves
+#   make clear-uploads    HotCRP CSVs that wipe R1 reviews and the track tags
 #   make clean            remove assignment outputs only
 #   make clean-fingerprints  remove embedding caches, never DBLP caches
 
@@ -68,9 +70,22 @@ SENIORITY = $(REPORT_DIR)/reviewer_seniority.csv
 RESERVE_SENIORITY = $(REPORT_DIR)/reserve_seniority.csv
 RESERVE_INFO = $(REPORT_DIR)/reserve_reviewer_info.csv
 ASSIGNMENT = $(ASSIGNMENT_DIR)/assignment.txt
+ASSIGNMENT_CSV = $(ASSIGNMENT_DIR)/assignment.csv
 COMPLETE_ASSIGNMENT = $(ASSIGNMENT_DIR)/assignment-complete.txt
+COMPLETE_ASSIGNMENT_CSV = $(ASSIGNMENT_DIR)/assignment-complete.csv
 AREA_CHAIR_ASSIGNMENT = $(ASSIGNMENT_DIR)/area_chair_assignment.txt
 AREA_CHAIR_COMPLETE = $(ASSIGNMENT_DIR)/area_chair_assignment-complete.txt
+AREA_CHAIR_ACCOUNT_TAGS = $(ASSIGNMENT_DIR)/area_chair_account_tags.csv
+AREA_CHAIR_PAPER_TAGS = $(ASSIGNMENT_DIR)/area_chair_paper_tags.csv
+AREA_CHAIR_ACCOUNT_TAGS_COMPLETE = $(ASSIGNMENT_DIR)/area_chair_account_tags-complete.csv
+AREA_CHAIR_PAPER_TAGS_COMPLETE = $(ASSIGNMENT_DIR)/area_chair_paper_tags-complete.csv
+CLEAR_ASSIGNMENT = $(ASSIGNMENT_DIR)/clear_assignment.csv
+CLEAR_PAPER_TAGS = $(ASSIGNMENT_DIR)/clear_paper_tags.csv
+CLEAR_ACCOUNT_TAGS = $(ASSIGNMENT_DIR)/clear_account_tags.csv
+
+# Round the clearing upload wipes. CLEAR_ROUND=all clears every round, not
+# just the one this pipeline assigns into.
+CLEAR_ROUND ?= R1
 
 PC_CHECK ?=
 AREA_CHAIR_YEARS = 10
@@ -78,6 +93,12 @@ AREA_CHAIR_YEARS = 10
 # The derived co-author COI is on by default, like the same-country cap. Set
 # COAUTHOR_COI=--no-coauthor-coi to assign without it.
 COAUTHOR_COI ?=
+
+# Same for the derived declared-collaborator COI (name-matched only; the
+# affiliation-overlap signal is reported, not excluded -- see
+# reviewer_match.collaborator_coi). Set COLLABORATOR_COI=--no-collaborator-coi
+# to assign without it.
+COLLABORATOR_COI ?=
 
 # Area chairs are kept out of the reviewer pool by default. Set
 # AREA_CHAIR_CHECK=--no-area-chair-exclusion to assign papers to them anyway.
@@ -89,12 +110,12 @@ EMBED_LIBS = src/reviewer_match/fingerprint.py src/reviewer_match/specter2_model
 
 .DELETE_ON_ERROR:
 .PHONY: all enrich area-chairs reserve-need reserve-info reserve-pids reserves \
-	dblp-snapshot coauthor-coi affiliation-countries pc-roster duplicates \
-	complete-papers area-chairs-complete clean clean-fingerprints
+	dblp-snapshot coauthor-coi collaborator-coi affiliation-countries pc-roster duplicates \
+	complete-papers area-chairs-complete clear-uploads clean clean-fingerprints
 
 all: $(SENIORITY) enrich $(FINGERPRINTS)
 	$(RUN) scripts.build_fingerprints --csv "$(CSV)" --fingerprint-cache $(FINGERPRINTS)
-	$(MAKE) $(ASSIGNMENT)
+	$(MAKE) $(ASSIGNMENT) $(ASSIGNMENT_CSV)
 
 enrich: scripts/enrich_publications.py $(REVIEWER_LIBS) $(CSV_DEP) $(OVERRIDES) $(PCINFO)
 	$(RUN) scripts.enrich_publications --csv "$(CSV)"
@@ -106,7 +127,16 @@ area-chairs:
 	$(RUN) scripts.build_fingerprints --role area-chair --csv "$(AREA_CHAIR_CSV)" \
 		--fingerprint-cache $(AREA_CHAIR_FINGERPRINTS) --years $(AREA_CHAIR_YEARS)
 	$(RUN) scripts.assign_area_chairs --paper-policy $(PAPER_POLICY) \
-		--csv "$(AREA_CHAIR_CSV)" $(COAUTHOR_COI) > $(AREA_CHAIR_ASSIGNMENT)
+		--csv "$(AREA_CHAIR_CSV)" $(COAUTHOR_COI) $(COLLABORATOR_COI) \
+		--account-tag-csv $(AREA_CHAIR_ACCOUNT_TAGS) --paper-tag-csv $(AREA_CHAIR_PAPER_TAGS) \
+		> $(AREA_CHAIR_ASSIGNMENT)
+
+clear-uploads:
+	@test -f $(PCINFO) || { echo "ERROR: $(PCINFO) not found; download it from HotCRP" >&2; exit 1; }
+	$(RUN) scripts.generate_clear_uploads --pcinfo $(PCINFO) --csv "$(AREA_CHAIR_CSV)" \
+		--data $(DATA) --round $(CLEAR_ROUND) \
+		--assignment-out $(CLEAR_ASSIGNMENT) --paper-tag-out $(CLEAR_PAPER_TAGS) \
+		--account-tag-out $(CLEAR_ACCOUNT_TAGS)
 
 reserve-need:
 	$(RUN) scripts.estimate_reserve_need --paper-policy $(PAPER_POLICY) --csv "$(CSV)"
@@ -134,6 +164,10 @@ coauthor-coi:
 	@test -f $(COAUTHORS) || { echo "ERROR: $(COAUTHORS) not found; run make dblp-snapshot first" >&2; exit 1; }
 	$(RUN) scripts.audit_coauthor_conflicts --paper-policy $(PAPER_POLICY) --data $(DATA)
 
+collaborator-coi:
+	@test -f $(PCINFO) || { echo "ERROR: $(PCINFO) not found; download it from HotCRP" >&2; exit 1; }
+	$(RUN) scripts.audit_collaborator_conflicts --paper-policy $(PAPER_POLICY) --data $(DATA) --pcinfo $(PCINFO)
+
 reserves:
 	@test -f $(RESERVE_INFO) || { echo "ERROR: $(RESERVE_INFO) not found; run make reserve-info first" >&2; exit 1; }
 	@test -f $(PCINFO) || { echo "ERROR: $(PCINFO) not found; download it from HotCRP, or pass PC_CHECK=--no-pc-check" >&2; exit 1; }
@@ -146,7 +180,7 @@ reserves:
 affiliation-countries: scripts/build_affiliation_countries.py src/reviewer_match/affiliation_country.py
 	$(RUN) scripts.build_affiliation_countries --data $(DATA)
 
-complete-papers: $(COMPLETE_ASSIGNMENT)
+complete-papers: $(COMPLETE_ASSIGNMENT) $(COMPLETE_ASSIGNMENT_CSV)
 
 area-chairs-complete: $(COMPLETE_ASSIGNMENT)
 	$(RUN) scripts.enrich_publications --role area-chair --csv "$(AREA_CHAIR_CSV)" \
@@ -155,7 +189,9 @@ area-chairs-complete: $(COMPLETE_ASSIGNMENT)
 		--fingerprint-cache $(AREA_CHAIR_FINGERPRINTS) --years $(AREA_CHAIR_YEARS)
 	$(RUN) scripts.assign_area_chairs --paper-policy complete \
 		--reviewer-assignment $(COMPLETE_ASSIGNMENT) --csv "$(AREA_CHAIR_CSV)" \
-		$(COAUTHOR_COI) > $(AREA_CHAIR_COMPLETE)
+		$(COAUTHOR_COI) $(COLLABORATOR_COI) \
+		--account-tag-csv $(AREA_CHAIR_ACCOUNT_TAGS_COMPLETE) --paper-tag-csv $(AREA_CHAIR_PAPER_TAGS_COMPLETE) \
+		> $(AREA_CHAIR_COMPLETE)
 
 $(PUBLICATIONS) $(ABSTRACTS) &: scripts/enrich_publications.py $(REVIEWER_LIBS) $(CSV_DEP) $(OVERRIDES) $(PCINFO)
 	$(RUN) scripts.enrich_publications --csv "$(CSV)"
@@ -181,7 +217,7 @@ $(SENIORITY): scripts/classify_reviewers.py $(REVIEWER_LIBS) $(CSV_DEP) $(OVERRI
 $(FINGERPRINTS): $(PUBLICATIONS) $(ABSTRACTS) scripts/build_fingerprints.py $(REVIEWER_LIBS) $(EMBED_LIBS) $(CSV_DEP) $(OVERRIDES) $(DBLP_PUBS) $(PCINFO)
 	$(RUN) scripts.build_fingerprints --csv "$(CSV)" --fingerprint-cache $@
 
-$(ASSIGNMENT): scripts/assign_reviewers.py src/reviewer_match/paper_matching.py \
+$(ASSIGNMENT) $(ASSIGNMENT_CSV) &: scripts/assign_reviewers.py src/reviewer_match/paper_matching.py \
 	scripts/classify_reviewers.py src/reviewer_match/affiliation_country.py \
 	src/reviewer_match/coauthor_coi.py src/reviewer_match/reserve_reviewers.py \
 	src/reviewer_match/area_chairs.py src/reviewer_match/pc_membership.py \
@@ -190,9 +226,11 @@ $(ASSIGNMENT): scripts/assign_reviewers.py src/reviewer_match/paper_matching.py 
 	$(if $(RESERVE_FLAG),$(RESERVE_FINGERPRINTS) $(RESERVE_SENIORITY))
 	$(RUN) scripts.assign_reviewers --paper-policy $(PAPER_POLICY) --csv "$(CSV)" \
 		--area-chair-csv "$(AREA_CHAIR_CSV)" \
-		$(RESERVE_FLAG) $(PC_CHECK) $(AREA_CHAIR_CHECK) $(REGION_FLAG) $(COAUTHOR_COI) > $@
+		--hotcrp-csv $(ASSIGNMENT_CSV) \
+		$(RESERVE_FLAG) $(PC_CHECK) $(AREA_CHAIR_CHECK) $(REGION_FLAG) $(COAUTHOR_COI) $(COLLABORATOR_COI) \
+		> $(ASSIGNMENT)
 
-$(COMPLETE_ASSIGNMENT): scripts/assign_reviewers.py src/reviewer_match/paper_matching.py \
+$(COMPLETE_ASSIGNMENT) $(COMPLETE_ASSIGNMENT_CSV) &: scripts/assign_reviewers.py src/reviewer_match/paper_matching.py \
 	scripts/classify_reviewers.py src/reviewer_match/affiliation_country.py \
 	src/reviewer_match/coauthor_coi.py \
 	src/reviewer_match/area_chairs.py src/reviewer_match/pc_membership.py \
@@ -200,10 +238,15 @@ $(COMPLETE_ASSIGNMENT): scripts/assign_reviewers.py src/reviewer_match/paper_mat
 	$(AREA_CHAIR_CSV_DEP) $(PCINFO)
 	$(RUN) scripts.assign_reviewers --paper-policy complete --csv "$(CSV)" \
 		--area-chair-csv "$(AREA_CHAIR_CSV)" \
-		$(PC_CHECK) $(AREA_CHAIR_CHECK) $(REGION_FLAG) $(COAUTHOR_COI) > $@
+		--hotcrp-csv $(COMPLETE_ASSIGNMENT_CSV) \
+		$(PC_CHECK) $(AREA_CHAIR_CHECK) $(REGION_FLAG) $(COAUTHOR_COI) $(COLLABORATOR_COI) \
+		> $(COMPLETE_ASSIGNMENT)
 
 clean:
-	rm -f $(ASSIGNMENT) $(AREA_CHAIR_ASSIGNMENT) $(COMPLETE_ASSIGNMENT) $(AREA_CHAIR_COMPLETE)
+	rm -f $(ASSIGNMENT) $(ASSIGNMENT_CSV) $(AREA_CHAIR_ASSIGNMENT) \
+		$(COMPLETE_ASSIGNMENT) $(COMPLETE_ASSIGNMENT_CSV) $(AREA_CHAIR_COMPLETE) \
+		$(AREA_CHAIR_ACCOUNT_TAGS) $(AREA_CHAIR_PAPER_TAGS) \
+		$(AREA_CHAIR_ACCOUNT_TAGS_COMPLETE) $(AREA_CHAIR_PAPER_TAGS_COMPLETE)
 
 clean-fingerprints:
 	rm -f $(FINGERPRINTS) $(PAPER_FINGERPRINTS) $(AREA_CHAIR_FINGERPRINTS)

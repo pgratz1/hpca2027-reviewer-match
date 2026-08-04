@@ -39,6 +39,15 @@ class Reviewer:
     tier: str  # 'full' | 'light'
     override_cap: int | None  # overrides the tier-based default paper cap, if set
     pid_from_override: bool = False  # pid came from dblp_overrides.csv, not the form
+    # The address a HotCRP bulk upload must use, which is `email` unless
+    # pc_membership matched this person under a different one they hold their
+    # PC account under. Defaults to `email` for callers (mostly tests) that
+    # never ran the membership check.
+    hotcrp_email: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.hotcrp_email:
+            self.hotcrp_email = self.email
 
     @property
     def name(self) -> str:
@@ -174,23 +183,30 @@ def load_reviewers(
 
     reviewers: list[Reviewer] = []
     dropped: list[str] = []
+    timestamps: dict[str, datetime.datetime] = {}
     for row in _latest_rows_by_email(rows):
         membership = field(row, "PC membership")
         if "unable" in membership.lower():
             continue
         tier = "light" if "light" in membership.lower() else "full"
         email = field(row, "email address").lower()
+        timestamps[email] = datetime.datetime.strptime(row["Timestamp"].strip(), TIMESTAMP_FORMAT)
         first, last = field(row, "First Name"), field(row, "Last Name")
         # Before the Reviewer is built, not after: someone who is off the PC
         # shouldn't be able to take the whole pipeline down through a garbage
         # override-cap cell they will never use.
-        if index is not None and index.match(email, first, last)[0] is None:
-            dropped.append(email)
-            continue
+        hotcrp_email = email
+        if index is not None:
+            acct, how = index.match(email, first, last)
+            if acct is None:
+                dropped.append(email)
+                continue
+            hotcrp_email = pc_membership.hotcrp_email_for(email, acct, how)
         dblp_url = field(row, "DBLP")
         reviewers.append(
             Reviewer(
                 email=email,
+                hotcrp_email=hotcrp_email,
                 first=first,
                 last=last,
                 dblp_url=dblp_url,
@@ -211,9 +227,24 @@ def load_reviewers(
             dropped, len(reviewers), "acceptance-form reviewers", index
         )
 
+    # A person who resubmitted under a second real address (not the same
+    # email twice, which _latest_rows_by_email already handled) is two rows
+    # here that resolve to one HotCRP account; the later submission wins, the
+    # same policy as same-email duplicates.
+    reviewers, collapsed = pc_membership.collapse_by_hotcrp_email(reviewers, timestamps)
+    if collapsed:
+        shown = ", ".join(f"{lost} -> {kept}" for kept, lost in sorted(collapsed)[:5])
+        more = f", +{len(collapsed) - 5} more" if len(collapsed) > 5 else ""
+        print(
+            f"{len(collapsed)} acceptance-form submission(s) under a second address "
+            f"collapsed into the same HotCRP account as another row: {shown}{more}",
+            file=sys.stderr,
+        )
+
     # A dropped reviewer's override is accounted for, not a typo — saying
     # otherwise would send someone hunting for a mistake they didn't make.
-    unmatched = set(overrides) - {r.email for r in reviewers} - set(dropped)
+    collapsed_away = {lost for _, lost in collapsed}
+    unmatched = set(overrides) - {r.email for r in reviewers} - set(dropped) - collapsed_away
     for email in sorted(unmatched):
         print(
             f"Warning: DBLP override for {email} matches no accepted reviewer "

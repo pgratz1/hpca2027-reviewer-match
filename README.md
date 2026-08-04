@@ -105,8 +105,39 @@ PAPER_POLICY=registered` restores the pre-deadline view.
    then run **`make`** — rebuilds
    whatever is stale, in order: reviewer seniority classification, cached
    IEEE/ACM abstract enrichment, reviewer fingerprints, then the assignment. The final
-   output lands in **`outputs/assignments/assignment.txt`**: per-paper reviewer slates, the
-   per-area shortage report, and the seniority criteria report.
+   outputs land in **`outputs/assignments/assignment.txt`** and
+   **`outputs/assignments/assignment.csv`**. The text file contains the per-paper
+   reviewer slates, per-area shortage report, and seniority criteria report. The
+   CSV is ready for HotCRP's Assignments → Bulk update page: it first clears all
+   existing R1 review assignments, then installs the new slate as mandatory
+   primary R1 reviews. Always use HotCRP's preview before approving the upload.
+   Each row uses the reviewer's **`hotcrp_email`**, not their roster `email`:
+   someone `pc_membership` matched under a second address (accepting the
+   invitation from one email while HotCRP has their `pc` role under another —
+   `outputs/reports/pc_roster_missing.csv`'s `alternate_account` rows) would
+   otherwise write an address the bulk upload rejects, since HotCRP checks the
+   exact address, not the person behind it. The durable fix is still to merge
+   each such pair in HotCRP, as that report says; `hotcrp_email` just keeps a
+   merge-pending duplicate from blocking every upload in the meantime.
+   Two things this identity resolution also has to get right, both caught by
+   HotCRP itself at upload before they were fixed here:
+   - **COI is declared against `hotcrp_email`, not the roster key.** A real
+     conflict recorded against someone's actual HotCRP account was invisible
+     to `paper_matching.eligible_scores` (and `assign_area_chairs.py`'s own
+     conflict check) when the roster still keyed them by their acceptance-form
+     address — HotCRP's own "cannot review, conflicted" error at upload was
+     the only thing that ever caught it. Both now check `pc_conflicts` against
+     a candidate's `email` *and* `hotcrp_email`.
+   - **Resubmitting the form under a second real address is two roster rows
+     for one person**, not caught by `_latest_rows_by_email`'s same-email
+     dedup. Left alone, the assignment stage sees two distinct candidates who
+     happen to resolve to the same `hotcrp_email`, and can hand the same real
+     person two reviews on one paper. `load_reviewers`, `load_area_chairs`
+     and `load_reserve_reviewers` now collapse any such pair via
+     `pc_membership.collapse_by_hotcrp_email` — latest form timestamp wins,
+     the same policy `_latest_rows_by_email` already uses for same-email
+     duplicates (first-seen wins for the reserve roster, which has no
+     timestamp) — and report it to stderr.
 5. **If classify reported reviewers with missing DBLP identities**, it
    appended blank stub rows for them to `data/curated/dblp_overrides.csv` — fill in their
    `dblp` cells and `make` again. Unknowns caused by transient DBLP fetch
@@ -121,6 +152,7 @@ The equivalent manual commands, in dependency order:
 ~/envs/hpca-matching/bin/python3 -m scripts.build_fingerprints
 ~/envs/hpca-matching/bin/python3 -m scripts.assign_reviewers \
     --paper-policy submitted --include-reserves --reserve-cap 6 \
+    --hotcrp-csv outputs/assignments/assignment.csv \
     > outputs/assignments/assignment.txt
 ```
 
@@ -131,7 +163,7 @@ assigns from the PC alone. To reproduce the former completeness-based selection
 in its own artifacts, without overwriting `outputs/assignments/assignment.txt`:
 
 ```bash
-make complete-papers          # outputs/assignments/assignment-complete.txt
+make complete-papers          # assignment-complete.txt and assignment-complete.csv
 make area-chairs-complete     # outputs/assignments/area_chair_assignment-complete.txt
 ```
 
@@ -563,6 +595,50 @@ make COAUTHOR_COI=--no-coauthor-coi    # assign without it
 ~/envs/hpca-matching/bin/python3 -m scripts.assign_reviewers --coauthor-years 3
 ```
 
+#### Derived declared-collaborator COI
+
+**On by default** (`--no-collaborator-coi` to disable). HotCRP's own
+Assignments-upload page warns "Proposed reviewer X may conflict with #N"
+using two signals `pc_conflicts` never captured — this reproduces them from
+`data/inputs/hpca2027-pcinfo.csv`'s `collaborators` column (every HotCRP
+account has one, not just PC members; the export is ~5,600 rows, all of
+them) rather than leaving them as a warning to notice on a 6,000-row bulk
+upload:
+
+* **Name.** A reviewer's declared collaborator is a paper's author, or a
+  paper's author (if they hold any HotCRP account) declared the reviewer as
+  theirs — checked both ways, since the declaration is one-sided by
+  construction. `collaborators` also accepts HotCRP's `All (Institution)`
+  shorthand for "everyone there," which never matches by name alone.
+* **Affiliation.** The reviewer's own affiliation shares a significant word
+  with an author's.
+
+Only the **name** signal excludes. The affiliation signal is also HotCRP's,
+and was built the same way at first — but measured on this data it touched
+556 of 688 reviewers and 963 of 1156 papers, dominated by generic words
+(`hong`, `california`, `chinese`, `computing`, `china`, `shanghai`,
+`computer`, `tech`, `georgia`). A corpus document-frequency cutoff cannot
+separate that from a genuinely specific match either: `shenzhen`, the
+original example that motivated this layer, sits at 1.1% of accounts,
+`california` at 2.3%, `shanghai` at 3.5% — the same range, not a different
+one. HotCRP's own wording agrees it is a hint, not a rule: "you may want to
+**confirm** all potential conflicts." So affiliation overlap is written to
+the report and left there; `collaborator_coi.hard_conflicts` is the
+name-only subset `assign_reviewers.py` and `assign_area_chairs.py` actually
+exclude on.
+
+Like the co-author layer this is meant to be mostly redundant with
+`pc_conflicts` — on the current data the name signal excludes ~1,000
+reviewer-paper pairs and ~500 chair-paper pairs, most of them already
+declared. Where it is not, `scripts/audit_collaborator_conflicts.py` is the
+itemised report, `declared` column and all, same convention as the co-author
+one.
+
+```bash
+make collaborator-coi                            # the itemised report, offline
+make COLLABORATOR_COI=--no-collaborator-coi       # assign without it
+```
+
 ### `scripts/audit_coauthor_conflicts.py` — conflicts nobody declared
 
 Writes `outputs/reports/coauthor_conflicts.csv`, one row per reviewer-paper
@@ -603,6 +679,29 @@ them would disclose who submitted, which this file cannot carry. They are in
 ```bash
 make coauthor-coi
 ~/envs/hpca-matching/bin/python3 -m scripts.audit_coauthor_conflicts --role reviewer
+```
+
+### `scripts/audit_collaborator_conflicts.py` — conflicts from declared collaborators
+
+Writes `outputs/reports/collaborator_conflicts.csv`, one row per reviewer-paper
+conflict `reviewer_match.collaborator_coi` finds, `declared` column and `kind`
+column both — same `pc_conflicts`/`own_paper`/empty convention as the
+co-author report, plus `kind` (`name` or `affiliation`) since only `name` is
+actually excluded. The `direction` column says which side declared it:
+`reviewer_declared` (a reviewer's own `collaborators` field named the
+author), `author_declared` (an author's account named the reviewer), or
+`institution` (affiliation overlap, either side).
+
+Read it the same way as the co-author report: the declared rows are the
+control group, the undeclared `name` rows are what the layer newly excludes,
+and the `affiliation` rows — the large majority of the file — are exactly
+what did **not** get excluded and are worth spot-checking the `evidence`
+column for, since that is where a shared word being too generic to mean
+anything would show up.
+
+```bash
+make collaborator-coi
+~/envs/hpca-matching/bin/python3 -m scripts.audit_collaborator_conflicts --role reviewer
 ```
 
 ### `scripts/build_affiliation_countries.py` — the affiliation-country to-do list
@@ -996,9 +1095,9 @@ a `ValueError` rather than a silently dropped conflict.
 Area-chair profiles use a 10-year publication window (reviewer profiles retain
 their four-year default), giving the smaller chair pool a deeper research
 history. The optimizer maximizes total SPECTER2 cosine affinity globally while
-keeping each chair within 10% of the mean load when integer bounds permit it.
-Otherwise it uses the closest possible floor/ceiling balance; for 56 papers
-and 15 chairs, loads are 3–4. The report is grouped by area chair, with
+using the closest possible floor/ceiling load balance; for 56 papers and 15
+chairs, loads are 3–4. A wider experimental band can be requested with
+`--load-tolerance`. The report is grouped by area chair, with
 assigned paper IDs, titles, topics, and scores beneath each chair, followed by
 affinity, conflict, coverage, and load-bound checks.
 
@@ -1007,9 +1106,135 @@ make area-chairs
 # output: outputs/assignments/area_chair_assignment.txt
 ```
 
+`make area-chairs` also writes two HotCRP bulk-upload CSVs implementing the
+per-area Tracks feature, so an area chair can see reviewer identities and full
+review content — hidden from non-conflicted PC by default — and post
+discussion comments on their own papers without being expected to write a
+review themselves. Each chair is numbered 0-indexed in the same order the
+`.txt` report already prints them (`sorted(chair_emails, key=lambda e:
+(chairs_by_email[e].name.lower(), e))`), and track N is written with **two
+different tags in two separate HotCRP namespaces**; the report prints both
+under each chair's `track:` line for a human-auditable record:
+
+- the **papers** of track N are tagged plain `track_N`. Not `~~track_N`: a
+  `~~` tag is chair-hidden, so the tag would be invisible — and unsearchable —
+  to the one person it exists for, the chair who wants `#track_N` to pull up
+  their pile. Nothing is lost by making it plain, because HotCRP registers any
+  tag that *names* a track as chair-readonly (`TF_TRACK | TFM_ADMIN_PUBLIC |
+  TF_CHAIR_READONLY`, `lib/tagger.php` upstream), so an ordinary PC member
+  still cannot tag a paper into a track. Track membership itself is a raw
+  `$prow->has_tag()` string test (`Conf::check_tracks`), viewer-independent, so
+  the spelling changes visibility and nothing else.
+- the **chair's PC account** is tagged `~~track_N`, and stays chair-only:
+  it is the chair-to-track mapping, which the PC has no reason to see. This is
+  the tag the track's permissions name, under Settings → Tags & tracks (`Who
+  can see reviewer names?` / `Which non-reviewers can add comments?` → "PC
+  members with tag `~~track_N`").
+
+The tracks themselves are **not** created by this repo — they're set up by
+hand in HotCRP first, one per chair, named `track_0` .. `track_23` for 24
+chairs, and these CSVs only bulk-assign existing tags:
+
+- `outputs/assignments/area_chair_account_tags.csv` — upload via **Settings →
+  Accounts** bulk update, header `email,remove_tags,add_tags`, one row per
+  chair. **Never use the plain `tags` column here**: HotCRP's bulk user
+  importer (`src/userstatus.php`'s `$csv_keys`/`parse_json` in upstream
+  HotCRP) treats a bare `tags` value as a full replacement of that account's
+  entire tag set, silently wiping unrelated tags like `~~area-chairs` or `pc`.
+  `remove_tags`/`add_tags` are additive/subtractive only, touching nothing
+  else.
+- `outputs/assignments/area_chair_paper_tags.csv` — upload via **Assignments →
+  Bulk update**, header `paper,action,email,tag,round` with `action=tag` rows,
+  one per paper, tagging it into its chair's track. This is a separate upload
+  from `outputs/assignments/assignment.csv`: that file starts with
+  `all,clearreview,all,R1` and owns the reviewer-review lifecycle, so track
+  tagging is kept as its own independent bulk-update pass rather than coupled
+  to reviewer-assignment re-uploads. As always, use HotCRP's preview before
+  approving either upload.
+
+Both CSVs are **replacements, not additions**, for the same reason the
+reviewer-assignment CSV opens with `all,clearreview,all,R1`: as the matching
+stabilizes and papers move between chairs (or a chair's 0-indexed track
+number shifts because the sorted chair order changed), a stale tag from the
+previous run has to go, not just accumulate alongside the new one.
+`--track-clear-ceiling` (default 50, comfortably above any realistic chair
+count so a shrunk roster's stale higher-numbered tags still get cleared)
+governs how many track numbers get cleared before reapplying, in each
+namespace's own spelling: `area_chair_paper_tags.csv` opens with one
+`all,cleartag,,track_N,` row per track (paper tags), and each row of
+`area_chair_account_tags.csv` carries the full `~~track_N` range in
+`remove_tags` before `add_tags` grants the current one (account tags).
+Re-running `make area-chairs` and re-uploading both files is therefore
+enough to keep tags in sync for anyone still on the chair roster — **only**
+gap is a chair who leaves the roster entirely between runs: with no row for
+them in either CSV, their stale tags (both the paper tags on their old papers
+and their own account's `~~track_N`) are untouched. `make clear-uploads`
+closes that gap; see below.
+
 The workflow reuses the DBLP, publication metadata, abstract, and paper
 fingerprint caches, but writes chair vectors to
 `data/cache/area_chair_fingerprints.json`. It is not part of the default `make` target.
+
+### `scripts/generate_clear_uploads.py` — wipe assignments and track tags
+
+**`make clear-uploads`** writes the undo half of both uploads — the same
+`clearreview`, `cleartag` and `remove_tags` operations they open with, with
+nothing reinstalled afterwards. Offline, instant, read-only with respect to
+every input. Three files, because HotCRP takes them on two pages in two
+formats:
+
+- `outputs/assignments/clear_assignment.csv` — **Assignments → Bulk update**,
+  a single `all,clearreview,all,R1` row removing every R1 review assignment.
+  R1 is the only round `assign_reviewers.py` ever installs into, so it is the
+  only one cleared by default; `make clear-uploads CLEAR_ROUND=all` leaves the
+  round cell empty, which HotCRP reads as every round.
+- `outputs/assignments/clear_paper_tags.csv` — **Assignments → Bulk update**,
+  one `all,cleartag,,track_N,` row per track number. `cleartag` takes the tag
+  off every paper carrying it, so this is one row per track regardless of how
+  many papers hold it.
+- `outputs/assignments/clear_account_tags.csv` — **Settings → Accounts**, one
+  `email,remove_tags,add_tags` row per account, `remove_tags` carrying the
+  whole `~~track_N` range and `add_tags` left empty. The plain `tags` column
+  stays off limits for the reason given above (HotCRP reads it as a full
+  replacement of the account's tag set). The empty `add_tags` column has to be
+  **present**, which is not obvious: `p_profile.php`'s `save_bulk` decides
+  whether an upload is a CSV or a plain list of email addresses *before* it
+  looks at the header, and one of the two tests is whether the first line holds
+  at least two commas. A two-column `email,remove_tags` header holds one, and
+  on a HotCRP without the newer `(?:user|email)` test beside it every line is
+  re-quoted into a single field — the header stops being a header and each row
+  is validated whole as an email address, failing with **"Invalid email
+  address" on line 2** and every line after it. Three columns never reach that
+  branch, and the empty cell is a verified no-op: `UserStatus::parse_csv_main`
+  skips any column whose trimmed value is empty, so `add_tags` is never set on
+  the update object at all.
+
+Nothing else is touched: not `~~area-chairs`, not any other tag, not
+conflicts, not review preferences. As always, preview each upload in HotCRP
+before approving it.
+
+Two things it does that re-running `make area-chairs` cannot:
+
+- **The account rows come from the HotCRP user export, not the chair roster.**
+  That is what reaches the chair who left the roster between runs — invisible
+  to `area_chair_account_tags.csv`, but still carrying `~~track_N` in the
+  export. The chair roster is unioned in as a second source, since an export
+  taken *before* the last tag upload knows nothing about the tags that upload
+  wrote. Every row is an address the export itself lists, and the account's own
+  address rather than an acceptance-form one: HotCRP's bulk user importer
+  **creates** an account for an unknown email, so a clearing file naming a
+  form-only address would quietly add users.
+- **Track tags outside the canonical range are cleared too**, read off the
+  paper export and the user export rather than assumed. Setting the track
+  mechanism up by hand left a `track1`/`~~track1` pair on the live data that
+  clearing `track_0..track_49` would strand. A tag that merely contains the
+  word (`TRC-track`) does not match — that is a separate track and is nobody's
+  to clear here.
+
+The tag spellings and the clear ceiling are imported from
+`assign_area_chairs.py`, never restated: a clearing file that spelled a tag
+differently from the file that installed it would report success and leave the
+tag in place.
 
 ## Publication exclusions
 

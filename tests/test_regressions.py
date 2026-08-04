@@ -17,6 +17,7 @@ import requests
 
 from reviewer_match import affiliation_country
 from reviewer_match import coauthor_coi
+from reviewer_match import collaborator_coi
 from scripts import assign_reviewers
 from scripts import assign_area_chairs
 from reviewer_match import area_chairs
@@ -39,6 +40,7 @@ from scripts import score_abstract_evaluation
 from scripts import audit_coauthor_conflicts
 from scripts import audit_pc_roster
 from scripts import find_duplicate_accounts
+from scripts import generate_clear_uploads
 from reviewer_match import pc_membership
 from reviewer_match import reviewers as reviewers_mod
 from reviewer_match import roster as roster_mod
@@ -46,7 +48,7 @@ from reviewer_match.reviewers import Reviewer, _parse_override_cap
 
 PCINFO_FIELDS = [
     "given_name", "family_name", "email", "affiliation", "orcid", "country",
-    "disabled", "roles", "tags",
+    "disabled", "roles", "tags", "collaborators",
 ]
 
 
@@ -60,6 +62,204 @@ class RepositoryPathTests(unittest.TestCase):
         self.assertEqual(paths.CURATED_DIR, Path(reviewers_mod.DEFAULT_OVERRIDES).parent)
         self.assertEqual(paths.CACHE_DIR, Path(assign_reviewers.DEFAULT_FINGERPRINT_CACHE).parent)
         self.assertEqual(paths.REPORT_DIR, Path(classify_reviewers.DEFAULT_OUT).parent)
+
+
+class HotcrpAssignmentCsvTests(unittest.TestCase):
+    def read_rows(self, path):
+        with Path(path).open(newline="", encoding="utf-8") as f:
+            return list(csv.reader(f))
+
+    def test_csv_clears_r1_then_assigns_primary_reviews_deterministically(self):
+        slates = {2: ["low@example.com", "high@example.com"], 1: ["one@example.com"]}
+        scores = {
+            ("low@example.com", 2): 0.5,
+            ("high@example.com", 2): 0.9,
+            ("one@example.com", 1): 0.7,
+        }
+        reviewers_by_email = {
+            email: reviewer_with_email(email)
+            for email in ("low@example.com", "high@example.com", "one@example.com")
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "assignment.csv"
+            assign_reviewers.write_hotcrp_csv(str(path), slates, scores, reviewers_by_email)
+            rows = self.read_rows(path)
+        self.assertEqual(
+            [
+                ["paper", "action", "email", "round"],
+                ["all", "clearreview", "all", "R1"],
+                ["1", "primaryreview", "one@example.com", "R1"],
+                ["2", "primaryreview", "high@example.com", "R1"],
+                ["2", "primaryreview", "low@example.com", "R1"],
+            ],
+            rows,
+        )
+
+    def test_csv_writes_the_hotcrp_email_not_the_roster_email(self):
+        # A reviewer pc_membership matched under a second address: the roster
+        # key is their form email, but the upload must use the address HotCRP
+        # actually has marked `pc`, or it is rejected on upload.
+        slates = {1: ["form@example.com"]}
+        scores = {("form@example.com", 1): 0.8}
+        reviewers_by_email = {
+            "form@example.com": reviewer_with_email("form@example.com", hotcrp_email="real@other.edu"),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "assignment.csv"
+            assign_reviewers.write_hotcrp_csv(str(path), slates, scores, reviewers_by_email)
+            rows = self.read_rows(path)
+        self.assertEqual(
+            [
+                ["paper", "action", "email", "round"],
+                ["all", "clearreview", "all", "R1"],
+                ["1", "primaryreview", "real@other.edu", "R1"],
+            ],
+            rows,
+        )
+
+    def test_empty_slates_still_clear_existing_r1_assignments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "assignment.csv"
+            assign_reviewers.write_hotcrp_csv(str(path), {1: []}, {}, {})
+            rows = self.read_rows(path)
+        self.assertEqual(
+            [["paper", "action", "email", "round"],
+             ["all", "clearreview", "all", "R1"]],
+            rows,
+        )
+
+    def test_failed_atomic_replace_preserves_the_previous_csv(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "assignment.csv"
+            path.write_text("previous\n", encoding="utf-8")
+            with mock.patch.object(
+                assign_reviewers.os, "replace", side_effect=OSError("replace failed")
+            ):
+                with self.assertRaises(OSError):
+                    assign_reviewers.write_hotcrp_csv(str(path), {1: []}, {}, {})
+            self.assertEqual("previous\n", path.read_text(encoding="utf-8"))
+            self.assertEqual([], list(Path(tmp).glob(".assignment.csv.*.tmp")))
+
+
+class AreaChairTrackTagCsvTests(unittest.TestCase):
+    def read_rows(self, path):
+        with Path(path).open(newline="", encoding="utf-8") as f:
+            return list(csv.reader(f))
+
+    def test_paper_and_account_track_tags_are_zero_indexed_and_spelled_apart(self):
+        # The paper tag names the track and stays plain so the chair can see
+        # and search it; the account grant stays `~~` so the chair-to-track
+        # mapping is chair-only. One spelling for both hid the tag from the
+        # person it exists for.
+        self.assertEqual("track_0", assign_area_chairs.paper_track_tag(0))
+        self.assertEqual("track_23", assign_area_chairs.paper_track_tag(23))
+        self.assertEqual("~~track_0", assign_area_chairs.account_track_tag(0))
+        self.assertEqual("~~track_23", assign_area_chairs.account_track_tag(23))
+        self.assertNotEqual(
+            assign_area_chairs.paper_track_tag(0), assign_area_chairs.account_track_tag(0)
+        )
+
+    def test_account_tag_csv_is_sorted_by_email_and_uses_safe_add_remove_columns(self):
+        track_number = {"b@example.com": 1, "a@example.com": 0}
+        chairs_by_email = {
+            "a@example.com": chair_with_email("a@example.com"),
+            "b@example.com": chair_with_email("b@example.com"),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "area_chair_account_tags.csv"
+            assign_area_chairs.write_account_tag_csv(
+                str(path), chairs_by_email, track_number, clear_through=3
+            )
+            rows = self.read_rows(path)
+        self.assertEqual(
+            [
+                ["email", "remove_tags", "add_tags"],
+                ["a@example.com", "~~track_0 ~~track_1 ~~track_2", "~~track_0"],
+                ["b@example.com", "~~track_0 ~~track_1 ~~track_2", "~~track_1"],
+            ],
+            rows,
+        )
+
+    def test_account_tag_csv_writes_the_hotcrp_email_not_the_roster_email(self):
+        # Same reasoning as the reviewer CSV: a chair matched under a second
+        # address must be tagged on the account HotCRP actually has marked
+        # `pc`, not the one on their acceptance-form row.
+        track_number = {"form@example.com": 0}
+        chairs_by_email = {
+            "form@example.com": chair_with_email("form@example.com", hotcrp_email="real@other.edu"),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "area_chair_account_tags.csv"
+            assign_area_chairs.write_account_tag_csv(
+                str(path), chairs_by_email, track_number, clear_through=1
+            )
+            rows = self.read_rows(path)
+        self.assertEqual(
+            [
+                ["email", "remove_tags", "add_tags"],
+                ["real@other.edu", "~~track_0", "~~track_0"],
+            ],
+            rows,
+        )
+
+    def test_paper_tag_csv_groups_by_chair_then_sorts_pids(self):
+        by_chair = {"b@example.com": [20, 5], "a@example.com": [1]}
+        track_number = {"a@example.com": 0, "b@example.com": 1}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "area_chair_paper_tags.csv"
+            assign_area_chairs.write_paper_tag_csv(str(path), by_chair, track_number, clear_through=0)
+            rows = self.read_rows(path)
+        self.assertEqual(
+            [
+                ["paper", "action", "email", "tag", "round"],
+                ["1", "tag", "", "track_0", ""],
+                ["5", "tag", "", "track_1", ""],
+                ["20", "tag", "", "track_1", ""],
+            ],
+            rows,
+        )
+
+    def test_paper_tag_csv_clears_stale_tracks_before_reapplying(self):
+        by_chair = {"a@example.com": [1]}
+        track_number = {"a@example.com": 0}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "area_chair_paper_tags.csv"
+            assign_area_chairs.write_paper_tag_csv(str(path), by_chair, track_number, clear_through=3)
+            rows = self.read_rows(path)
+        self.assertEqual(
+            [
+                ["paper", "action", "email", "tag", "round"],
+                ["all", "cleartag", "", "track_0", ""],
+                ["all", "cleartag", "", "track_1", ""],
+                ["all", "cleartag", "", "track_2", ""],
+                ["1", "tag", "", "track_0", ""],
+            ],
+            rows,
+        )
+
+    def test_failed_atomic_replace_preserves_the_previous_account_tag_csv(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "area_chair_account_tags.csv"
+            path.write_text("previous\n", encoding="utf-8")
+            with mock.patch.object(
+                assign_area_chairs.os, "replace", side_effect=OSError("replace failed")
+            ):
+                with self.assertRaises(OSError):
+                    assign_area_chairs.write_account_tag_csv(str(path), {}, {})
+            self.assertEqual("previous\n", path.read_text(encoding="utf-8"))
+            self.assertEqual([], list(Path(tmp).glob(".area_chair_account_tags.csv.*.tmp")))
+
+    def test_failed_atomic_replace_preserves_the_previous_paper_tag_csv(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "area_chair_paper_tags.csv"
+            path.write_text("previous\n", encoding="utf-8")
+            with mock.patch.object(
+                assign_area_chairs.os, "replace", side_effect=OSError("replace failed")
+            ):
+                with self.assertRaises(OSError):
+                    assign_area_chairs.write_paper_tag_csv(str(path), {}, {})
+            self.assertEqual("previous\n", path.read_text(encoding="utf-8"))
+            self.assertEqual([], list(Path(tmp).glob(".area_chair_paper_tags.csv.*.tmp")))
 
 
 def write_pcinfo(path, accounts):
@@ -89,6 +289,23 @@ def reviewer(pid="1/Test"):
         email="person@example.com", first="Test", last="Person", dblp_url="",
         pid=pid, affiliation="Example", primary="Memory", secondary="", tertiary="",
         keywords="caches", tier="full", override_cap=None,
+    )
+
+
+def reviewer_with_email(email, hotcrp_email=""):
+    """A minimal Reviewer for CSV-writer tests that only look at the email fields."""
+    return Reviewer(
+        email=email, hotcrp_email=hotcrp_email, first="Test", last="Person", dblp_url="",
+        pid=None, affiliation="Example", primary="Memory", secondary="", tertiary="",
+        keywords="", tier="full", override_cap=None,
+    )
+
+
+def chair_with_email(email, hotcrp_email=""):
+    """A minimal AreaChair for CSV-writer tests that only look at the email fields."""
+    return area_chairs.AreaChair(
+        email=email, hotcrp_email=hotcrp_email, first="Test", last="Chair", dblp_url="",
+        pid=None, affiliation="Example", primary="Memory", secondary="", tertiary="", keywords="",
     )
 
 
@@ -254,6 +471,10 @@ class AreaChairAssignmentTests(unittest.TestCase):
 
     def test_load_bounds_use_closest_integer_balance_when_tolerance_is_infeasible(self):
         self.assertEqual((3, 4), assign_area_chairs.load_bounds(56, 15, 0.10))
+
+    def test_zero_tolerance_uses_closest_even_split(self):
+        self.assertEqual((56, 57), assign_area_chairs.load_bounds(1192, 21, 0.0))
+        self.assertEqual((4, 4), assign_area_chairs.load_bounds(60, 15, 0.0))
 
     def test_zero_load_chair_is_reported_without_crashing(self):
         chairs = [
@@ -2058,6 +2279,19 @@ class OwnPaperConflictTests(unittest.TestCase):
         # Declared conflict still excludes them, though they wrote nothing.
         self.assertEqual([], paper_matching.eligible_scores(p, *args, area_gate=False))
 
+    def test_pc_conflicts_declared_against_the_hotcrp_email_still_excludes(self):
+        # HotCRP's own declared conflicts are keyed by whatever address the
+        # account actually has -- hotcrp_email -- not necessarily the roster
+        # key candidate_emails uses. Missing this let a real declared
+        # conflict through for anyone pc_membership matched under a second
+        # address, caught only by HotCRP itself, at upload, as a hard error.
+        r = reviewer_with_email("form@a.edu", hotcrp_email="real@b.edu")
+        p = self.paper(pid=2, authors=[{"email": "someone@else.edu"}],
+                       pc_conflicts={"real@b.edu": 1})
+        args = ([r.email], np.ones((1, 3), dtype=np.float32),
+                np.ones(3, dtype=np.float32), {r.email: r})
+        self.assertEqual([], paper_matching.eligible_scores(p, *args, area_gate=False))
+
     def test_a_malformed_nomination_line_is_ignored_not_guessed_at(self):
         p = self.paper(reserve_reviewer="Just A Name\nNo Email / Somewhere\n")
         self.assertEqual(set(), paper_matching.own_paper_conflicts(p))
@@ -2233,6 +2467,168 @@ class CoauthorConflictTests(unittest.TestCase):
                        contacts=[{"given_name": "Charles", "family_name": "Babbage",
                                   "email": "cb@y.edu", "affiliation": "Y"}])
         self.assertIn("rev@x.edu", self.derive(p)[1][7])
+
+
+class CollaboratorLineParsingTests(unittest.TestCase):
+    """collaborator_coi.parse_collaborator_lines and institution_tokens."""
+
+    def test_a_named_line_splits_name_from_trailing_institution(self):
+        self.assertEqual(
+            [("Ada Lovelace", "Analytical Engines Ltd")],
+            collaborator_coi.parse_collaborator_lines("Ada Lovelace (Analytical Engines Ltd)"),
+        )
+
+    def test_a_line_with_no_institution_has_an_empty_one(self):
+        self.assertEqual([("Ada Lovelace", "")],
+                         collaborator_coi.parse_collaborator_lines("Ada Lovelace"))
+
+    def test_blank_lines_are_skipped(self):
+        self.assertEqual(
+            [("Ada Lovelace", "")],
+            collaborator_coi.parse_collaborator_lines("\nAda Lovelace\n\n"),
+        )
+
+    def test_all_marks_an_institution_wide_line(self):
+        self.assertTrue(collaborator_coi.is_institution_wide("All"))
+        self.assertTrue(collaborator_coi.is_institution_wide(" all "))
+        self.assertFalse(collaborator_coi.is_institution_wide("Alla Smith"))
+
+    def test_institution_tokens_drop_stopwords_and_short_words(self):
+        self.assertEqual(
+            {"shenzhen"},
+            collaborator_coi.institution_tokens("Shenzhen University"),
+        )
+        self.assertEqual(set(), collaborator_coi.institution_tokens("The Institute of Technology"))
+
+
+class CollaboratorConflictTests(unittest.TestCase):
+    """collaborator_coi: conflicts HotCRP's own declared-collaborator warning catches."""
+
+    def profiles(self, people, accounts):
+        tmp = Path(tempfile.mkdtemp())
+        index = pc_membership.load_pc_accounts(str(write_pcinfo(tmp / "pc.csv", accounts)))
+        return collaborator_coi.build_index(people, index), index
+
+    def paper(self, authors, **kwargs):
+        base = {"pid": 9, "title": "A paper.", "topics": [], "contacts": [],
+                "pc_conflicts": {}, "reserve_reviewer": "",
+                "authors": [
+                    {"given_name": g, "family_name": f, "email": e, "affiliation": a}
+                    for g, f, e, a in authors
+                ]}
+        base.update(kwargs)
+        return base
+
+    def test_a_reviewers_declared_collaborator_matches_a_paper_author(self):
+        r = reviewer_with_email("rev@x.edu")
+        profiles, index = self.profiles(
+            [r], [pc_account("rev@x.edu", "Ada", "Lovelace",
+                              collaborators="Charles Babbage (Difference Engines)")],
+        )
+        p = self.paper([("Charles", "Babbage", "cb@y.edu", "Difference Engines")])
+        conflict = collaborator_coi.derive_conflicts([p], profiles, index)[9]["rev@x.edu"]
+        self.assertEqual(("name", "reviewer_declared"), (conflict.kind, conflict.direction))
+
+    def test_an_authors_declared_collaborator_matches_the_reviewer(self):
+        # The direction that matters most: the reviewer's own account may say
+        # nothing, but the author already named them.
+        r = reviewer_with_email("rev@x.edu")  # name "Test Person", see reviewer_with_email
+        profiles, index = self.profiles(
+            [r],
+            [pc_account("rev@x.edu", "Ada", "Lovelace"),
+             pc_account("cb@y.edu", "Charles", "Babbage",
+                        collaborators="Test Person (Analytical Engines)")],
+        )
+        p = self.paper([("Charles", "Babbage", "cb@y.edu", "Difference Engines")])
+        conflict = collaborator_coi.derive_conflicts([p], profiles, index)[9]["rev@x.edu"]
+        self.assertEqual(("name", "author_declared"), (conflict.kind, conflict.direction))
+
+    def test_a_bare_all_line_never_matches_a_person_by_name(self):
+        r = reviewer_with_email("rev@x.edu")
+        profiles, index = self.profiles(
+            [r], [pc_account("rev@x.edu", "Ada", "Lovelace", collaborators="All")],
+        )
+        p = self.paper([("All", "", "weird@y.edu", "")])
+        self.assertEqual({}, collaborator_coi.derive_conflicts([p], profiles, index))
+
+    def test_reviewers_own_affiliation_overlaps_an_authors(self):
+        r = reviewer_with_email("rev@x.edu")
+        profiles, index = self.profiles(
+            [r], [pc_account("rev@x.edu", "Ada", "Lovelace", affiliation="Shenzhen University")],
+        )
+        p = self.paper([("Ruiheng", "Wang", "rw@y.edu",
+                         "School of Engineering, Peking University, Shenzhen")])
+        conflict = collaborator_coi.derive_conflicts([p], profiles, index)[9]["rev@x.edu"]
+        self.assertEqual(("affiliation", "institution", "shenzhen"),
+                         (conflict.kind, conflict.direction, conflict.evidence))
+
+    def test_an_institution_wide_all_line_conflicts_every_author_there(self):
+        r = reviewer_with_email("rev@x.edu")
+        profiles, index = self.profiles(
+            [r], [pc_account("rev@x.edu", "Ada", "Lovelace",
+                              collaborators="All (Google Quantum AI)")],
+        )
+        p = self.paper([("Jingbo", "Wang", "jw@y.edu",
+                         "Beijing Academy of Quantum Information Sciences")])
+        conflict = collaborator_coi.derive_conflicts([p], profiles, index)[9]["rev@x.edu"]
+        self.assertEqual("affiliation", conflict.kind)
+        self.assertEqual("quantum", conflict.evidence)
+
+    def test_no_shared_signal_is_not_a_conflict(self):
+        r = reviewer_with_email("rev@x.edu")
+        profiles, index = self.profiles(
+            [r], [pc_account("rev@x.edu", "Ada", "Lovelace", affiliation="MIT")],
+        )
+        p = self.paper([("Grace", "Hopper", "gh@y.edu", "Yale University")])
+        self.assertEqual({}, collaborator_coi.derive_conflicts([p], profiles, index))
+
+    def test_hard_conflicts_keeps_only_the_name_kind(self):
+        # The calibration this whole layer landed on: affiliation overlap
+        # (measured at 556/688 reviewers, 963/1156 papers on real data,
+        # dominated by generic words) is reported but never excludes: only a
+        # name match does.
+        r = reviewer_with_email("rev@x.edu")
+        profiles, index = self.profiles(
+            [r], [pc_account("rev@x.edu", "Ada", "Lovelace", affiliation="MIT",
+                             collaborators="Charles Babbage (Difference Engines)")],
+        )
+        p1 = self.paper([("Someone", "AtMIT", "sm@y.edu", "MIT")], pid=1)
+        p2 = self.paper([("Charles", "Babbage", "cb@y.edu", "Difference Engines")], pid=2)
+        derived = collaborator_coi.derive_conflicts([p1, p2], profiles, index)
+        self.assertEqual("affiliation", derived[1]["rev@x.edu"].kind)
+        self.assertEqual("name", derived[2]["rev@x.edu"].kind)
+        hard = collaborator_coi.hard_conflicts(derived)
+        self.assertEqual({"rev@x.edu"}, hard.get(2))
+        self.assertEqual(set(), hard.get(1, set()))
+
+    def test_a_name_match_is_reported_over_an_affiliation_match_on_the_same_paper(self):
+        # Two authors on one paper: one shares only an affiliation word, the
+        # other is a declared collaborator by name. The report should show
+        # the higher-precision reason regardless of author order.
+        r = reviewer_with_email("rev@x.edu")
+        profiles, index = self.profiles(
+            [r], [pc_account("rev@x.edu", "Ada", "Lovelace", affiliation="MIT",
+                              collaborators="Charles Babbage (Difference Engines)")],
+        )
+        p = self.paper([
+            ("Someone", "AtMIT", "sm@y.edu", "MIT"),
+            ("Charles", "Babbage", "cb@y.edu", "Difference Engines"),
+        ])
+        conflict = collaborator_coi.derive_conflicts([p], profiles, index)[9]["rev@x.edu"]
+        self.assertEqual("name", conflict.kind)
+
+    def test_hotcrp_email_not_roster_email_supplies_the_account_signals(self):
+        # Same reasoning as the identity fixes elsewhere: the collaborators
+        # and affiliation live on the account pc_membership resolved to, not
+        # necessarily the roster row's own address.
+        r = reviewer_with_email("form@x.edu", hotcrp_email="real@y.edu")
+        profiles, index = self.profiles(
+            [r], [pc_account("real@y.edu", "Ada", "Lovelace",
+                              collaborators="Charles Babbage (Difference Engines)")],
+        )
+        p = self.paper([("Charles", "Babbage", "cb@y.edu", "Difference Engines")])
+        conflict = collaborator_coi.derive_conflicts([p], profiles, index)[9]["form@x.edu"]
+        self.assertEqual("name", conflict.kind)
 
 
 class CoauthorIdentityTests(unittest.TestCase):
@@ -2965,6 +3361,40 @@ class PcMembershipTests(unittest.TestCase):
         self.assertEqual("name", how)
         self.assertEqual("a@a.edu", acct.email)  # deterministic, lowest email
 
+    def test_hotcrp_email_for_uses_the_account_only_when_matched_indirectly(self):
+        index = self.index([pc_account("real@b.edu", "Ada", "Lovelace")])
+        acct, how = index.match("real@b.edu", "Ada", "Lovelace")
+        self.assertEqual("real@b.edu", pc_membership.hotcrp_email_for("real@b.edu", acct, how))
+        acct, how = index.match("other@a.edu", "Ada", "Lovelace")
+        self.assertEqual("real@b.edu", pc_membership.hotcrp_email_for("other@a.edu", acct, how))
+        # No match at all: the row would already have been dropped, but the
+        # helper still has a defined, harmless answer -- the input unchanged.
+        self.assertEqual("nobody@a.edu", pc_membership.hotcrp_email_for("nobody@a.edu", None, ""))
+
+    def test_collapse_by_hotcrp_email_keeps_the_higher_ranked_duplicate(self):
+        old = reviewer_with_email("old@a.edu", hotcrp_email="real@b.edu")
+        new = reviewer_with_email("new@a.edu", hotcrp_email="real@b.edu")
+        other = reviewer_with_email("other@a.edu", hotcrp_email="other@a.edu")
+        survivors, collapsed = pc_membership.collapse_by_hotcrp_email(
+            [old, new, other], {"old@a.edu": 1, "new@a.edu": 2, "other@a.edu": 0}
+        )
+        self.assertEqual(["new@a.edu", "other@a.edu"], sorted(r.email for r in survivors))
+        self.assertEqual([("new@a.edu", "old@a.edu")], collapsed)
+
+    def test_collapse_by_hotcrp_email_without_ranks_keeps_the_first(self):
+        first = reviewer_with_email("first@a.edu", hotcrp_email="real@b.edu")
+        second = reviewer_with_email("second@a.edu", hotcrp_email="real@b.edu")
+        survivors, collapsed = pc_membership.collapse_by_hotcrp_email([first, second])
+        self.assertEqual(["first@a.edu"], [r.email for r in survivors])
+        self.assertEqual([("first@a.edu", "second@a.edu")], collapsed)
+
+    def test_collapse_by_hotcrp_email_is_a_no_op_with_no_duplicates(self):
+        a = reviewer_with_email("a@a.edu")
+        b = reviewer_with_email("b@a.edu")
+        survivors, collapsed = pc_membership.collapse_by_hotcrp_email([a, b])
+        self.assertEqual([a, b], survivors)
+        self.assertEqual([], collapsed)
+
 
 class ReviewerLoaderTests(unittest.TestCase):
     """reviewers.py: the acceptance form plus the HotCRP membership check."""
@@ -2990,8 +3420,8 @@ class ReviewerLoaderTests(unittest.TestCase):
             )
 
     def row(self, email, membership="Yes, I accept as a full PC member",
-            first="Ada", last="Lovelace", override=""):
-        return ["07/01/2026 10:00:00", email, membership, first, last, "none",
+            first="Ada", last="Lovelace", override="", timestamp="07/01/2026 10:00:00"):
+        return [timestamp, email, membership, first, last, "none",
                 "Example", "Memory", "", "", "", override]
 
     def test_an_acceptance_whose_account_lost_the_pc_role_is_dropped(self):
@@ -3002,6 +3432,43 @@ class ReviewerLoaderTests(unittest.TestCase):
               "roles": "", "tags": "pc-full"}],
         )
         self.assertEqual(["here@a.edu"], [r.email for r in people])
+
+    def test_a_reviewer_matched_by_name_gets_the_accounts_own_hotcrp_email(self):
+        # accept.csv:form@a.edu and pcinfo:real@b.edu are the same person, found
+        # by name -- a bulk upload has to use real@b.edu, the one HotCRP has
+        # marked pc, or it is rejected the same way this whole fix exists for.
+        people = self.load(
+            [self.row("form@a.edu")],
+            [pc_account("real@b.edu", "Ada", "Lovelace")],
+        )
+        self.assertEqual("form@a.edu", people[0].email)
+        self.assertEqual("real@b.edu", people[0].hotcrp_email)
+
+    def test_a_direct_email_match_keeps_hotcrp_email_equal_to_email(self):
+        people = self.load(
+            [self.row("here@a.edu", first="Alan", last="Turing")],
+            [pc_account("here@a.edu", "Alan", "Turing")],
+        )
+        self.assertEqual("here@a.edu", people[0].hotcrp_email)
+
+    def test_no_pc_check_leaves_hotcrp_email_equal_to_email(self):
+        people = self.load([self.row("form@a.edu")], [], check=False)
+        self.assertEqual("form@a.edu", people[0].hotcrp_email)
+
+    def test_two_submissions_under_different_real_addresses_collapse_to_one(self):
+        # The Rohan Basu Roy case: two real, accepted, non-declined form
+        # submissions under two different addresses that both resolve by
+        # name to the one PC account. Left uncollapsed, the assignment stage
+        # would see two distinct candidates and could hand the same real
+        # person two reviews on the same paper.
+        people = self.load(
+            [
+                self.row("old@a.edu", timestamp="05/09/2026 00:35:15"),
+                self.row("new@a.edu", timestamp="05/28/2026 21:38:58"),
+            ],
+            [pc_account("new@a.edu", "Ada", "Lovelace")],
+        )
+        self.assertEqual(["new@a.edu"], [r.email for r in people])
 
     def test_pcinfo_path_none_keeps_the_pre_check_roster(self):
         # The --no-pc-check contract: the loader must be able to answer "who
@@ -3491,6 +3958,140 @@ class DuplicateAccountTests(unittest.TestCase):
             self.account("b@y.edu", "Grace", "Hopper"),
             pc_membership.DEFAULT_TOKEN_RATIO,
         ))
+
+
+class ClearUploadTests(unittest.TestCase):
+    """generate_clear_uploads.py: the undo half of the two HotCRP uploads."""
+
+    def run_generator(self, accounts, form_rows=(), papers=(), extra_argv=()):
+        tmp = Path(tempfile.mkdtemp())
+        form = tmp / "chairs.csv"
+        with form.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(AreaChairExclusionTests.AC_HEADERS)
+            writer.writerows(form_rows)
+        data = tmp / "papers.json"
+        data.write_text(json.dumps(list(papers)), encoding="utf-8")
+        out = {name: tmp / f"{name}.csv" for name in ("assignment", "paper", "account")}
+        argv = ["generate_clear_uploads.py",
+                "--pcinfo", str(write_pcinfo(tmp / "pcinfo.csv", accounts)),
+                "--csv", str(form), "--overrides", str(tmp / "missing.csv"),
+                "--data", str(data),
+                "--assignment-out", str(out["assignment"]),
+                "--paper-tag-out", str(out["paper"]),
+                "--account-tag-out", str(out["account"]), *extra_argv]
+        with mock.patch.object(sys, "argv", argv), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            generate_clear_uploads.main()
+
+        def read(path):
+            with path.open(newline="", encoding="utf-8") as f:
+                return list(csv.reader(f))
+
+        return {name: read(path) for name, path in out.items()}
+
+    def ac_row(self, email, **kwargs):
+        return AreaChairExclusionTests.ac_row(AreaChairExclusionTests, email, **kwargs)
+
+    def test_the_review_clear_is_the_line_the_assignment_upload_opens_with(self):
+        rows = self.run_generator([pc_account("a@x.edu")])["assignment"]
+        self.assertEqual([["paper", "action", "email", "round"],
+                          ["all", "clearreview", "all", "R1"]], rows)
+
+    def test_round_all_widens_the_clear_to_every_round(self):
+        rows = self.run_generator([pc_account("a@x.edu")],
+                                  extra_argv=["--round", "all"])["assignment"]
+        self.assertEqual(["all", "clearreview", "all", ""], rows[1])
+
+    def test_the_canonical_track_range_is_cleared_from_every_paper(self):
+        rows = self.run_generator([pc_account("a@x.edu")],
+                                  extra_argv=["--track-clear-ceiling", "3"])["paper"]
+        self.assertEqual([["paper", "action", "email", "tag", "round"],
+                          ["all", "cleartag", "", "track_0", ""],
+                          ["all", "cleartag", "", "track_1", ""],
+                          ["all", "cleartag", "", "track_2", ""]], rows)
+
+    def test_a_hand_made_track_tag_outside_the_range_is_cleared_too(self):
+        # `track1` is live on the current export, left behind by setting the
+        # track mechanism up by hand; clearing only `track_N` would strand it.
+        rows = self.run_generator(
+            [pc_account("a@x.edu")],
+            papers=[{"pid": 1, "tags": ["track1#0"]}],
+            extra_argv=["--track-clear-ceiling", "2"],
+        )["paper"]
+        self.assertIn(["all", "cleartag", "", "track1", ""], rows)
+
+    def test_a_tag_that_merely_contains_the_word_track_is_left_alone(self):
+        rows = self.run_generator(
+            [pc_account("a@x.edu")],
+            papers=[{"pid": 1, "tags": ["TRC-track#0", "~~needs-reserve#0"]}],
+            extra_argv=["--track-clear-ceiling", "2"],
+        )["paper"]
+        self.assertEqual(3, len(rows))
+
+    def test_an_account_holding_a_stale_track_tag_is_cleared_even_off_the_roster(self):
+        # The gap assign_area_chairs.py's clear-then-reinstall cannot reach: a
+        # chair who left the roster has no row in either tag CSV, so their tag
+        # stays until something reads it off the export instead.
+        rows = self.run_generator(
+            [pc_account("gone@x.edu", tags="pc-full ~~track_4")],
+            extra_argv=["--track-clear-ceiling", "2"],
+        )["account"]
+        self.assertEqual(["email", "remove_tags", "add_tags"], rows[0])
+        self.assertEqual(["gone@x.edu", "~~track_0 ~~track_1 ~~track_4", ""], rows[1])
+
+    def test_a_chair_the_export_has_not_caught_up_with_is_still_cleared(self):
+        # An export taken before the last tag upload knows nothing about the
+        # tags that upload wrote, so the chair roster has to be a second source.
+        rows = self.run_generator(
+            [pc_account("chair@x.edu", tags="pc-full")],
+            form_rows=[self.ac_row("chair@x.edu")],
+            extra_argv=["--track-clear-ceiling", "1"],
+        )["account"]
+        self.assertEqual([["email", "remove_tags", "add_tags"],
+                          ["chair@x.edu", "~~track_0", ""]], rows)
+
+    def test_no_row_is_written_for_an_address_hotcrp_does_not_have(self):
+        # The bulk user importer *creates* an account for an unknown email, so
+        # a chair whose form address is not their account address must appear
+        # under the account address only -- never both, never the form's.
+        rows = self.run_generator(
+            [pc_account("real@x.edu", given="Ada", family="Lovelace", tags="pc-full")],
+            form_rows=[self.ac_row("typo@elsewhere.edu", first="Ada", last="Lovelace")],
+            extra_argv=["--track-clear-ceiling", "1"],
+        )["account"]
+        self.assertEqual([["email", "remove_tags", "add_tags"],
+                          ["real@x.edu", "~~track_0", ""]], rows)
+
+    def test_the_account_header_carries_the_two_commas_hotcrp_parses_on(self):
+        # `p_profile.php`'s save_bulk reads a first line with fewer than two
+        # commas as a plain list of email addresses (unless it also passes the
+        # newer `(?:user|email)` test), re-quoting every row into one field and
+        # failing it as an email address. Two commas never reach that branch.
+        tmp = Path(tempfile.mkdtemp())
+        out = tmp / "account.csv"
+        generate_clear_uploads.write_clear_account_tag_csv(
+            str(out), [["a@x.edu", "~~track_0"]]
+        )
+        first = out.read_text(encoding="utf-8").splitlines()[0]
+        self.assertEqual(2, first.count(","))
+        self.assertEqual("email,remove_tags,add_tags", first)
+
+    def test_the_area_chair_tag_itself_is_never_touched(self):
+        rows = self.run_generator(
+            [pc_account("chair@x.edu", tags="pc-full ~~area-chairs ~~track_0")],
+            extra_argv=["--track-clear-ceiling", "1"],
+        )["account"]
+        self.assertNotIn("~~area-chairs", rows[1][1])
+
+    def test_the_tag_spellings_come_from_the_installing_script(self):
+        # One definition, or a clearing file silently misses the tag it is
+        # meant to remove.
+        self.assertIs(generate_clear_uploads.paper_track_tag,
+                      assign_area_chairs.paper_track_tag)
+        self.assertIs(generate_clear_uploads.account_track_tag,
+                      assign_area_chairs.account_track_tag)
 
 
 if __name__ == "__main__":

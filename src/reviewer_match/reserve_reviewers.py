@@ -137,9 +137,13 @@ def load_reserve_reviewers(
             continue
         name = (row.get("name") or "").strip()
         first, _, last = name.partition(" ")
-        if index is not None and index.match(email, first, last)[0] is None:
-            dropped.append(email)
-            continue
+        hotcrp_email = email
+        if index is not None:
+            acct, how = index.match(email, first, last)
+            if acct is None:
+                dropped.append(email)
+                continue
+            hotcrp_email = pc_membership.hotcrp_email_for(email, acct, how)
         topics = authored.get(email) or nominated.get(email) or Counter()
         areas = top_areas(topics, max_areas)
         areas += [""] * (3 - len(areas))
@@ -148,6 +152,7 @@ def load_reserve_reviewers(
         reserves.append(
             Reviewer(
                 email=email,
+                hotcrp_email=hotcrp_email,
                 first=first,
                 last=last,
                 dblp_url=dblp_url,
@@ -168,4 +173,17 @@ def load_reserve_reviewers(
 
     if index is not None:
         pc_membership.report_pruned(dropped, len(reserves), "reserve reviewers", index)
+
+    # No resubmission timestamp exists here (unlike the acceptance form), so
+    # the first row for an account wins -- still better than two nominated
+    # addresses for the same person being assigned as two reviewers.
+    reserves, collapsed = pc_membership.collapse_by_hotcrp_email(reserves)
+    if collapsed:
+        shown = ", ".join(f"{lost} -> {kept}" for kept, lost in sorted(collapsed)[:5])
+        more = f", +{len(collapsed) - 5} more" if len(collapsed) > 5 else ""
+        print(
+            f"{len(collapsed)} reserve roster row(s) under a second address "
+            f"collapsed into the same HotCRP account as another row: {shown}{more}",
+            file=sys.stderr,
+        )
     return reserves

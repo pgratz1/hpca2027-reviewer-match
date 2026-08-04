@@ -23,12 +23,13 @@ from __future__ import annotations
 from .paths import assignment_path, cache_path, curated_path, input_path, report_path
 
 import csv
+import datetime
 import sys
 from dataclasses import dataclass
 
 from . import pc_membership
 from .dblp import parse_pid
-from .reviewers import _latest_rows_by_email, field, load_dblp_overrides
+from .reviewers import TIMESTAMP_FORMAT, _latest_rows_by_email, field, load_dblp_overrides
 
 
 @dataclass
@@ -44,6 +45,13 @@ class AreaChair:
     tertiary: str
     keywords: str
     pid_from_override: bool = False
+    # See Reviewer.hotcrp_email in reviewers.py: the address a HotCRP bulk
+    # upload must use, defaulting to `email`.
+    hotcrp_email: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.hotcrp_email:
+            self.hotcrp_email = self.email
 
     @property
     def name(self) -> str:
@@ -80,19 +88,26 @@ def load_area_chairs(
 
     chairs = []
     dropped: list[str] = []
+    timestamps: dict[str, datetime.datetime] = {}
     for row in _latest_rows_by_email(rows):
         membership = field(row, "Area Chair membership")
         if not membership.lower().startswith("yes"):
             continue
         email = field(row, "email address").lower()
+        timestamps[email] = datetime.datetime.strptime(row["Timestamp"].strip(), TIMESTAMP_FORMAT)
         first, last = field(row, "First Name"), field(row, "Last Name")
-        if index is not None and index.match(email, first, last)[0] is None:
-            dropped.append(email)
-            continue
+        hotcrp_email = email
+        if index is not None:
+            acct, how = index.match(email, first, last)
+            if acct is None:
+                dropped.append(email)
+                continue
+            hotcrp_email = pc_membership.hotcrp_email_for(email, acct, how)
         dblp_url = field(row, "DBLP")
         chairs.append(
             AreaChair(
                 email=email,
+                hotcrp_email=hotcrp_email,
                 first=first,
                 last=last,
                 dblp_url=dblp_url,
@@ -108,6 +123,22 @@ def load_area_chairs(
 
     if index is not None:
         pc_membership.report_pruned(dropped, len(chairs), "area chairs", index)
+
+    # Same reasoning as reviewers.py: a chair who resubmitted under a second
+    # real address is two rows here for one HotCRP account, and the later
+    # submission wins. Done before the tag-supplement extend below, which has
+    # its own dedup against `chairs` and would otherwise be checked against
+    # a chair who is about to be collapsed away.
+    chairs, collapsed = pc_membership.collapse_by_hotcrp_email(chairs, timestamps)
+    if collapsed:
+        shown = ", ".join(f"{lost} -> {kept}" for kept, lost in sorted(collapsed)[:5])
+        more = f", +{len(collapsed) - 5} more" if len(collapsed) > 5 else ""
+        print(
+            f"{len(collapsed)} area-chair submission(s) under a second address "
+            f"collapsed into the same HotCRP account as another row: {shown}{more}",
+            file=sys.stderr,
+        )
+
     if index is not None and supplement is not None:
         chairs.extend(_tagged_without_a_form_row(index, chairs, supplement))
     return chairs
@@ -162,6 +193,7 @@ def _tagged_without_a_form_row(index, chairs: list[AreaChair], supplement) -> li
         added.append(
             AreaChair(
                 email=donor.email,
+                hotcrp_email=acct.email,
                 first=donor.first or acct.given,
                 last=donor.last or acct.family,
                 dblp_url=donor.dblp_url,

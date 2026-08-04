@@ -141,6 +141,7 @@ class Account:
         self.country = row.get("country", "").strip()
         self.roles = row.get("roles", "").strip()
         self.tags = row.get("tags", "").strip()
+        self.collaborators = row.get("collaborators", "").strip()
         self.disabled = row.get("disabled", "").strip().lower() == "yes"
 
         self.name = " ".join(p for p in (self.given, self.family) if p)
@@ -319,6 +320,55 @@ class PcIndex:
             return self._first(self.by_local[local]), "local"
 
         return None, ""
+
+
+def hotcrp_email_for(email: str, acct: Account | None, how: str) -> str:
+    """The address to write into a HotCRP bulk upload for this roster row.
+
+    `match()` may find the account by name or local part rather than email --
+    accepting from one address while HotCRP knows them under another is
+    ordinary here (see module docstring). Writing the roster row's own
+    address into a bulk-assignment CSV in that case fails on upload, since
+    HotCRP checks the exact address: only the account's own email is one it
+    will recognize as `pc`.
+    """
+    return acct.email.lower() if acct is not None and how != "email" else email
+
+
+def collapse_by_hotcrp_email(records: list, ranks: dict[str, object] | None = None):
+    """One record per HotCRP account: the highest-ranked among duplicates.
+
+    Someone who resubmits a roster form under a second real address (not a
+    typo of the first, an address `match()` resolves to a different account
+    than their own) produces two roster rows for one person. Left alone, the
+    assignment stage sees two distinct candidates who happen to share a
+    `hotcrp_email`, and can hand the same real person two reviews on one
+    paper -- invisible in the roster, since the two rows never compare equal
+    on `email`.
+
+    Every record must expose `.email` and `.hotcrp_email`. `ranks[record.email]`
+    breaks ties -- for a roster with resubmission timestamps, pass those, so
+    the same "latest wins" policy applies as for same-email duplicates
+    (`_latest_rows_by_email`). Without `ranks`, the first record encountered
+    for each account wins.
+
+    Returns (survivors, collapsed), where `collapsed` is
+    `[(kept_email, dropped_email), ...]` for callers that want to report it.
+    """
+    best: dict[str, tuple] = {}
+    for i, r in enumerate(records):
+        rank = ranks[r.email] if ranks is not None else 0
+        prior = best.get(r.hotcrp_email)
+        if prior is None or rank > prior[0]:
+            best[r.hotcrp_email] = (rank, i, r)
+    kept_by_hotcrp = {h: v[2] for h, v in best.items()}
+    collapsed = [
+        (kept_by_hotcrp[r.hotcrp_email].email, r.email)
+        for r in records
+        if kept_by_hotcrp[r.hotcrp_email] is not r
+    ]
+    survivors = sorted(kept_by_hotcrp.values(), key=lambda r: best[r.hotcrp_email][1])
+    return survivors, collapsed
 
 
 _CACHE: dict[tuple[str, int, int], PcIndex] = {}

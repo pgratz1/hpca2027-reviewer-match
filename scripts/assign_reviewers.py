@@ -104,16 +104,21 @@ from __future__ import annotations
 from reviewer_match.paths import assignment_path, cache_path, curated_path, input_path, report_path
 
 import argparse
+import csv
 import json
+import os
 import sys
+import tempfile
 from collections import Counter, defaultdict, deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
 from reviewer_match import affiliation_country
 from reviewer_match import coauthor_coi
+from reviewer_match import collaborator_coi
 from reviewer_match import fingerprint as fp
 from scripts.classify_reviewers import DEFAULT_OUT as DEFAULT_SENIORITY, load_seniority
 from reviewer_match.paper_matching import (
@@ -1247,6 +1252,44 @@ def report_coauthor_coi(
     )
 
 
+def report_collaborator_coi(papers: list[dict], derived: dict, reviewers_by_email: dict) -> None:
+    """Print what the declared-collaborator layer found, and how much of it excluded.
+
+    Only the `name` kind is excluded (see collaborator_coi.hard_conflicts);
+    `affiliation` is reported here but not applied, so the counts below
+    separate "excluded" from "found but left as informational."
+
+    Unlike the co-author layer this one has no coverage gap to report: every
+    HotCRP account, reviewer or author, is either in the export or it is not,
+    and `collaborator_coi.build_index`/`derive_conflicts` read directly from
+    it rather than a separately-built cache that could be stale or missing a
+    PID.
+    """
+    total = new = excluded = 0
+    by_kind: dict[str, int] = defaultdict(int)
+    for found in derived.values():
+        for email, coi in found.items():
+            total += 1
+            by_kind[coi.kind] += 1
+            if coi.kind == "name":
+                excluded += 1
+            if not coi.declared:
+                new += 1
+    print(f"\n=== Derived declared-collaborator COI ===")
+    print(f"Reviewer-paper pairs found: {total} over {len(derived)} of "
+          f"{len(papers)} paper(s); {excluded} excluded (name match), "
+          f"{total - excluded} reported only (affiliation overlap)")
+    print(f"  already declared: {total - new}   not declared anywhere: {new}")
+    for kind, count in sorted(by_kind.items(), key=lambda kv: -kv[1]):
+        print(f"    {count:>6}  {kind}")
+    print(
+        "Name matches are excluded like a declared conflict; affiliation "
+        "overlap is HotCRP's own 'may conflict' signal too, but too coarse "
+        "to hard-block on -- see reviewer_match.collaborator_coi. Run "
+        "`make collaborator-coi` for the itemised report.", file=sys.stderr,
+    )
+
+
 def area_pool_stats(
     candidate_emails: list[str], reviewers_by_email: dict, light_cap: int, full_cap: int,
     reserve_cap: int = DEFAULT_RESERVE_CAP,
@@ -1323,9 +1366,59 @@ def shortage_report(
     return total_missing
 
 
+def write_hotcrp_csv(
+    path: str,
+    slates: Mapping[int, Sequence[str]],
+    score_lookup: Mapping[tuple[str, int], float],
+    reviewers_by_email: Mapping[str, object],
+) -> None:
+    """Atomically write the final slates as a replacing HotCRP R1 upload.
+
+    Writes each reviewer's `hotcrp_email`, not the roster key `email`: for
+    someone pc_membership matched under a different address than the one on
+    their acceptance-form row, `email` is what they typed, but `hotcrp_email`
+    is the address HotCRP actually has marked `pc` -- the only one a bulk
+    upload will accept.
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            newline="",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            temporary = Path(f.name)
+            writer = csv.writer(f)
+            writer.writerow(["paper", "action", "email", "round"])
+            writer.writerow(["all", "clearreview", "all", "R1"])
+            for pid in sorted(slates):
+                emails = sorted(
+                    slates[pid],
+                    key=lambda email: (-score_lookup[(email, pid)], email),
+                )
+                for email in emails:
+                    hotcrp_email = reviewers_by_email[email].hotcrp_email
+                    writer.writerow([pid, "primaryreview", hotcrp_email, "R1"])
+        os.replace(temporary, target)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--data", default=DEFAULT_DATA, help="path to the HotCRP paper export JSON")
+    parser.add_argument(
+        "--hotcrp-csv",
+        help="write the final slates as a HotCRP bulk-update CSV that replaces all R1 reviews",
+    )
     parser.add_argument(
         "--paper-policy", choices=PAPER_POLICIES, default="registered",
         help="paper selection policy (default: registered)",
@@ -1437,6 +1530,15 @@ def main() -> int:
     parser.add_argument(
         "--coauthor-years", type=int, default=coauthor_coi.DEFAULT_COAUTHOR_YEARS,
         help="calendar years of co-authorship that conflict (default: %(default)s)"
+    )
+    parser.add_argument(
+        "--no-collaborator-coi", action="store_true",
+        help="disable the derived declared-collaborator COI. On by default: a "
+             "reviewer whose declared collaborators (data/inputs/hpca2027-pcinfo.csv) "
+             "name a paper's author, or who is named as a collaborator by an author "
+             "who declared one, is excluded whether or not pc_conflicts records it. "
+             "Affiliation overlap -- the same signal, but too coarse to hard-block "
+             "on -- is reported instead; see reviewer_match.collaborator_coi"
     )
     parser.add_argument(
         "--area-chair-csv", default=DEFAULT_AREA_CHAIR_CSV,
@@ -1650,6 +1752,27 @@ def main() -> int:
             use_identity=not args.no_coauthor_identity,
         )
 
+    # Same "conservative" direction, sourced from HotCRP's own declared
+    # `collaborators` field rather than DBLP -- see collaborator_coi's module
+    # docstring. Reads args.pcinfo directly, independent of --no-pc-check:
+    # that flag turns off roster *pruning*, a different question from
+    # whether this COI check can run. Only the name-matched subset is
+    # excluded; the noisier affiliation-overlap signal is reported, not
+    # hard-blocked -- see collaborator_coi.hard_conflicts.
+    collab_derived: dict[int, dict[str, collaborator_coi.CollaboratorConflict]] = {}
+    collab_hard: dict[int, set[str]] = {}
+    if not args.no_collaborator_coi:
+        try:
+            pcinfo_index = pc_membership.load_pc_accounts(args.pcinfo)
+        except (FileNotFoundError, ValueError) as exc:
+            parser.error(f"{exc}; needed for the declared-collaborator COI check, "
+                         f"or pass --no-collaborator-coi to assign without it")
+        collab_profiles = collaborator_coi.build_index(
+            list(reviewers_by_email.values()), pcinfo_index
+        )
+        collab_derived = collaborator_coi.derive_conflicts(papers, collab_profiles, pcinfo_index)
+        collab_hard = collaborator_coi.hard_conflicts(collab_derived)
+
     # Gated pairs drive the normal phases; area-released pairs (COI-only)
     # back the relaxation phases, so score_lookup and caps cover the superset.
     eligible_by_pid: dict[int, list[tuple[str, float]]] = {}
@@ -1659,15 +1782,15 @@ def main() -> int:
     for p in papers:
         pid = p["pid"]
         paper_vec = np.array(paper_cache[str(pid)]["vector"], dtype=np.float32)
-        coauthored = set(derived.get(pid, ()))
+        derived_conflicts = set(derived.get(pid, ())) | collab_hard.get(pid, set())
         pairs_all = eligible_scores(
             p, candidate_emails, candidate_matrix, paper_vec, reviewers_by_email,
-            area_gate=False, extra_conflicts=coauthored,
+            area_gate=False, extra_conflicts=derived_conflicts,
         )
         released_by_pid[pid] = pairs_all
         eligible_by_pid[pid] = pairs_all if args.no_area_gate else eligible_scores(
             p, candidate_emails, candidate_matrix, paper_vec, reviewers_by_email,
-            extra_conflicts=coauthored,
+            extra_conflicts=derived_conflicts,
         )
         for email, score in pairs_all:
             score_lookup[(email, pid)] = score
@@ -1689,6 +1812,8 @@ def main() -> int:
     if coauthor_index is not None:
         report_coauthor_coi(papers, derived, coauthor_index, reviewers_by_email,
                             args.coauthor_years)
+    if not args.no_collaborator_coi:
+        report_collaborator_coi(papers, collab_derived, reviewers_by_email)
 
     # The same-country cap binds before any phase runs, and no phase releases it.
     countries: list[CountryCap] = []
@@ -1984,6 +2109,12 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+    if args.hotcrp_csv:
+        try:
+            write_hotcrp_csv(args.hotcrp_csv, paper_held, score_lookup, reviewers_by_email)
+        except OSError as exc:
+            print(f"ERROR: could not write HotCRP CSV {args.hotcrp_csv}: {exc}", file=sys.stderr)
+            return 1
     return 0
 
 

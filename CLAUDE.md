@@ -126,21 +126,45 @@ contains spaces and parentheses — always quote it in shell commands).
   should not depend on that. With only 15 chairs, tightening COI can make the
   load bounds infeasible where the reviewer matcher would under-fill; that
   surfaces as `ValueError`, which is the honest outcome.
+- `make clear-uploads` writes the **undo half** of the two HotCRP uploads —
+  `outputs/assignments/clear_assignment.csv` (one `all,clearreview,all,R1` row;
+  `CLEAR_ROUND=all` widens it to every round), `clear_paper_tags.csv`
+  (`all,cleartag,,track_N,`) and `clear_account_tags.csv`
+  (`email,remove_tags,add_tags`, the last cell empty — **the empty column has
+  to be there**: `p_profile.php`'s `save_bulk` reads a first line holding under
+  two commas as a plain list of emails unless it also passes the newer
+  `(?:user|email)` test, re-quotes every row into a single field and validates
+  it whole as an address. That is the "Invalid email address, line 2" a
+  two-column header produced on the live instance. The empty cell itself is a
+  no-op: `UserStatus::parse_csv_main` skips any column whose trimmed value is
+  empty). Offline, instant, read-only. Two things `make area-chairs`
+  cannot do: account rows come from the **user export**, not the chair roster,
+  which is what reaches a chair who left the roster still carrying `~~track_N`
+  (the roster is unioned in as a second source, since an export predating the
+  last upload cannot know what it wrote); and **non-canonical spellings are
+  cleared too** (`track1`/`~~track1` are live on this data), while a tag merely
+  containing the word — `TRC-track` — is not. Every row names an address the
+  export lists, because HotCRP's bulk user importer **creates** an account for
+  an unknown email. Tag spellings and the ceiling are imported from
+  `assign_area_chairs.py`, never restated: a clearing file that spells a tag
+  differently reports success and leaves it in place. `~~area-chairs`,
+  conflicts and preferences are never touched.
 - `make complete-papers` and `make area-chairs-complete` retain the former
   completeness filter in separate `*-complete.txt` artifacts.
 - Library modules (imported, never run): `src/reviewer_match/reviewers.py`, `src/reviewer_match/dblp.py`,
   `src/reviewer_match/paper_matching.py`, `src/reviewer_match/fingerprint.py`, `src/reviewer_match/specter2_model.py`,
   `src/reviewer_match/reserve_reviewers.py`, `src/reviewer_match/roster.py`, `src/reviewer_match/affiliation_country.py`,
-  `src/reviewer_match/pc_membership.py`, `src/reviewer_match/coauthor_coi.py`. Runnable
+  `src/reviewer_match/pc_membership.py`, `src/reviewer_match/coauthor_coi.py`,
+  `src/reviewer_match/collaborator_coi.py`. Runnable
   scripts: `scripts/audit_pc_roster.py`, `scripts/find_duplicate_accounts.py`,
-  `scripts/audit_coauthor_conflicts.py`,
+  `scripts/audit_coauthor_conflicts.py`, `scripts/audit_collaborator_conflicts.py`,
   `scripts/audit_reserve_identities.py`, `scripts/classify_reviewers.py`, `scripts/build_fingerprints.py`,
   `scripts/enrich_publications.py`, `scripts/assign_reviewers.py`, `scripts/score_papers.py`,
   `scripts/nearest_neighbors.py`, `scripts/compare_abstract_rankings.py`,
   `scripts/score_abstract_evaluation.py`, `scripts/assign_area_chairs.py`,
   `scripts/estimate_reserve_need.py`, `scripts/build_reserve_reviewer_info.py`,
   `scripts/resolve_reserve_pids.py`, `scripts/build_dblp_snapshot_cache.py`,
-  `scripts/build_affiliation_countries.py`,
+  `scripts/build_affiliation_countries.py`, `scripts/generate_clear_uploads.py`,
   `scripts/resolve_trc_members.py`, `scripts/main.py`.
 
 ## Architecture (filter-then-rank, then constrained assignment)

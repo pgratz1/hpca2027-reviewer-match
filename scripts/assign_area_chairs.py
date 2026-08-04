@@ -21,16 +21,21 @@ from __future__ import annotations
 from reviewer_match.paths import assignment_path, cache_path, curated_path, input_path, report_path
 
 import argparse
+import csv
 import json
 import math
+import os
 import re
 import sys
+import tempfile
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
 from reviewer_match import coauthor_coi
+from reviewer_match import collaborator_coi
 from reviewer_match import fingerprint as fp
 from reviewer_match import pc_membership
 from reviewer_match.area_chairs import AreaChair
@@ -47,6 +52,14 @@ DEFAULT_ASSIGNMENT = assignment_path("assignment.txt")
 DEFAULT_DATA = input_path("hpca2027-data.json")
 DEFAULT_FINGERPRINT_CACHE = cache_path("area_chair_fingerprints.json")
 DEFAULT_PAPER_CACHE = cache_path("paper_fingerprints.json")
+
+# Reruns reassign papers as the matching stabilizes, so write_paper_tag_csv
+# clears every track tag up to this ceiling before reapplying the current
+# set -- the same "clear then reinstall" idiom assign_reviewers.py already
+# uses for R1 reviews. Cleared unconditionally, not just this run's chair
+# count, so a shrunk chair roster doesn't strand a previous run's
+# higher-numbered tags on papers that moved away from them.
+DEFAULT_TRACK_CLEAR_CEILING = 50
 
 _PAPER_HEADER_RE = re.compile(r"^=== \[(\d+)\]")
 _ASSIGNED_RE = re.compile(r"^    assigned (\d+) of")
@@ -100,6 +113,25 @@ def chair_conflicts(papers, chairs, args, parser) -> dict[int, set[str]]:
               f"pass this layer silently", file=sys.stderr)
     for pid, found in derived.items():
         conflicts[pid] |= set(found)
+
+    if not args.no_collaborator_coi:
+        try:
+            pcinfo_index = pc_membership.load_pc_accounts(args.pcinfo)
+        except (FileNotFoundError, ValueError) as exc:
+            parser.error(f"{exc}; needed for the declared-collaborator COI check, "
+                         f"or pass --no-collaborator-coi to assign without it")
+        collab_profiles = collaborator_coi.build_index(chairs, pcinfo_index)
+        collab_derived = collaborator_coi.derive_conflicts(papers, collab_profiles, pcinfo_index)
+        # Only the name-matched subset excludes; affiliation overlap is
+        # reported (make collaborator-coi) but too coarse to hard-block on
+        # -- see collaborator_coi's module docstring.
+        collab_hard = collaborator_coi.hard_conflicts(collab_derived)
+        collab_total = sum(len(found) for found in collab_hard.values())
+        print(f"Declared-collaborator COI: {collab_total} chair-paper pair(s) "
+              f"excluded (name match) over {len(collab_hard)} paper(s)", file=sys.stderr)
+        for pid, found in collab_hard.items():
+            conflicts[pid] |= found
+
     return conflicts
 
 
@@ -248,6 +280,119 @@ def maximize_balanced_affinity(
     return result
 
 
+def paper_track_tag(n: int) -> str:
+    """Chair index n's paper tag -- the tag that *names* the HotCRP track.
+
+    Plain, not `~~`-prefixed, so the chair can see it on their own papers and
+    search `#track_N` to pull up their pile; a `~~` tag is chair-hidden and
+    invisible to the very person it exists for. Naming a track is enough to
+    make HotCRP register the tag chair-readonly, so an ordinary PC member
+    still cannot tag a paper into a track.
+    """
+    return f"track_{n}"
+
+
+def account_track_tag(n: int) -> str:
+    """Chair index n's PC-account grant -- what the track's permissions name.
+
+    Stays `~~`-prefixed, and so chair-only: this is the chair-to-track
+    mapping, which the PC has no reason to see. Paper tags and account tags
+    are separate HotCRP namespaces, so this differs from `paper_track_tag`
+    only in visibility, never in which track it refers to.
+    """
+    return f"~~track_{n}"
+
+
+def write_account_tag_csv(
+    path: str,
+    chairs_by_email: dict[str, AreaChair],
+    track_number: dict[str, int],
+    clear_through: int = DEFAULT_TRACK_CLEAR_CEILING,
+) -> None:
+    """Atomically write a HotCRP Settings -> Accounts bulk-tag CSV.
+
+    Uses `remove_tags`/`add_tags`, never the plain `tags` column: HotCRP's
+    bulk user importer treats a bare `tags` value as a full replacement of
+    the account's entire tag set (wiping `~~area-chairs` and anything else
+    unrelated), while `remove_tags`/`add_tags` touch only the named tags.
+    `remove_tags` clears every track tag up to `clear_through` before
+    `add_tags` grants the current one, so a chair whose track number shifted
+    since the last run doesn't keep the stale tag too.
+
+    Keyed on `chair.hotcrp_email`, not the roster's `email`: a chair matched
+    under a different address than their acceptance-form row would otherwise
+    get tagged on an account HotCRP doesn't consider `pc` at all.
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            newline="",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            temporary = Path(f.name)
+            writer = csv.writer(f)
+            writer.writerow(["email", "remove_tags", "add_tags"])
+            remove_tags = " ".join(account_track_tag(n) for n in range(clear_through))
+            for email in sorted(track_number):
+                hotcrp_email = chairs_by_email[email].hotcrp_email
+                writer.writerow(
+                    [hotcrp_email, remove_tags, account_track_tag(track_number[email])]
+                )
+        os.replace(temporary, target)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def write_paper_tag_csv(
+    path: str,
+    by_chair: dict[str, list[int]],
+    track_number: dict[str, int],
+    clear_through: int = DEFAULT_TRACK_CLEAR_CEILING,
+) -> None:
+    """Atomically write a HotCRP Assignments bulk-update CSV clearing every
+
+    track tag up to `clear_through`, then tagging every paper into its
+    chair's track -- a rerun-safe replacement, not an addition, so a paper
+    that moved to a different chair since the last run doesn't keep both tags.
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            newline="",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            temporary = Path(f.name)
+            writer = csv.writer(f)
+            writer.writerow(["paper", "action", "email", "tag", "round"])
+            for n in range(clear_through):
+                writer.writerow(["all", "cleartag", "", paper_track_tag(n), ""])
+            for email in sorted(by_chair):
+                tag = paper_track_tag(track_number[email])
+                for pid in sorted(by_chair[email]):
+                    writer.writerow([pid, "tag", "", tag, ""])
+        os.replace(temporary, target)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--csv", default=DEFAULT_CSV, help="area-chair acceptance CSV")
@@ -259,11 +404,18 @@ def main() -> int:
     )
     parser.add_argument("--fingerprint-cache", default=DEFAULT_FINGERPRINT_CACHE)
     parser.add_argument("--paper-cache", default=DEFAULT_PAPER_CACHE)
-    parser.add_argument("--load-tolerance", type=float, default=0.10)
+    parser.add_argument(
+        "--load-tolerance", type=float, default=0.0,
+        help="fractional chair-load tolerance (default: 0, closest even split)",
+    )
     parser.add_argument("--area-weight", type=float, default=1.0)
     parser.add_argument(
         "--no-coauthor-coi", action="store_true",
         help="disable the derived co-author COI (on by default, as for reviewers)"
+    )
+    parser.add_argument(
+        "--no-collaborator-coi", action="store_true",
+        help="disable the derived declared-collaborator COI (on by default, as for reviewers)"
     )
     parser.add_argument(
         "--coauthor-years", type=int, default=coauthor_coi.DEFAULT_COAUTHOR_YEARS,
@@ -287,6 +439,20 @@ def main() -> int:
              "rosters. Also disables tag-sourced chairs, since both read the export"
     )
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--account-tag-csv",
+        help="write a HotCRP Settings->Accounts bulk-tag CSV granting each chair their ~~track_N",
+    )
+    parser.add_argument(
+        "--paper-tag-csv",
+        help="write a HotCRP Assignments bulk-update CSV tagging each paper into its chair's track_N",
+    )
+    parser.add_argument(
+        "--track-clear-ceiling", type=int, default=DEFAULT_TRACK_CLEAR_CEILING,
+        help="clear track_0..track_(N-1) from papers, and ~~track_0..~~track_(N-1) from "
+             "chair accounts, before reapplying; covers a shrunk chair roster too "
+             "(default: %(default)s)",
+    )
     args = parser.parse_args()
     if not 0 <= args.load_tolerance < 1:
         parser.error("--load-tolerance must be at least 0 and less than 1")
@@ -368,7 +534,10 @@ def main() -> int:
         similarities = chair_matrix @ paper_vec
         conflicts = conflicts_by_pid[pid]
         for email, score in zip(chair_emails, similarities):
-            if email in conflicts:
+            # pc_conflicts is declared against the chair's HotCRP account
+            # address, which may differ from the roster key -- see the same
+            # check in paper_matching.eligible_scores.
+            if email in conflicts or chairs_by_email[email].hotcrp_email.lower() in conflicts:
                 conflict_pairs += 1
                 continue
             scores[(pid, email)] = float(score)
@@ -406,7 +575,10 @@ def main() -> int:
         assigned_scores.append(score)
         by_chair[email].append(pid)
 
-    for email in sorted(chair_emails, key=lambda e: (chairs_by_email[e].name.lower(), e)):
+    ordered_chairs = sorted(chair_emails, key=lambda e: (chairs_by_email[e].name.lower(), e))
+    track_number = {email: i for i, email in enumerate(ordered_chairs)}
+
+    for email in ordered_chairs:
         chair = chairs_by_email[email]
         pids = sorted(by_chair[email])
         mean_score = (
@@ -417,6 +589,8 @@ def main() -> int:
         print(f"\n=== {chair.name} <{email}>")
         print(
             f"    primary area: {chair.primary}\n"
+            f"    track: {paper_track_tag(track_number[email])} "
+            f"(account tag {account_track_tag(track_number[email])})\n"
             f"    assigned {loads[email]} papers; mean affinity {mean_label}"
         )
         for pid in pids:
@@ -446,6 +620,20 @@ def main() -> int:
         f"mean affinity {sum(assigned_scores) / len(assigned_scores):.3f}.",
         file=sys.stderr,
     )
+
+    clear_through = max(len(ordered_chairs), args.track_clear_ceiling)
+    if args.account_tag_csv:
+        try:
+            write_account_tag_csv(args.account_tag_csv, chairs_by_email, track_number, clear_through)
+        except OSError as exc:
+            print(f"ERROR: could not write account tag CSV {args.account_tag_csv}: {exc}", file=sys.stderr)
+            return 1
+    if args.paper_tag_csv:
+        try:
+            write_paper_tag_csv(args.paper_tag_csv, by_chair, track_number, clear_through)
+        except OSError as exc:
+            print(f"ERROR: could not write paper tag CSV {args.paper_tag_csv}: {exc}", file=sys.stderr)
+            return 1
     return 0
 
 
