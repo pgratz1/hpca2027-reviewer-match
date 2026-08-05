@@ -332,7 +332,8 @@ per-reviewer caps (`--light-cap` / `--full-cap`, or the CSV's per-reviewer
 override column) and `--reviewers-per-paper`. Solved by paper-proposing
 deferred acceptance (Hospital/Residents stable matching), run in phases that
 enforce **seniority constraints** from `outputs/reports/reviewer_seniority.csv` — each paper
-should get ≥ `--min-seniors` (1) senior reviewers, ≤ `--max-juniors` (1)
+should get ≥ `--min-seniors` (1) senior reviewers, ≤ `--max-juniors` (script
+default 1, but `make` passes **2** — see "The policy pair" below)
 juniors, and ≤ `--max-out-of-area` (3) out-of-area reviewers — and a **full
 slate** of `--reviewers-per-paper` (5). When the normal constraints can't fill a paper's slate or senior
 slot, they are released per-paper in a fixed order, each relaxed pool still
@@ -413,7 +414,8 @@ does not read as the assignment getting worse.
 
 #### Same-country cap
 
-**On by default at 2.** A paper whose authors are mostly from country C gets at
+**On by default.** The script's own default is 2; **`make` passes 1** (see "The
+policy pair" below). A paper whose authors are mostly from country C gets at
 most `--same-country-cap N` reviewers affiliated in C. The same rule applies to
 every country: a US paper is capped on US reviewers exactly as a Chinese paper
 is capped on Chinese ones, and **no country is named in the policy** — the set
@@ -458,6 +460,43 @@ before `data/curated/affiliation_countries.csv` was filled in, `.cn` and `.kr` w
 while `.edu` and `.com` were not, so US institutions were essentially invisible
 and **US did not appear once among the majority countries**. Read the coverage
 numbers before trusting a run.
+
+### The policy pair: `SAME_COUNTRY_CAP=1`, `MAX_JUNIORS=2`
+
+The Makefile passes a same-country cap of **1** and a junior cap of **2**, both
+overridable (`make SAME_COUNTRY_CAP=2`, `make MAX_JUNIORS=1`,
+`make SAME_COUNTRY_CAP=off`). They were chosen together off a 7-cell sweep of
+(cap 3 / 2 / 1 / off) × (juniors 1 / 2), run once affiliation coverage reached
+99.1% — an earlier sweep at 84% coverage was not trustworthy, because a reviewer
+who cannot be placed can never consume a cap.
+
+Against the former cap 2 / 1 junior, on identical inputs:
+
+| | cap 2 / jun 1 | cap 1 / jun 2 |
+|---|---|---|
+| mean match goodness | 0.9647 | **0.9650** |
+| worst-50 tail | 0.9345 | **0.9363** |
+| reviewer-paper pairs | 6,172 | **6,283** |
+| papers needing a relaxed constraint | 60 | **47** |
+| papers trading a same-country reviewer | 400 | **631** |
+| papers left short by the cap | 0 | 0 |
+
+Better on every quality measure *and* substantially stricter on country. The
+sweep settled two things worth keeping. **The country cap is nearly free**: the
+whole span from `off` to `1` costs 0.0006 of a mean against a 0.011 standard
+deviation, and never leaves a paper short. **The junior lever is worth about ten
+times the country lever**, so loosening juniors more than pays for tightening
+the cap. The cost is real, and it is the junior half: **409 of 1,157 papers
+carry two juniors instead of at most one.**
+
+These are *operational* defaults living in the Makefile, the same arrangement as
+`PAPER_POLICY`. The scripts' own defaults stay 2 and 1, so invoking
+`assign_reviewers.py` directly is unchanged.
+
+One thing not to misread: at cap 1 the **split blocking-pair count is not 0** (1
+today, among capped papers). That is the crossing-family consequence described
+just below, not a regression; `country_over == 0` is the invariant that replaces
+stability for capped papers, and it holds.
 
 **One caveat on stability.** `{juniors, out-of-area, country}` is a *crossing*
 family — a reviewer from the paper's country can also be junior or out-of-area —
@@ -925,6 +964,44 @@ of 6; `make reserves` has to have run first, since the pool needs
     --paper-policy submitted --include-reserves --reserve-cap 6
 ```
 
+#### Reserves elevated to the PC (`~~ex-rr`)
+
+Some reserves are promoted onto the committee proper. Because they never filled
+in an acceptance form, the promotion exists only as HotCRP tags: `~~ex-rr` says
+it happened, and `pc-light`/`pc-full` says to which tier. `load_reserve_reviewers`
+reads both off the matched account and stamps that tier instead of `reserve`, so
+they are capped at `--light-cap`/`--full-cap` rather than `--reserve-cap`, and
+counted as PC members in the capacity and conflict-coverage tables. Five accounts
+are in this state today, all light.
+
+Three rules make it safe:
+
+- **The tier tag is only read for an ex-reserve.** Roughly 474 accounts carry
+  `pc-light`/`pc-full` — effectively the whole PC — and for anyone who returned
+  the form, that form's `PC membership` column stays the tier authority. The tag
+  agrees with it on all but a handful, but the form is the answer the person
+  actually gave. Only someone with no form row is tiered from the tag.
+- **An unsettled tier promotes nobody.** An `~~ex-rr` account carrying neither
+  tier tag, or both, stays a reserve at the reserve cap, and is named on stderr
+  and by `make pc-roster`. A reserve still reviews, so waiting for the tag to be
+  fixed costs one paper; inventing a tier hands someone a fifteen-paper load they
+  never agreed to.
+- **They stay on the reserve roster.** It is still the only source of their DBLP
+  page and derived areas, so `make reserves` keeps building their fingerprint and
+  seniority row, and their senior/typical/junior/out-of-area class is produced by
+  the same `classify()` and the same PCDB overrides as everyone else's. Only the
+  tier and the pool membership change; `tier` is not part of the fingerprint
+  cache key, so promoting somebody re-embeds nothing.
+
+Because they are PC members, they are in the pool **whether or not reserves are
+being assigned from** — `--include-reserves` gates the reserve bench, not them.
+That makes `data/cache/reserve_fingerprints.json` and
+`outputs/reports/reserve_seniority.csv` prerequisites of every assignment,
+including `make RESERVE_CAP=off`; a missing one is a named error pointing at
+`make reserves`, because silently dropping five sitting PC members is worse than
+failing. Under `--no-pc-check` there is no export and so no tags: nobody is
+promoted, everyone stays a reserve, and the run warns about it.
+
 ### `scripts/audit_reserve_identities.py` — cross-check the reserves' DBLP pages
 
 A name check cannot tell two people apart when they share a name — a computer
@@ -999,6 +1076,15 @@ Both files are always written, even when empty, and sorted by email, so a re-run
 against a fresh export diffs cleanly rather than going stale. A useful sanity
 signal: `no_roster_row` counts drop to zero as invitees answer the form, so a
 number that *stays* up is a real question, not a backlog.
+
+Two tag reconciliations follow on stderr, neither of which fits either CSV.
+`~~area-chairs` against the area-chair form, both directions; and `~~ex-rr`
+against the reserve roster and the tier tags, which is where the promotion of a
+reserve onto the PC either resolves or does not. It flags the two ways it can
+fail silently: an account carrying neither or both of `pc-light`/`pc-full`, whose
+tier is not settled and who therefore stays a reserve; and one on no reserve
+roster row at all, where there is no DBLP page or areas to promote, so the tag
+changes nothing.
 
 If the export is missing, or is a truncated download in which nothing is marked
 `pc`, every script refuses to run rather than pruning the entire roster and

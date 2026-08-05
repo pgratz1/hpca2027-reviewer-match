@@ -17,6 +17,13 @@ free-text drift the acceptance form's areas need reconciling for.
 Records come back as real `Reviewer` objects carrying `tier="reserve"`, so every
 consumer that already takes a Reviewer — enrich_publications.py,
 build_fingerprints.py, classify_reviewers.py — takes a reserve unchanged.
+
+Some of them are since elevated to the PC, which HotCRP records as an `~~ex-rr`
+marker plus a `pc-light`/`pc-full` tag. Those come back carrying that tier
+instead, so they are capped and reported as the PC members they now are. They
+stay on this roster all the same: they never filled in an acceptance form, so
+this is still the only place their DBLP page and derived areas come from, and
+`make reserves` has to keep building their fingerprint and seniority row.
 """
 
 from __future__ import annotations
@@ -24,6 +31,7 @@ from __future__ import annotations
 from .paths import assignment_path, cache_path, curated_path, input_path, report_path
 
 import csv
+import sys
 from collections import Counter, defaultdict
 
 import json
@@ -119,6 +127,12 @@ def load_reserve_reviewers(
     are, and it matters more here: a recruit who is later stood down keeps the
     `reserve-reviewer` tag on their account, so the roster file alone cannot
     tell that the `pc` role is gone. `pcinfo_path=None` skips the check.
+
+    The export is also what says who has been elevated off the reserve bench:
+    an account tagged `~~ex-rr` and `pc-light`/`pc-full` gets that tier rather
+    than `reserve`. Without the export there are no tags, so nobody is promoted
+    and everyone here stays a reserve — the same degradation the area-chair tag
+    has, and the reason `audit_pc_roster.py`'s un-gated view is unaffected.
     """
     with open(data_path, encoding="utf-8") as f:
         papers = json.load(f)
@@ -131,6 +145,8 @@ def load_reserve_reviewers(
 
     reserves = []
     dropped: list[str] = []
+    promoted: list[tuple[str, str]] = []
+    untiered: list[str] = []
     for row in rows:
         email = (row.get("email") or "").strip().lower()
         if not email:
@@ -138,12 +154,23 @@ def load_reserve_reviewers(
         name = (row.get("name") or "").strip()
         first, _, last = name.partition(" ")
         hotcrp_email = email
+        tier = TIER
         if index is not None:
             acct, how = index.match(email, first, last)
             if acct is None:
                 dropped.append(email)
                 continue
             hotcrp_email = pc_membership.hotcrp_email_for(email, acct, how)
+            if acct.is_ex_reserve:
+                # An unresolvable tier leaves them a reserve rather than
+                # guessing. A reserve still reviews, just at the reserve cap,
+                # so the cost of waiting for the tag to be fixed is small and
+                # the cost of inventing a commitment level is not.
+                if acct.pc_tier is None:
+                    untiered.append(email)
+                else:
+                    tier = acct.pc_tier
+                    promoted.append((email, tier))
         topics = authored.get(email) or nominated.get(email) or Counter()
         areas = top_areas(topics, max_areas)
         areas += [""] * (3 - len(areas))
@@ -162,7 +189,7 @@ def load_reserve_reviewers(
                 secondary=areas[1],
                 tertiary=areas[2],
                 keywords="",
-                tier=TIER,
+                tier=tier,
                 override_cap=None,
                 # The roster is itself the hand-maintained identity layer
                 # (reserve_dblp_overrides.csv feeds it), so every PID here is a
@@ -173,6 +200,24 @@ def load_reserve_reviewers(
 
     if index is not None:
         pc_membership.report_pruned(dropped, len(reserves), "reserve reviewers", index)
+    if promoted:
+        by_tier = Counter(tier for _, tier in promoted)
+        counts = ", ".join(f"{tier} {n}" for tier, n in sorted(by_tier.items()))
+        print(
+            f"{len(promoted)} reserve reviewer(s) tagged `~~{pc_membership.EX_RESERVE_TAG}` "
+            f"are on the PC ({counts}) and load as PC members, not reserves: "
+            f"{', '.join(sorted(email for email, _ in promoted))}",
+            file=sys.stderr,
+        )
+    if untiered:
+        tags = "`/`".join(sorted(pc_membership.TIER_TAGS))
+        print(
+            f"WARNING: {len(untiered)} account(s) tagged `~~{pc_membership.EX_RESERVE_TAG}` "
+            f"carry neither or both of `{tags}`, so their PC tier is not settled and "
+            f"they stay reserves at the reserve cap: {', '.join(sorted(untiered))} — "
+            f"fix the tags in HotCRP",
+            file=sys.stderr,
+        )
 
     # No resubmission timestamp exists here (unlike the acceptance form), so
     # the first row for an account wins -- still better than two nominated

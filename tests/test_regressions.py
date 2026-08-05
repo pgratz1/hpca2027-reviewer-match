@@ -3784,6 +3784,145 @@ class ReserveMembershipTests(unittest.TestCase):
         self.assertEqual(["recruit@a.edu"], [r.email for r in people])
 
 
+class PromotedReserveTests(unittest.TestCase):
+    """`~~ex-rr`: a reserve elevated to the PC loads at their PC tier.
+
+    The promotion lives entirely in HotCRP tags -- these people never filled in
+    an acceptance form, so there is no other record of it. Getting it wrong is
+    quiet in both directions: missing it caps a PC member at the reserve load
+    and drops them from a PC-only run, while inventing one hands somebody a
+    fifteen-paper assignment they never agreed to.
+    """
+
+    def load(self, roster, accounts):
+        with contextlib.redirect_stderr(io.StringIO()):
+            return ReserveMembershipTests.load(
+                ReserveMembershipTests(), roster, accounts
+            )
+
+    def tier_of(self, tags):
+        people = self.load(
+            [("a@a.edu", "Ada Lovelace", "")],
+            [pc_account("a@a.edu", "Ada", "Lovelace", tags=tags)],
+        )
+        self.assertEqual(1, len(people))
+        return people[0].tier
+
+    def test_the_marker_and_a_tier_tag_promote_a_reserve(self):
+        self.assertEqual("light", self.tier_of("pc-light ~~ex-rr"))
+        self.assertEqual("full", self.tier_of("pc-full ~~ex-rr"))
+
+    def test_a_promoted_reserve_stays_on_the_reserve_roster(self):
+        # The tier changes; the roster does not. They never filled in a form, so
+        # this file is still the only source of their DBLP page and areas, and
+        # `make reserves` has to keep building their fingerprint and seniority.
+        people = self.load(
+            [("a@a.edu", "Ada Lovelace", "https://dblp.org/pid/1/A.html")],
+            [pc_account("a@a.edu", "Ada", "Lovelace", tags="pc-light ~~ex-rr")],
+        )
+        self.assertEqual(["a@a.edu"], [r.email for r in people])
+        self.assertEqual("1/A", people[0].pid)
+
+    def test_every_spelling_of_the_tags_resolves(self):
+        # HotCRP writes a tag plain, twiddled for a chairs-only tag, and with an
+        # order value appended. All three name the same tag.
+        self.assertEqual("light", self.tier_of("~~pc-light ~~ex-rr"))
+        self.assertEqual("light", self.tier_of("pc-light#3 ~~ex-rr#1"))
+        self.assertEqual("full", self.tier_of("~~PC-FULL ~~EX-RR"))
+
+    def test_an_unsettled_tier_leaves_them_a_reserve(self):
+        # Neither tag or both is not a tier. Guessing would assign a load the
+        # person never agreed to; staying a reserve merely under-uses them until
+        # the tag is fixed, which make pc-roster reports.
+        self.assertEqual("reserve", self.tier_of("~~ex-rr"))
+        self.assertEqual("reserve", self.tier_of("pc-light pc-full ~~ex-rr"))
+
+    def test_a_tier_tag_without_the_marker_promotes_nobody(self):
+        # ~474 accounts carry pc-light/pc-full -- effectively the whole PC. The
+        # tier tag is only ever read for an ex-reserve; for everyone else the
+        # acceptance form is the authority.
+        self.assertEqual("reserve", self.tier_of("pc-light"))
+        self.assertEqual("reserve", self.tier_of("pc-full reserve-reviewer"))
+
+    def test_a_containing_tag_is_not_the_tag(self):
+        # `endswith` would be wrong here the way it is right for ~~area-chairs:
+        # pc-full and pc-light are two answers to one question, not a family.
+        self.assertEqual("reserve", self.tier_of("~~ex-pc-full ~~ex-rr"))
+        self.assertEqual("reserve", self.tier_of("pc-full ~~not-ex-rr"))
+
+    def test_without_the_export_nobody_is_promoted(self):
+        # --no-pc-check: no export means no tags, so the promotion is invisible
+        # and everyone stays a reserve. assign_reviewers warns about exactly this.
+        with contextlib.redirect_stderr(io.StringIO()):
+            people = ReserveReviewerLoaderTests.load(
+                ReserveReviewerLoaderTests(),
+                [("a@a.edu", "Ada Lovelace", "")],
+                [{"pid": 1, "topics": ["Memory"], "reserve_reviewer": "",
+                  "authors": [], "contacts": []}],
+            )
+        self.assertEqual(["reserve"], [r.tier for r in people])
+
+    def test_the_tag_tests_have_one_definition(self):
+        acct = pc_membership.Account(
+            {"email": "a@a.edu", "roles": "pc", "tags": "pc-light ~~ex-rr"}
+        )
+        self.assertTrue(acct.is_ex_reserve)
+        self.assertEqual("light", acct.pc_tier)
+        self.assertIsNone(
+            pc_membership.Account({"email": "a@a.edu", "tags": "~~ex-rr"}).pc_tier
+        )
+
+    def test_a_promoted_reserve_is_capped_as_a_pc_member(self):
+        # The point of the whole change: light_cap, not reserve_cap.
+        def rv(tier):
+            return Reviewer(
+                email="e@x.edu", first="A", last="B", dblp_url="", pid=None,
+                affiliation="", primary="", secondary="", tertiary="", keywords="",
+                tier=tier, override_cap=None,
+            )
+
+        cap = assign_reviewers.reviewer_paper_cap
+        self.assertEqual(7, cap(rv("light"), 7, 15, 6))
+        self.assertEqual(15, cap(rv("full"), 7, 15, 6))
+        self.assertEqual(6, cap(rv("reserve"), 7, 15, 6))
+
+    def person(self, email, tier="reserve", hotcrp_email=""):
+        return Reviewer(
+            email=email, hotcrp_email=hotcrp_email or email, first="A", last="B",
+            dblp_url="", pid=None, affiliation="", primary="", secondary="",
+            tertiary="", keywords="", tier=tier, override_cap=None,
+        )
+
+    def test_the_promoted_are_split_from_the_reserve_bench(self):
+        promoted, already_pc, reserves = assign_reviewers.split_promoted_reserves(
+            [self.person("up@a.edu", "light"), self.person("bench@a.edu")], {}
+        )
+        self.assertEqual(["up@a.edu"], [r.email for r in promoted])
+        self.assertEqual(["bench@a.edu"], [r.email for r in reserves])
+        self.assertEqual([], already_pc)
+
+    def test_a_promoted_reserve_who_also_filled_the_form_is_not_duplicated(self):
+        # The form record carries their own declared areas and a PC fingerprint;
+        # the reserve record's areas are inferred. The form wins.
+        pool = {"ada@a.edu": self.person("ada@a.edu", "light")}
+        promoted, already_pc, _ = assign_reviewers.split_promoted_reserves(
+            [self.person("recruit@a.edu", "light", hotcrp_email="ada@a.edu")], pool
+        )
+        self.assertEqual([], promoted)
+        self.assertEqual(["recruit@a.edu"], already_pc)
+
+    def test_the_overlap_is_compared_on_the_hotcrp_address(self):
+        # Accepting under one address while holding the account under another is
+        # ordinary here; comparing roster addresses would file one person as two
+        # and assign them twice.
+        pool = {"ada@a.edu": self.person("ada@a.edu", "full", hotcrp_email="ada@b.edu")}
+        promoted, already_pc, _ = assign_reviewers.split_promoted_reserves(
+            [self.person("recruit@c.edu", "light", hotcrp_email="ada@b.edu")], pool
+        )
+        self.assertEqual([], promoted)
+        self.assertEqual(["recruit@c.edu"], already_pc)
+
+
 class PcRosterAuditTests(unittest.TestCase):
     """audit_pc_roster.py: both directions of the HotCRP cross-check."""
 

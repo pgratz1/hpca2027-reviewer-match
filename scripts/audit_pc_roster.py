@@ -291,6 +291,71 @@ def report_area_chairs(ac: dict) -> None:
               f"Re-run the assignment if it predates the tag.", file=sys.stderr)
 
 
+def collect_ex_reserves(index, data_path, reserve_info) -> dict:
+    """Reconcile HotCRP's `~~ex-rr` tag against the reserve roster and the tier tags.
+
+    A reserve elevated to the PC is recorded entirely in tags: `~~ex-rr` says the
+    promotion happened, `pc-light`/`pc-full` says to which tier. Two things can
+    go wrong, and both are silent everywhere else.
+
+    Neither tier tag, or both, and the tier is not settled, so
+    `load_reserve_reviewers` leaves them a reserve at the reserve cap rather than
+    guess at a load they never agreed to. Tagged but on no reserve roster row and
+    there is no record to promote at all -- no DBLP page, no derived areas -- so
+    the tag changes nothing.
+    """
+    reserves = {
+        r.email.lower() for r in reserve_reviewers.load_reserve_reviewers(
+            reserve_info, data_path, pcinfo_path=None)
+    }
+    tiered: list[tuple[str, str]] = []
+    untiered: list[str] = []
+    off_roster: list[str] = []
+    for acct in index.accounts:
+        if not acct.is_ex_reserve:
+            continue
+        email = acct.email.lower()
+        if acct.pc_tier is None:
+            untiered.append(email)
+        else:
+            tiered.append((email, acct.pc_tier))
+        if email not in reserves:
+            off_roster.append(email)
+    return {
+        "tiered": sorted(tiered),
+        "untiered": sorted(untiered),
+        "off_roster": sorted(off_roster),
+    }
+
+
+def report_ex_reserves(ex: dict) -> None:
+    """What the `~~ex-rr` tag will and will not do on the next assignment."""
+    total = len(ex["tiered"]) + len(ex["untiered"])
+    if not total:
+        return
+    by_tier = Counter(tier for _, tier in ex["tiered"])
+    counts = ", ".join(f"{tier} {n}" for tier, n in sorted(by_tier.items())) or "none"
+    print(f"\n{total} account(s) tagged `~~ex-rr`, elevated off the reserve bench "
+          f"onto the PC ({counts}). They keep their reserve-side fingerprint and "
+          f"seniority row, but load and are capped as PC members.", file=sys.stderr)
+
+    if ex["untiered"]:
+        print(f"    {len(ex['untiered'])} carry neither or both of `pc-light`/`pc-full`, "
+              f"so the tier is not settled and they stay reserves at the reserve cap. "
+              f"Fix the tags in HotCRP:", file=sys.stderr)
+        for email in ex["untiered"]:
+            print(f"        {email}", file=sys.stderr)
+    if ex["off_roster"]:
+        print(f"    {len(ex['off_roster'])} are on no reserve roster row, so there is no "
+              f"DBLP page or areas to promote and the tag changes nothing:",
+              file=sys.stderr)
+        for email in ex["off_roster"]:
+            print(f"        {email}", file=sys.stderr)
+    if not ex["untiered"] and not ex["off_roster"]:
+        print("    Every one of them resolves to a tier and a roster row.",
+              file=sys.stderr)
+
+
 def report(pruned: list[dict], missing: list[dict], pruned_path: str,
            missing_path: str) -> None:
     """Summarise both directions, settled rows kept apart from real work."""
@@ -394,11 +459,13 @@ def main() -> int:
 
     area_chairs = collect_area_chairs(index, args.area_chair_csv, args.csv,
                                       args.data, args.reserve_info)
+    ex_reserves = collect_ex_reserves(index, args.data, args.reserve_info)
 
     write_csv(args.pruned, PRUNED_FIELDS, pruned)
     write_csv(args.missing, MISSING_FIELDS, missing)
     report(pruned, missing, args.pruned, args.missing)
     report_area_chairs(area_chairs)
+    report_ex_reserves(ex_reserves)
     return 0
 
 

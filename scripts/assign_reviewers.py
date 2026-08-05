@@ -132,6 +132,7 @@ from reviewer_match.area_chairs import area_chair_emails, drop_area_chairs
 from reviewer_match.roster import DEFAULT_AREA_CHAIR_CSV
 from reviewer_match.reserve_reviewers import DEFAULT_DATA as DEFAULT_RESERVE_DATA
 from reviewer_match.reserve_reviewers import DEFAULT_INFO as DEFAULT_RESERVE_INFO
+from reviewer_match.reserve_reviewers import TIER as RESERVE_TIER
 from reviewer_match.reserve_reviewers import load_reserve_reviewers
 from reviewer_match.reviewers import load_reviewers
 
@@ -430,6 +431,34 @@ def reviewer_paper_cap(
     if r.tier == "reserve":
         return reserve_cap
     return full_cap
+
+
+def split_promoted_reserves(reserves, reviewers_by_email) -> tuple[list, list[str], list]:
+    """Split the reserve roster into (promoted, already on the PC roster, reserves).
+
+    A reserve HotCRP tags `~~ex-rr` comes off this roster carrying a `light` or
+    `full` tier, because they have been elevated to the committee. They are PC
+    members and belong in the pool whether or not reserves are being assigned
+    from -- excluding the reserve bench must not quietly exclude them too.
+
+    One of them who has since also returned the acceptance form is on both
+    rosters, and the form record wins: it carries the areas they declared
+    themselves and a fingerprint built from them, where the reserve record's
+    areas are inferred from the topics of papers they happened to author.
+    Comparison is on `hotcrp_email`, never the roster address -- accepting under
+    one address while holding the account under another is ordinary here, and
+    that is the whole reason `pc_membership` exists. Nobody is in both today.
+    """
+    pc_accounts = {r.hotcrp_email.lower() for r in reviewers_by_email.values()}
+    promoted, already_pc, true_reserves = [], [], []
+    for r in reserves:
+        if r.tier == RESERVE_TIER:
+            true_reserves.append(r)
+        elif r.hotcrp_email.lower() in pc_accounts:
+            already_pc.append(r.email)
+        else:
+            promoted.append(r)
+    return promoted, already_pc, true_reserves
 
 
 @dataclass(frozen=True)
@@ -1649,41 +1678,98 @@ def main() -> int:
             parser.error(str(exc))
         raise
 
-    if args.include_reserves:
-        reserves = load_reserve_reviewers(
-            args.reserve_info, args.data, pcinfo_path=pcinfo
-        )
+    # The reserve roster is read whether or not reserves are being assigned from,
+    # because it is also where the reserves who have since been elevated to the
+    # PC live: they never filled in an acceptance form, so this file is the only
+    # place their DBLP page and derived areas exist. They are PC members now, so
+    # they join the pool unconditionally -- excluding reserves must not quietly
+    # exclude five sitting PC members too.
+    reserves: list = []
+    if pcinfo:
+        try:
+            reserves = load_reserve_reviewers(
+                args.reserve_info, args.data, pcinfo_path=pcinfo
+            )
+        except FileNotFoundError:
+            if args.include_reserves:
+                raise
+            print(f"WARNING: {args.reserve_info} not found, so reserve reviewers "
+                  f"promoted to the PC cannot be identified and are absent from the "
+                  f"pool; run `make reserve-info`", file=sys.stderr)
+    elif args.include_reserves:
+        reserves = load_reserve_reviewers(args.reserve_info, args.data, pcinfo_path=None)
+        print("WARNING: --no-pc-check leaves the `~~ex-rr` tag unreadable, so any "
+              "reserve since promoted to the PC is assigned at the reserve cap",
+              file=sys.stderr)
+
+    promoted, already_pc, true_reserves = split_promoted_reserves(
+        reserves, reviewers_by_email
+    )
+    if already_pc:
+        print(f"{len(already_pc)} promoted reserve(s) also returned the acceptance "
+              f"form; the form record wins: {', '.join(sorted(already_pc))}",
+              file=sys.stderr)
+
+    merged = promoted + (true_reserves if args.include_reserves else [])
+    if merged:
         reserve_fp = fp.load_fingerprint_cache(args.reserve_fingerprint_cache)
-        reserve_seniority = (
-            {} if seniority is None else load_seniority(args.reserve_seniority)
-        )
-        # A reserve with no fingerprint cannot be scored and one with no
+        reserve_seniority = {}
+        if seniority is not None:
+            try:
+                reserve_seniority = load_seniority(args.reserve_seniority)
+            except FileNotFoundError:
+                reserve_seniority = {}
+        # Missing artifacts are fatal for the promoted half. A reserve silently
+        # absent from the pool is a thinner assignment; a PC member silently
+        # absent is the roster being wrong, which is the failure the membership
+        # check exists to prevent.
+        if promoted and not reserve_fp:
+            parser.error(
+                f"{args.reserve_fingerprint_cache}: not found or empty, so the "
+                f"{len(promoted)} reserve reviewer(s) promoted to the PC cannot be "
+                f"scored and would be dropped from the pool; run `make reserves`"
+            )
+        if promoted and seniority is not None and not reserve_seniority:
+            parser.error(
+                f"{args.reserve_seniority}: not found or empty, so the "
+                f"{len(promoted)} reserve reviewer(s) promoted to the PC would be "
+                f"unclassified and could never fill a senior slot; run `make reserves`"
+            )
+
+        # A reviewer with no fingerprint cannot be scored and one with no
         # seniority row cannot fill a senior slot. Either way they would simply
         # be absent from the pool, which is indistinguishable from having none —
         # so say so rather than let the roster silently shrink.
-        no_fp = [r.email for r in reserves if r.email not in reserve_fp]
+        no_fp = [r.email for r in merged if r.email not in reserve_fp]
         no_sen = [
-            r.email for r in reserves
+            r.email for r in merged
             if seniority is not None and r.email not in reserve_seniority
         ]
         if no_fp:
-            print(f"WARNING: {len(no_fp)} reserve(s) have no fingerprint in "
-                  f"{args.reserve_fingerprint_cache} and cannot be assigned: "
-                  f"{', '.join(no_fp[:5])}{' ...' if len(no_fp) > 5 else ''} — "
+            print(f"WARNING: {len(no_fp)} reserve-roster reviewer(s) have no "
+                  f"fingerprint in {args.reserve_fingerprint_cache} and cannot be "
+                  f"assigned: {', '.join(no_fp[:5])}{' ...' if len(no_fp) > 5 else ''} — "
                   f"run `make reserves`", file=sys.stderr)
         if no_sen:
-            print(f"WARNING: {len(no_sen)} reserve(s) have no row in "
+            print(f"WARNING: {len(no_sen)} reserve-roster reviewer(s) have no row in "
                   f"{args.reserve_seniority}; they can fill slots but never a "
                   f"senior one: {', '.join(no_sen[:5])}"
                   f"{' ...' if len(no_sen) > 5 else ''}", file=sys.stderr)
 
-        reviewers_by_email.update({r.email: r for r in reserves})
+        reviewers_by_email.update({r.email: r for r in merged})
         reviewer_fp.update(reserve_fp)
         if seniority is not None:
             seniority.update(reserve_seniority)
-        print(f"Reserve reviewers included: {len(reserves)} roster, "
-              f"{len(reserve_fp)} fingerprinted, {len(reserve_seniority)} classified "
-              f"(cap {args.reserve_cap} papers each)", file=sys.stderr)
+        if promoted:
+            by_tier = Counter(r.tier for r in promoted)
+            counts = ", ".join(f"{tier} {n}" for tier, n in sorted(by_tier.items()))
+            print(f"Ex-reserve reviewers promoted to the PC: {len(promoted)} "
+                  f"({counts}); assigned at the PC cap for their tier, not the "
+                  f"reserve cap", file=sys.stderr)
+        if args.include_reserves:
+            print(f"Reserve reviewers included: {len(true_reserves)} roster, "
+                  f"{len(reserve_fp)} fingerprinted, {len(reserve_seniority)} classified "
+                  f"(cap {args.reserve_cap} papers each)", file=sys.stderr)
 
     # An area chair chairs papers and reviews none. This has to run after the
     # reserve merge above, not inside the PC load: a reserve can be an area

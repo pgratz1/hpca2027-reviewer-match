@@ -28,9 +28,24 @@ PAPER_POLICY ?= submitted
 RESERVE_CAP ?= 6
 RESERVE_FLAG = $(if $(filter off,$(RESERVE_CAP)),,\
                     --include-reserves --reserve-cap $(RESERVE_CAP))
-SAME_COUNTRY_CAP ?= 2
+# One same-country reviewer per paper, and up to two juniors. Chosen together
+# off a 7-cell sweep of (cap 3/2/1/off) x (juniors 1/2) at 99.1% affiliation
+# coverage: this pair beats the former cap 2 / 1 junior on every quality measure
+# -- mean goodness 0.9650 vs 0.9647, worst-50 tail 0.9365 vs 0.9346, 6275 pairs
+# placed vs 6164, 47 papers needing a relaxed constraint vs 60 -- while taking
+# papers that trade away a better-matched same-country reviewer from 400 to 629.
+# The country cap is close to free (off -> 1 costs 0.0006 of a mean, against a
+# 0.011 std) and never leaves a paper short; the junior change is what actually
+# buys the quality, and it costs 409 of 1157 papers a second junior reviewer.
+# These are the *operational* defaults, the same way PAPER_POLICY is: the
+# scripts' own defaults stay at 2 and 1 so a bare `python -m scripts...` run is
+# unchanged. SAME_COUNTRY_CAP=off disables the cap; =0 admits no same-country
+# reviewer at all, which is a different setting.
+SAME_COUNTRY_CAP ?= 1
 REGION_FLAG = $(if $(filter off,$(SAME_COUNTRY_CAP)),--no-same-country-cap,\
                    --same-country-cap $(SAME_COUNTRY_CAP))
+MAX_JUNIORS ?= 2
+JUNIOR_FLAG = --max-juniors $(MAX_JUNIORS)
 
 # Optional local secrets. Variables are exported for enrichment commands.
 -include .env
@@ -55,6 +70,13 @@ DBLP_SNAPSHOT = $(INPUT_DIR)/dblp-2026-07-01.xml
 OVERRIDES = $(CURATED_DIR)/dblp_overrides.csv
 RESERVE_OVERRIDES = $(CURATED_DIR)/reserve_dblp_overrides.csv
 COUNTRIES = $(CURATED_DIR)/affiliation_countries.csv
+# The hand-maintained country layer feeds the same-country cap, so editing it has
+# to restage the assignment -- without this, filling in a blank `country` cell
+# leaves a stale result that make reports as up to date. Guarded by `wildcard`
+# because the file is optional: affiliation_country.load_affiliation_countries
+# returns {} when it is absent, and a hard prerequisite would instead break a
+# fresh checkout with "No rule to make target".
+COUNTRIES_DEP = $(wildcard $(COUNTRIES))
 
 COAUTHORS = $(CACHE_DIR)/dblp_coauthors.json
 AUTHOR_NAMES = $(CACHE_DIR)/dblp_author_names.json
@@ -206,9 +228,19 @@ $(COAUTHORS):
 	@exit 1
 
 # Same idiom, for the reserve half of the pool: only reached when missing.
+# RESERVE_CAP=off is no longer an escape from needing these: reserves elevated
+# to the PC (`~~ex-rr`) are assigned even when the reserve bench is not, and
+# their fingerprint and seniority row are only ever built here.
 $(RESERVE_FINGERPRINTS) $(RESERVE_SENIORITY):
-	@echo "ERROR: $@ not found; run make reserves, or" >&2
-	@echo "       assign from the PC alone: make RESERVE_CAP=off" >&2
+	@echo "ERROR: $@ not found; run make reserves" >&2
+	@echo "       (needed even with RESERVE_CAP=off, for the ex-reserves now on the PC)" >&2
+	@exit 1
+
+# Same idiom again, one stage earlier: the reserve roster is what names the
+# ex-reserves in the first place, so the assignment needs it however RESERVE_CAP
+# is set.
+$(RESERVE_INFO):
+	@echo "ERROR: $@ not found; run make reserve-info VERIFY=--verify" >&2
 	@exit 1
 
 $(SENIORITY): scripts/classify_reviewers.py $(REVIEWER_LIBS) $(CSV_DEP) $(OVERRIDES) $(PCDB) $(PCINFO)
@@ -222,24 +254,26 @@ $(ASSIGNMENT) $(ASSIGNMENT_CSV) &: scripts/assign_reviewers.py src/reviewer_matc
 	src/reviewer_match/coauthor_coi.py src/reviewer_match/reserve_reviewers.py \
 	src/reviewer_match/area_chairs.py src/reviewer_match/pc_membership.py \
 	$(EMBED_LIBS) $(FINGERPRINTS) $(SENIORITY) $(DATA) $(COAUTHORS) \
-	$(AREA_CHAIR_CSV_DEP) $(PCINFO) \
-	$(if $(RESERVE_FLAG),$(RESERVE_FINGERPRINTS) $(RESERVE_SENIORITY))
+	$(AREA_CHAIR_CSV_DEP) $(PCINFO) $(COUNTRIES_DEP) \
+	$(RESERVE_INFO) $(RESERVE_FINGERPRINTS) $(RESERVE_SENIORITY)
 	$(RUN) scripts.assign_reviewers --paper-policy $(PAPER_POLICY) --csv "$(CSV)" \
 		--area-chair-csv "$(AREA_CHAIR_CSV)" \
 		--hotcrp-csv $(ASSIGNMENT_CSV) \
-		$(RESERVE_FLAG) $(PC_CHECK) $(AREA_CHAIR_CHECK) $(REGION_FLAG) $(COAUTHOR_COI) $(COLLABORATOR_COI) \
+		$(RESERVE_FLAG) $(PC_CHECK) $(AREA_CHAIR_CHECK) $(REGION_FLAG) $(JUNIOR_FLAG) $(COAUTHOR_COI) $(COLLABORATOR_COI) \
 		> $(ASSIGNMENT)
 
 $(COMPLETE_ASSIGNMENT) $(COMPLETE_ASSIGNMENT_CSV) &: scripts/assign_reviewers.py src/reviewer_match/paper_matching.py \
 	scripts/classify_reviewers.py src/reviewer_match/affiliation_country.py \
 	src/reviewer_match/coauthor_coi.py \
 	src/reviewer_match/area_chairs.py src/reviewer_match/pc_membership.py \
+	src/reviewer_match/reserve_reviewers.py \
 	$(EMBED_LIBS) $(FINGERPRINTS) $(SENIORITY) $(DATA) $(COAUTHORS) \
-	$(AREA_CHAIR_CSV_DEP) $(PCINFO)
+	$(AREA_CHAIR_CSV_DEP) $(PCINFO) $(COUNTRIES_DEP) \
+	$(RESERVE_INFO) $(RESERVE_FINGERPRINTS) $(RESERVE_SENIORITY)
 	$(RUN) scripts.assign_reviewers --paper-policy complete --csv "$(CSV)" \
 		--area-chair-csv "$(AREA_CHAIR_CSV)" \
 		--hotcrp-csv $(COMPLETE_ASSIGNMENT_CSV) \
-		$(PC_CHECK) $(AREA_CHAIR_CHECK) $(REGION_FLAG) $(COAUTHOR_COI) $(COLLABORATOR_COI) \
+		$(PC_CHECK) $(AREA_CHAIR_CHECK) $(REGION_FLAG) $(JUNIOR_FLAG) $(COAUTHOR_COI) $(COLLABORATOR_COI) \
 		> $(COMPLETE_ASSIGNMENT)
 
 clean:

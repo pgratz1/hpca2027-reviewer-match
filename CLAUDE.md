@@ -94,7 +94,8 @@ contains spaces and parentheses — always quote it in shell commands).
   `--include-reserves --reserve-cap $(RESERVE_CAP)` (default 6) — so `make
   reserves` has to have run first, and a missing one is a named error pointing
   at it rather than make's "No rule to make target". `make RESERVE_CAP=off`
-  assigns from the PC alone.
+  assigns from the PC alone — but **still needs those artifacts**, because the
+  ex-reserves now on the PC are assigned from them either way (§3d).
 - **COI is a floor, not a full picture.** `paper_matching.own_paper_conflicts`
   treats authors, contacts, and `reserve_reviewer` nominees as conflicted, because
   authors have not yet been asked to declare conflicts against recently promoted
@@ -193,7 +194,9 @@ contains spaces and parentheses — always quote it in shell commands).
    accepting from one address and holding the HotCRP account under another is
    ordinary. Matching is exact (email → name tokens → email local part) and
    never fuzzy; a false match keeps someone already on the roster, a false miss
-   silently removes a real reviewer.
+   silently removes a real reviewer. The export is also the only record of a
+   **reserve elevated to the PC** (`~~ex-rr` plus a tier tag, §3d) — a promotion
+   no form can know about either.
 2. **Seniority**: `scripts/classify_reviewers.py` → `outputs/reports/reviewer_seniority.csv`
    (senior ≥0.8 papers/yr over 15y in ISCA/MICRO/HPCA/ASPLOS; junior <20
    pubs overall; out-of-area ≥20 pubs but <5 target-venue career; typical
@@ -258,7 +261,34 @@ contains spaces and parentheses — always quote it in shell commands).
    and areas; `roster.load_roster` composes that, so enrich, fingerprint and
    assign all see one roster. Anyone tagged and on no roster is reported, never
    silently emitted.
-3b. **Same-country cap** (`--same-country-cap N`, **on by default at 2**): a
+3d. **Reserves elevated to the PC** (`~~ex-rr`): a reserve promoted onto the
+   committee never filled in an acceptance form, so the promotion exists only as
+   HotCRP tags — `~~ex-rr` says it happened, `pc-light`/`pc-full` says to which
+   tier. `load_reserve_reviewers` stamps that tier instead of `reserve`, so they
+   take `--light-cap`/`--full-cap` and count as PC in every tier report. 5 today,
+   all light. Three rules: **the tier tag is read only for an ex-reserve** — ~474
+   accounts carry it, and for anyone who returned the form the form's `PC
+   membership` column stays the authority (6 disagree today, deliberately left
+   alone); **an unsettled tier promotes nobody** — neither tag or both leaves
+   them a reserve at the reserve cap, named on stderr and by `make pc-roster`,
+   because a withheld promotion costs one paper while an invented one hands
+   somebody a 15-paper load they never agreed to; and **they stay on the reserve
+   roster**, which is still the only source of their DBLP page and derived areas,
+   so `make reserves` keeps building their fingerprint and seniority row and
+   their class comes from the same `classify()` and PCDB overrides as everyone
+   else's. `tier` is **not** in the fingerprint key, so promoting re-embeds
+   nobody. Because they are PC members they are in the pool **regardless of
+   `--include-reserves`**, which gates the bench and not them —
+   `assign_reviewers.split_promoted_reserves` does the split, and a promoted
+   person who later also returns the form is deduped on `hotcrp_email` with the
+   **form record winning** (its areas are declared, not inferred). Tag spellings
+   live once in `pc_membership` (`EX_RESERVE_TAG`, `TIER_TAGS`, `tag_names`);
+   matching is on the **normalised exact name**, not `endswith` as `~~area-chairs`
+   uses, because `pc-full` and `pc-light` are two answers to one question.
+   Under `--no-pc-check` there are no tags, so nobody is promoted and the run
+   warns.
+3b. **Same-country cap** (`--same-country-cap N`, script default 2, **`make`
+   default 1** via `SAME_COUNTRY_CAP` — see §4a for why): a
    paper whose authors are mostly from country C holds at most N reviewers
    affiliated in C. One rule for every country — **no country is named in the
    policy**; the capped set is whatever the submissions contain (31 today).
@@ -277,16 +307,36 @@ contains spaces and parentheses — always quote it in shell commands).
    the majority countries.
 4. **Assignment**: `scripts/assign_reviewers.py` — phased paper-proposing deferred
    acceptance over the PC **and, under `--include-reserves`, the reserve roster**
-   (the pool `make` now assigns from: 236 full + 223 light + 233 reserve),
+   (the pool `make` now assigns from: 235 full + 221 light + 202 reserve, where
+   5 of the light are ex-reserves promoted under §3d and are in the pool with or
+   without `--include-reserves`),
    aiming for a full slate of `--reviewers-per-paper`
    (`DEFAULT_REVIEWERS_PER_PAPER`, **5** since submissions closed) plus ≥1
-   senior, ≤1 junior, and ≤3 out-of-area per paper. Papers that can't fill
+   senior, ≤`--max-juniors` junior (script default 1, **`make` default 2** via
+   `MAX_JUNIORS` — §4a), and ≤3 out-of-area per paper. Papers that can't fill
    release constraints in order: area gate → junior/out-of-area caps
    (almost-nots only) → senior requirement (almost-senior), every pool still
    ranked by fingerprint similarity. Prints a criteria report, per-paper match
    goodness (mean assigned-reviewer similarity, worst-first summary), a
    relaxation & exclusion report, and self-checks (over-cap, blocking pairs,
    junior/out-of-area policy, slate ceiling) that must all be 0.
+4b. **The `make` policy pair: `SAME_COUNTRY_CAP=1`, `MAX_JUNIORS=2`.** Chosen
+   together off a 7-cell sweep of (cap 3/2/1/off) × (juniors 1/2) run at 99.1%
+   affiliation coverage, and they beat the former 2/1 on every quality measure:
+   mean goodness 0.9650 vs 0.9647, worst-50 tail 0.9363 vs 0.9345, 6,283 pairs
+   placed vs 6,172, 47 papers needing a relaxed constraint vs 60 — while papers
+   that trade away a better-matched same-country reviewer go 400 → 631. Two
+   things the sweep settled: **the country cap is nearly free** (off → 1 costs
+   0.0006 of a mean against a 0.011 std, and never leaves a paper short), and
+   **the junior lever is worth ~10× the country lever**, so loosening juniors
+   more than pays for tightening the cap. The cost is real but is the junior
+   half: **409 of 1,157 papers carry two juniors.** These are *operational*
+   defaults in the Makefile, the same shape as `PAPER_POLICY` — the scripts' own
+   defaults stay 2 and 1, so a bare `python -m scripts.assign_reviewers` is
+   unchanged. **At cap 1 the split blocking-pair count is not 0** (1 today among
+   capped papers); that is the documented consequence of a country class
+   crossing the seniority classes, and `country_over == 0` is the invariant that
+   replaces it — do not read it as a regression.
 4a. **Surplus distribution** (`--surplus-per-paper N`, **on by default at 1**;
    `0` is the off switch): `--reviewers-per-paper` is what every paper is
    *guaranteed*, and whatever capacity the six phases leave unspent then goes,

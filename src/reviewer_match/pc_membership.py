@@ -38,6 +38,12 @@ from .dblp import name_tokens
 
 DEFAULT_PCINFO = input_path("hpca2027-pcinfo.csv")
 
+# HotCRP account tags this repo reads. Spelled once here so a tool that writes
+# or clears them imports the spelling rather than restating it -- a file that
+# spells a tag differently reports success and leaves it in place.
+EX_RESERVE_TAG = "ex-rr"          # recruited as a reserve, since promoted to the PC
+TIER_TAGS = {"pc-full": "full", "pc-light": "light"}
+
 # A token pair this close counts as one spelling of one name, but only for
 # tokens long enough that a single edit is unlikely to land on a different name.
 # "Zhang"/"Wang" and "Chen"/"Chan" are short and distinct; a long surname such
@@ -110,6 +116,20 @@ def on_pc(roles: str) -> bool:
     return "pc" in roles.split()
 
 
+def tag_names(tags: str) -> set[str]:
+    """The bare names in a HotCRP tag cell, comparable by equality.
+
+    HotCRP writes a tag three ways for one name: plain (`pc-light`), twiddled
+    for a chairs-only tag (`~~ex-rr`), and with an order value appended
+    (`track_3#7`). Stripping the marker and the value is what lets a caller
+    test a name with `==` instead of guessing at a prefix, which matters for
+    names that are distinct rather than nested -- `pc-full` and `pc-light` are
+    two answers to one question, and an `endswith` test would let a stray
+    `ex-pc-full` count as either.
+    """
+    return {t.split("#", 1)[0].lstrip("~").lower() for t in tags.split()}
+
+
 def registrable_domain(email: str) -> str:
     """The last two labels of the mail domain, so a.edu meets mail.a.edu."""
     _, _, domain = email.partition("@")
@@ -176,6 +196,34 @@ class Account:
         chair breaks the rule that an area chair reviews nothing.
         """
         return any(t.endswith("area-chairs") for t in self.tags.split())
+
+    @property
+    def is_ex_reserve(self) -> bool:
+        """Tagged `~~ex-rr`: recruited as a reserve, since elevated to the PC.
+
+        The marker alone says the promotion happened; `pc_tier` says which tier
+        it was to. Both are needed, because a reserve who was promoted is a PC
+        member at a PC load, and one who was not is neither.
+        """
+        return EX_RESERVE_TAG in tag_names(self.tags)
+
+    @property
+    def pc_tier(self) -> str | None:
+        """'light' or 'full' from the tier tag, or None if that is not settled.
+
+        None covers both an account carrying neither tag and one carrying both.
+        Neither is a tier, and guessing at one would assign a load the person
+        never agreed to, so the caller reports it rather than picking.
+
+        This is only ever consulted for an ex-reserve. For everyone else the
+        acceptance form's `PC membership` column is the tier authority -- the
+        tag mirrors it on ~474 accounts today and mostly agrees, but the form is
+        the answer the person actually gave.
+        """
+        found = TIER_TAGS.keys() & tag_names(self.tags)
+        if len(found) != 1:
+            return None
+        return TIER_TAGS[found.pop()]
 
 
 # ---------------------------------------------------------------------------
