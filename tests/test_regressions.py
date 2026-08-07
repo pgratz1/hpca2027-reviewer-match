@@ -49,6 +49,7 @@ from reviewer_match.reviewers import Reviewer, _parse_override_cap
 PCINFO_FIELDS = [
     "given_name", "family_name", "email", "affiliation", "orcid", "country",
     "disabled", "roles", "tags", "collaborators",
+    "topic: Memory Systems", "topic: Microarchitecture",
 ]
 
 
@@ -3090,6 +3091,105 @@ class RegionResolutionTests(unittest.TestCase):
         # Abbreviations are a judgement call, so they stay distinct.
         self.assertNotEqual(norm("Blue University"), norm("Blue Univ."))
 
+    def test_pcinfo_outranks_every_other_layer_including_hand(self):
+        # What the account holder told HotCRP wins even over a human-curated
+        # affiliation_countries.csv entry -- the whole point of making it
+        # layer 1, not just "another automatic layer".
+        overrides = {affiliation_country.normalize_affiliation("Blue University"): "JP"}
+        notes = ["Blue University, Riverton, Portugal"]
+        self.assertEqual(
+            ("DE", "pcinfo"),
+            affiliation_country.resolve_country(
+                "Blue University", "x@blue.ac.kr", notes, overrides, "DE"),
+        )
+        # Absent (empty string), the pre-existing waterfall is untouched.
+        self.assertEqual(
+            ("JP", "hand"),
+            affiliation_country.resolve_country(
+                "Blue University", "x@blue.ac.kr", notes, overrides, ""),
+        )
+
+    def test_country_from_pcinfo_normalizes_messy_hotcrp_text(self):
+        # Most accounts already carry a clean ISO code from HotCRP's own
+        # picker; a few carry free text instead, observed on the live export.
+        cfp = affiliation_country.country_from_pcinfo
+        self.assertEqual("US", cfp("US"))
+        self.assertEqual("US", cfp("usa"))
+        self.assertEqual("US", cfp("USA"))
+        self.assertEqual("US", cfp("United States of America"))
+        self.assertEqual("HK", cfp("hk"))
+        self.assertEqual("", cfp(""))
+        self.assertEqual("", cfp("Nowhereland"))
+
+    def test_hong_kong_accounts_that_say_china_resolve_to_china(self):
+        # The accepted tradeoff, locked in on purpose: HotCRP's own field
+        # outranks the affiliation-text layer even where that layer is
+        # correct and pcinfo's "China" is a self-report that elides the SAR.
+        # A future change must not silently "fix" this by accident.
+        index = pc_membership.load_pc_accounts(str(write_pcinfo(
+            Path(tempfile.mkdtemp()) / "pc.csv",
+            [pc_account("cuhk@example.edu.hk", "A", "B", country="CN")],
+        )))
+        layers = affiliation_country.load_layers(
+            "/nonexistent", "/nonexistent", "/nonexistent", pcinfo_index=index,
+        )
+        r = reviewer()
+        r.email = "cuhk@example.edu.hk"
+        r.hotcrp_email = "cuhk@example.edu.hk"
+        r.affiliation = "The Chinese University of Hong Kong"
+        self.assertEqual(("CN", "pcinfo"), affiliation_country.reviewer_country(r, layers))
+        # The layer below still gets it right when pcinfo has no opinion.
+        r2 = reviewer()
+        r2.email = "someone-else@example.edu.hk"
+        r2.hotcrp_email = "someone-else@example.edu.hk"
+        r2.affiliation = "The Chinese University of Hong Kong"
+        self.assertEqual(("HK", "affiliation"), affiliation_country.reviewer_country(r2, layers))
+
+    def test_pcinfo_lookup_uses_the_hotcrp_email_not_the_form_email(self):
+        # A reviewer who submitted the acceptance form under one address but
+        # holds their HotCRP account under another (pc_membership.match's
+        # whole reason for existing -- eleven of them on the live roster) must
+        # be looked up in pcinfo_by_email under hotcrp_email. Keying on the
+        # form email instead would silently miss this layer for every one.
+        index = pc_membership.load_pc_accounts(str(write_pcinfo(
+            Path(tempfile.mkdtemp()) / "pc.csv",
+            [pc_account("real@nd.edu", "A", "B", country="US")],
+        )))
+        layers = affiliation_country.load_layers(
+            "/nonexistent", "/nonexistent", "/nonexistent", pcinfo_index=index,
+        )
+        r = reviewer()
+        r.email = "form-address@cuhk.edu.hk"
+        r.hotcrp_email = "real@nd.edu"
+        self.assertEqual(("US", "pcinfo"), affiliation_country.reviewer_country(r, layers))
+
+    def test_pcinfo_layer_covers_every_account_not_just_pc_members(self):
+        # author_country needs this too: most paper authors are never on the
+        # PC, but PcIndex.by_email/.accounts already cover the whole export.
+        index = pc_membership.load_pc_accounts(str(write_pcinfo(
+            Path(tempfile.mkdtemp()) / "pc.csv",
+            [pc_account("nonpc@example.com", "A", "B", roles="", country="FR"),
+             pc_account("blank@example.com", "C", "D", country="")],
+        )))
+        layers = affiliation_country.load_layers(
+            "/nonexistent", "/nonexistent", "/nonexistent", pcinfo_index=index,
+        )
+        self.assertEqual(
+            ("FR", "pcinfo"),
+            affiliation_country.author_country({"email": "nonpc@example.com"}, layers),
+        )
+        # A blank country cell contributes nothing -- falls through untouched.
+        self.assertEqual(
+            ("", "unresolved"),
+            affiliation_country.author_country({"email": "blank@example.com"}, layers),
+        )
+
+    def test_load_layers_without_a_pcinfo_index_is_unchanged(self):
+        # No PcIndex passed -> pcinfo_by_email is empty, the pre-existing
+        # four-layer behavior is exactly what callers who don't opt in get.
+        layers = affiliation_country.load_layers("/nonexistent", "/nonexistent", "/nonexistent")
+        self.assertEqual({}, layers.pcinfo_by_email)
+
 
 class SameCountryCapTests(unittest.TestCase):
     """assign_reviewers.py: which papers the same-country cap binds, and how."""
@@ -3101,12 +3201,14 @@ class SameCountryCapTests(unittest.TestCase):
         ]
         return {"pid": pid, "title": f"P{pid}", "authors": authors}
 
-    def build(self, papers, majority=0.5, min_resolved=0.5, cap=2, reviewers=()):
-        layers = affiliation_country.CountryLayers()
+    def build(self, papers, majority=0.5, min_resolved=0.5, cap=2, reviewers=(),
+              pcinfo_by_email=None):
+        layers = affiliation_country.CountryLayers(pcinfo_by_email=pcinfo_by_email or {})
         by_email = {}
         for email, affiliation in reviewers:
             by_email[email] = reviewer()
             by_email[email].email = email
+            by_email[email].hotcrp_email = email
             by_email[email].affiliation = affiliation
             by_email[email].pid = None
         return assign_reviewers.build_country_caps(
@@ -3170,6 +3272,22 @@ class SameCountryCapTests(unittest.TestCase):
         self.assertEqual(frozenset({"cn@x.edu"}), cn.members)
         # An unplaced reviewer is in no class and can never consume a cap.
         self.assertEqual("", by_email["no@x.edu"])
+
+    def test_a_pcinfo_country_overrides_the_reviewers_own_affiliation(self):
+        # End-to-end: build_country_caps draws on reviewer_country(), which
+        # must consult layers.pcinfo_by_email before the affiliation string.
+        # The paper is still majority-CN by its authors' affiliations (this
+        # helper's authors are affiliation strings, not pcinfo-backed) -- the
+        # thing under test is which *reviewer* class this person lands in.
+        papers = [self.paper(1, ["China", "China"])]
+        caps, by_email, _, _ = self.build(
+            papers,
+            reviewers=[("us@x.edu", "Tsinghua University, China")],
+            pcinfo_by_email={"us@x.edu": "US"},
+        )
+        self.assertEqual("US", by_email["us@x.edu"])
+        cn = self.by_code(caps)["CN"]
+        self.assertNotIn("us@x.edu", cn.members)
 
     def test_the_thresholds_are_tunable(self):
         papers = [self.paper(1, ["China", "USA"])]
@@ -3526,6 +3644,188 @@ class ReviewerLoaderTests(unittest.TestCase):
         # "typo" would also pass if nothing were written to stderr at all.
         self.assertIn("gone@a.edu", stderr.getvalue())
         self.assertNotIn("typo", stderr.getvalue())
+
+    def test_an_ungated_call_never_flags_a_no_form_row_override_as_a_typo(self):
+        # area_chairs.py's _profile_donors calls load_reviewers with
+        # pcinfo_path=None deliberately -- it wants a donor pool, not a
+        # membership claim -- which means _pc_members_without_a_form_row never
+        # runs there. A dblp_overrides.csv row for a real no-form-row PC
+        # member (the exact case that mechanism exists for) must not be
+        # reported as an unmatched typo just because this particular call
+        # never had the HotCRP data to explain it.
+        tmp = Path(tempfile.mkdtemp())
+        form = tmp / "form.csv"
+        with form.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(self.HEADERS)
+        overrides = tmp / "overrides.csv"
+        with overrides.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["email", "dblp", "note"])
+            writer.writeheader()
+            writer.writerow({"email": "new@a.edu", "dblp": "https://dblp.org/pid/1/A",
+                             "note": ""})
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            people = reviewers_mod.load_reviewers(str(form), str(overrides), pcinfo_path=None)
+        self.assertEqual([], people)
+        self.assertNotIn("typo", stderr.getvalue())
+
+
+class PcMembersWithoutFormRowTests(unittest.TestCase):
+    """reviewers.py: a PC account HotCRP knows about that the acceptance form
+    never explains -- someone added straight to HotCRP after the form closed.
+    """
+
+    def load(self, accounts, *, form_rows=None, dblp_overrides=None, area_overrides=None,
+             reserve_upload=None):
+        tmp = Path(tempfile.mkdtemp())
+        form = tmp / "form.csv"
+        with form.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(ReviewerLoaderTests.HEADERS)
+            writer.writerows(form_rows or [])
+        pcinfo = write_pcinfo(tmp / "pc.csv", accounts)
+
+        overrides_path = tmp / "dblp_overrides.csv"
+        with overrides_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["email", "dblp", "note"])
+            writer.writeheader()
+            for email, pid in (dblp_overrides or {}).items():
+                writer.writerow({"email": email, "dblp": pid, "note": ""})
+
+        area_overrides_path = tmp / "pc_area_overrides.csv"
+        with area_overrides_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f, fieldnames=["email", "primary", "secondary", "tertiary", "note"]
+            )
+            writer.writeheader()
+            for email, areas in (area_overrides or {}).items():
+                primary, secondary, tertiary = areas
+                writer.writerow({"email": email, "primary": primary,
+                                 "secondary": secondary, "tertiary": tertiary, "note": ""})
+
+        reserve_upload_path = tmp / "reserve_reviewer_upload.csv"
+        with reserve_upload_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["email", "name", "roles", "tags"])
+            writer.writeheader()
+            for email in (reserve_upload or []):
+                writer.writerow({"email": email, "name": "", "roles": "pc", "tags": ""})
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            people = reviewers_mod.load_reviewers(
+                str(form), str(overrides_path), pcinfo_path=str(pcinfo),
+                area_overrides_path=str(area_overrides_path),
+                reserve_upload_path=str(reserve_upload_path),
+            )
+        return people, stderr.getvalue()
+
+    def test_a_tagged_account_gets_a_reviewer_from_hotcrp_tags_and_topics(self):
+        people, _ = self.load(
+            [pc_account("new@a.edu", "Grace", "Hopper", tags="pc-full",
+                        **{"topic: Memory Systems": "2", "topic: Microarchitecture": "1"})],
+            dblp_overrides={"new@a.edu": "https://dblp.org/pid/1/Test"},
+        )
+        self.assertEqual(["new@a.edu"], [p.email for p in people])
+        p = people[0]
+        self.assertEqual("full", p.tier)
+        self.assertEqual("1/Test", p.pid)
+        self.assertEqual("Memory Systems", p.primary)
+        self.assertEqual("Microarchitecture", p.secondary)
+
+    def test_a_missing_dblp_link_still_yields_a_record(self):
+        # Same tolerance the form itself has for a blank DBLP cell:
+        # classify_reviewers.py's existing stub-appender is what turns this
+        # into a to-do, not an exclusion here.
+        people, stderr = self.load(
+            [pc_account("new@a.edu", "Grace", "Hopper", tags="pc-light",
+                        **{"topic: Memory Systems": "2"})],
+        )
+        self.assertEqual(["new@a.edu"], [p.email for p in people])
+        self.assertIsNone(people[0].pid)
+        self.assertIn("new@a.edu", stderr)
+
+    def test_a_manual_area_override_wins_over_topic_interest(self):
+        people, _ = self.load(
+            [pc_account("new@a.edu", "Grace", "Hopper", tags="pc-full",
+                        **{"topic: Memory Systems": "2"})],
+            area_overrides={"new@a.edu": ("Security", "GPUs", "")},
+        )
+        self.assertEqual("Security", people[0].primary)
+        self.assertEqual("GPUs", people[0].secondary)
+
+    def test_no_topic_interest_and_no_area_override_is_reported_not_invented(self):
+        people, stderr = self.load(
+            [pc_account("new@a.edu", "Grace", "Hopper", tags="pc-full")],
+        )
+        self.assertEqual(["new@a.edu"], [p.email for p in people])
+        self.assertEqual("", people[0].primary)
+        self.assertIn("new@a.edu", stderr)
+
+    def test_an_unsettled_tier_is_excluded_with_a_warning(self):
+        # Neither tag, or both, is not a tier -- the same rule applied to an
+        # untiered ~~ex-rr account: never invent a commitment level.
+        people, stderr = self.load(
+            [pc_account("new@a.edu", "Grace", "Hopper", tags="pc-full pc-light",
+                        **{"topic: Memory Systems": "2"})],
+        )
+        self.assertEqual([], people)
+        self.assertIn("new@a.edu", stderr)
+        self.assertIn("not settled", stderr)
+
+    def test_a_chair_trc_sysadmin_or_area_chair_is_never_swept_in(self):
+        people, _ = self.load(
+            [pc_account("chair@a.edu", "Ada", "Lovelace", roles="chair pc", tags="pc-full"),
+             pc_account("trc@a.edu", "Alan", "Turing", tags="trc pc-full"),
+             pc_account("admin@a.edu", "Grace", "Hopper", roles="sysadmin pc", tags="pc-full"),
+             pc_account("ac@a.edu", "Edsger", "Dijkstra", tags="pc-full ~~area-chairs")],
+        )
+        self.assertEqual([], people)
+
+    def test_an_ex_reserve_is_left_for_the_reserve_loader(self):
+        # Promoting a reserve is load_reserve_reviewers's job -- it derives
+        # areas from authored papers and keeps the reserve-side fingerprint,
+        # neither of which this supplement can reconstruct.
+        people, _ = self.load(
+            [pc_account("promoted@a.edu", "Grace", "Hopper", tags="pc-full ~~ex-rr")],
+        )
+        self.assertEqual([], people)
+
+    def test_an_account_with_a_form_row_is_not_duplicated(self):
+        accepted_row = ["07/01/2026 10:00:00", "here@a.edu",
+                        "Yes, I accept as a full PC member", "Alan", "Turing", "none",
+                        "Example", "Memory", "", "", "", ""]
+        people, _ = self.load(
+            [pc_account("here@a.edu", "Alan", "Turing", tags="pc-full")],
+            form_rows=[accepted_row],
+        )
+        self.assertEqual(["here@a.edu"], [p.email for p in people])
+
+    def test_an_untagged_account_is_silently_not_a_candidate(self):
+        # This loader only ever sees the PC acceptance-form roster, so an
+        # account with no pc-full/pc-light tag at all is, on the live data,
+        # almost always a reserve reviewer this loader cannot recognise as
+        # already accounted for elsewhere -- not a real anomaly to warn about.
+        # audit_pc_roster.py's no_roster_row category is the tag-agnostic
+        # backstop that still catches a genuine no-form, no-tag PC addition.
+        people, stderr = self.load(
+            [pc_account("reserve-like@a.edu", "Grace", "Hopper")],
+        )
+        self.assertEqual([], people)
+        self.assertNotIn("reserve-like@a.edu", stderr)
+
+    def test_a_raw_reserve_upload_recruit_is_not_mistaken_for_a_pc_addition(self):
+        # Observed on the live export: HotCRP had already tagged an account
+        # pc-light although it originated as a reserve-upload row whose DBLP
+        # identity build_reserve_reviewer_info.py never resolved. Building a
+        # Reviewer here would derive their profile from the wrong roster's
+        # rules (HotCRP topic interest instead of authored-paper topics,
+        # dblp_overrides.csv instead of the vetting workbook).
+        people, _ = self.load(
+            [pc_account("recruit@a.edu", "Grace", "Hopper", tags="pc-light")],
+            reserve_upload=["recruit@a.edu"],
+        )
+        self.assertEqual([], people)
 
 
 class AreaChairExclusionTests(unittest.TestCase):

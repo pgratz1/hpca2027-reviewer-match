@@ -23,6 +23,19 @@ TIMESTAMP_FORMAT = "%m/%d/%Y %H:%M:%S"
 # re-exports of the acceptance CSV. Auto-loaded by load_reviewers if present.
 DEFAULT_OVERRIDES = curated_path("dblp_overrides.csv")
 
+# Hand-maintained area overrides for a PC member with no acceptance-form row
+# (see _pc_members_without_a_form_row) whose HotCRP topic interests are blank
+# or wrong. Nobody else needs this file: everyone with a form row already
+# declared primary/secondary/tertiary there.
+DEFAULT_AREA_OVERRIDES = curated_path("pc_area_overrides.csv")
+
+# HotCRP's reserve-reviewer bulk upload -- read here only to recognise a raw
+# recruit whose reserve-side identity never resolved (build_reserve_reviewer_
+# info.py held them back in reserve_reviewer_unresolved.csv). Without this,
+# _pc_members_without_a_form_row would mistake them for a form-less PC
+# addition and build a Reviewer for them from the wrong roster's rules.
+DEFAULT_RESERVE_UPLOAD = input_path("reserve_reviewer_upload.csv")
+
 
 @dataclass
 class Reviewer:
@@ -124,6 +137,56 @@ def load_dblp_overrides(path: str = DEFAULT_OVERRIDES) -> dict[str, str]:
     return overrides
 
 
+def load_area_overrides(path: str = DEFAULT_AREA_OVERRIDES) -> dict[str, tuple[str, str, str]]:
+    """Load the hand-maintained area override file: email -> (primary, secondary, tertiary).
+
+    Format: a CSV with columns `email`, `primary`, `secondary`, `tertiary`,
+    `note` (note is free text and ignored here). A row with a blank email or a
+    blank `primary` is skipped -- a hand decision always names at least a
+    primary area, the same "blank means no override yet" rule
+    `load_dblp_overrides` uses. `secondary`/`tertiary` may be blank; not every
+    account has three.
+
+    Returns {} if the file doesn't exist.
+    """
+    try:
+        f = open(path, newline="", encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    overrides: dict[str, tuple[str, str, str]] = {}
+    with f:
+        for row in csv.DictReader(f):
+            email = (row.get("email") or "").strip().lower()
+            primary = (row.get("primary") or "").strip()
+            if not email or not primary:
+                continue
+            overrides[email] = (
+                primary,
+                (row.get("secondary") or "").strip(),
+                (row.get("tertiary") or "").strip(),
+            )
+    return overrides
+
+
+def _reserve_upload_emails(path: str) -> set[str]:
+    """Emails HotCRP's reserve-reviewer upload named, resolved or not.
+
+    A raw recruit belongs to the reserve pipeline even before
+    `build_reserve_reviewer_info.py` has resolved a DBLP identity for them --
+    so this counts them as accounted for, the same as an entry
+    `load_reserve_reviewers` would eventually pick up, and keeps them from
+    being mistaken for a form-less PC addition. Missing file -> empty set:
+    this is a defensive exclusion, not something `load_reviewers` should fail
+    without.
+    """
+    try:
+        f = open(path, newline="", encoding="utf-8-sig")
+    except FileNotFoundError:
+        return set()
+    with f:
+        return {(row.get("email") or "").strip().lower() for row in csv.DictReader(f)} - {""}
+
+
 def _latest_rows_by_email(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     """Collapse repeat form submissions to each person's most recent row.
 
@@ -153,6 +216,8 @@ def load_reviewers(
     overrides_path: str = DEFAULT_OVERRIDES,
     *,
     pcinfo_path: str | None = pc_membership.DEFAULT_PCINFO,
+    area_overrides_path: str = DEFAULT_AREA_OVERRIDES,
+    reserve_upload_path: str = DEFAULT_RESERVE_UPLOAD,
 ) -> list[Reviewer]:
     """Load accepted PC members from the acceptance CSV.
 
@@ -175,10 +240,16 @@ def load_reviewers(
     it blank and correcting wrong links (e.g. a namesake's page). Overrides
     whose email matches no accepted reviewer are reported to stderr so a
     typo'd email doesn't silently do nothing.
+
+    Finally, `_pc_members_without_a_form_row` adds anyone the HotCRP export
+    marks `pc` that the form never explains at all — someone added to the
+    committee straight in HotCRP after the acceptance form closed. See its
+    docstring for where their identity, tier and areas come from.
     """
     with open(csv_path, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
     overrides = load_dblp_overrides(overrides_path)
+    area_overrides = load_area_overrides(area_overrides_path)
     index = pc_membership.load_pc_accounts(pcinfo_path) if pcinfo_path else None
 
     reviewers: list[Reviewer] = []
@@ -241,14 +312,168 @@ def load_reviewers(
             file=sys.stderr,
         )
 
+    if index is not None:
+        reserve_upload_emails = _reserve_upload_emails(reserve_upload_path)
+        reviewers.extend(
+            _pc_members_without_a_form_row(
+                index, reviewers, overrides, area_overrides, reserve_upload_emails
+            )
+        )
+
     # A dropped reviewer's override is accounted for, not a typo — saying
     # otherwise would send someone hunting for a mistake they didn't make.
-    collapsed_away = {lost for _, lost in collapsed}
-    unmatched = set(overrides) - {r.email for r in reviewers} - set(dropped) - collapsed_away
-    for email in sorted(unmatched):
+    # This check only runs with the membership check on: it is the only case
+    # where _pc_members_without_a_form_row has had a chance to explain an
+    # override belonging to nobody on the form. Without it (area_chairs.py's
+    # `_profile_donors` reads the form this way on purpose, as a donor pool
+    # rather than a membership claim), a no-form-row override for a real PC
+    # member — the exact case this whole mechanism exists for — would always
+    # read as an unmatched typo, since nothing here could tell the two apart.
+    if index is not None:
+        collapsed_away = {lost for _, lost in collapsed}
+        unmatched = set(overrides) - {r.email for r in reviewers} - set(dropped) - collapsed_away
+        for email in sorted(unmatched):
+            print(
+                f"Warning: DBLP override for {email} matches no accepted reviewer "
+                f"(typo, or they declined?)",
+                file=sys.stderr,
+            )
+    return reviewers
+
+
+def _pc_members_without_a_form_row(
+    index: pc_membership.PcIndex,
+    reviewers: list[Reviewer],
+    overrides: dict[str, str],
+    area_overrides: dict[str, tuple[str, str, str]],
+    reserve_upload_emails: set[str],
+) -> list[Reviewer]:
+    """PC members HotCRP knows about that the acceptance form does not.
+
+    Someone added straight to HotCRP after the form closed never answered it,
+    so none of the three things the form would have supplied exist on its own:
+
+      * identity (a DBLP page) — from `dblp_overrides.csv`, the same file and
+        the same "blank means not resolved yet" rule as everyone else. A
+        missing PID does not exclude the account, the same as a form row that
+        left DBLP blank: `classify_reviewers.py` already treats a PID-less
+        Reviewer as unclassifiable and appends a stub row for it, so the
+        to-do surfaces there rather than needing a second mechanism here.
+      * areas — from the account's positive-scored HotCRP topic interests
+        (`Account.top_topics`), which is what the form's primary/secondary/
+        tertiary questions amount to when nobody manually curates them: a
+        `pc_area_overrides.csv` row for the email wins when present (a hand
+        decision always outranks a derived guess, the same precedence
+        `dblp_overrides.csv` has over the form's own DBLP column), otherwise
+        the top HotCRP-declared topics are used. Either way a missing area
+        does not exclude the account — it just cannot pass the area gate for
+        any paper until one exists, which is reported so it doesn't go
+        unnoticed.
+      * tier — `pc-full`/`pc-light` is the *only* place this can come from
+        when there is no form. A `pc-full`/`pc-light` tag is also the
+        candidacy signal, not just the tier value: this loader only ever sees
+        the PC acceptance-form roster, so an account carrying neither tag is
+        silently not a candidate here rather than reported — on the live
+        export most such accounts are reserve reviewers this loader has no
+        way to recognise as already accounted for, and `audit_pc_roster.py`'s
+        `no_roster_row` category is the tag-agnostic backstop that still
+        catches a genuine no-form, no-tag PC addition. An account carrying
+        *both* tags is a real anomaly, though, the same as `Account.pc_tier`'s
+        other caller (an untiered `~~ex-rr` account) — there is no safe
+        default to guess, so it is left out of the reviewer pool entirely and
+        reported.
+
+    Chairs, TRC members, sysadmins and area chairs are excluded — they are on
+    the PC for a structural reason `structural_role` already accounts for,
+    not because a review form is missing. So are ex-reserves, who are
+    promoted by `load_reserve_reviewers` instead: that path derives areas
+    from authored papers and keeps their reserve-side fingerprint, neither of
+    which this one can reconstruct. And so is anyone HotCRP's reserve-reviewer
+    upload named, even if `build_reserve_reviewer_info.py` never resolved a
+    DBLP identity for them (`reserve_reviewer_unresolved.csv`) — they belong
+    to that to-do list, not this one.
+    """
+    accounted: set[str] = set()
+    for r in reviewers:
+        accounted |= pc_membership.resolved_emails(index, r.email, r.first, r.last)
+
+    added: list[Reviewer] = []
+    untiered: list[str] = []
+    no_pid: list[str] = []
+    no_area: list[str] = []
+    for acct in index.pc_accounts:
+        email = acct.email.lower()
+        if email in accounted or email in reserve_upload_emails:
+            continue
+        if pc_membership.structural_role(acct) is not None or acct.is_ex_reserve:
+            continue
+        # A `pc-full`/`pc-light` tag is the candidacy signal, not just the tier
+        # value: this loader only ever sees the PC acceptance-form roster, not
+        # the reserve or area-chair rosters, so an untagged account here is
+        # usually a reserve reviewer this loader has no way to recognise as
+        # already accounted for -- not a genuine no-form-row PC member. Only a
+        # self-contradictory account (both tags) is a real anomaly worth a
+        # warning; a plain absence of either tag is silently not a candidate.
+        if not (pc_membership.TIER_TAGS.keys() & pc_membership.tag_names(acct.tags)):
+            continue
+        tier = acct.pc_tier
+        if tier is None:
+            untiered.append(email)
+            continue
+        override = area_overrides.get(email)
+        areas = list(override) if override else acct.top_topics(3)
+        areas += [""] * (3 - len(areas))
+        pid = overrides.get(email)
+        if pid is None:
+            no_pid.append(email)
+        if not areas[0]:
+            no_area.append(email)
+        added.append(
+            Reviewer(
+                email=email,
+                hotcrp_email=acct.email,
+                first=acct.given,
+                last=acct.family,
+                dblp_url="",
+                pid=pid,
+                affiliation=acct.affiliation,
+                primary=areas[0],
+                secondary=areas[1],
+                tertiary=areas[2],
+                keywords="",
+                tier=tier,
+                override_cap=None,
+                pid_from_override=email in overrides,
+            )
+        )
+
+    if added:
         print(
-            f"Warning: DBLP override for {email} matches no accepted reviewer "
-            f"(typo, or they declined?)",
+            f"{len(added)} PC member(s) on the HotCRP roster with no acceptance-form "
+            f"row; profile built from HotCRP tags and topic interests: "
+            f"{', '.join(sorted(r.email for r in added))}",
             file=sys.stderr,
         )
-    return reviewers
+    if no_pid:
+        print(
+            f"    {len(no_pid)} of them have no DBLP link yet — add one to "
+            f"{DEFAULT_OVERRIDES} to fingerprint them: {', '.join(sorted(no_pid))}",
+            file=sys.stderr,
+        )
+    if no_area:
+        print(
+            f"    {len(no_area)} of them have no positive HotCRP topic interest and "
+            f"no {DEFAULT_AREA_OVERRIDES} row, so they match no paper's area gate "
+            f"until one exists: {', '.join(sorted(no_area))}",
+            file=sys.stderr,
+        )
+    if untiered:
+        tags = "`/`".join(sorted(pc_membership.TIER_TAGS))
+        print(
+            f"WARNING: {len(untiered)} PC account(s) with no acceptance-form row "
+            f"carry neither or both of `{tags}`, so their load tier is not settled "
+            f"and they are left out of the reviewer pool entirely: "
+            f"{', '.join(sorted(untiered))} — fix the tags in HotCRP",
+            file=sys.stderr,
+        )
+    return added

@@ -44,6 +44,13 @@ DEFAULT_PCINFO = input_path("hpca2027-pcinfo.csv")
 EX_RESERVE_TAG = "ex-rr"          # recruited as a reserve, since promoted to the PC
 TIER_TAGS = {"pc-full": "full", "pc-light": "light"}
 
+# HotCRP's per-topic interest columns, one per conference topic, holding a
+# -2..2 score the account set in their profile. The header after this prefix
+# is the topic name verbatim -- it already matches the topic strings on a
+# paper exactly, the same vocabulary the acceptance form's area dropdowns
+# draw from, so no reconciling is needed to compare the two.
+TOPIC_PREFIX = "topic: "
+
 # A token pair this close counts as one spelling of one name, but only for
 # tokens long enough that a single edit is unlikely to land on a different name.
 # "Zhang"/"Wang" and "Chen"/"Chan" are short and distinct; a long surname such
@@ -163,6 +170,14 @@ class Account:
         self.tags = row.get("tags", "").strip()
         self.collaborators = row.get("collaborators", "").strip()
         self.disabled = row.get("disabled", "").strip().lower() == "yes"
+        self.topic_interests: dict[str, int] = {}
+        for header, value in row.items():
+            if not header or not header.startswith(TOPIC_PREFIX) or not (value or "").strip():
+                continue
+            try:
+                self.topic_interests[header[len(TOPIC_PREFIX):]] = int(value.strip())
+            except ValueError:
+                continue
 
         self.name = " ".join(p for p in (self.given, self.family) if p)
         self.tokens = token_set(self.name)
@@ -215,15 +230,33 @@ class Account:
         Neither is a tier, and guessing at one would assign a load the person
         never agreed to, so the caller reports it rather than picking.
 
-        This is only ever consulted for an ex-reserve. For everyone else the
-        acceptance form's `PC membership` column is the tier authority -- the
-        tag mirrors it on ~474 accounts today and mostly agrees, but the form is
-        the answer the person actually gave.
+        Consulted for an ex-reserve, and also for a PC account with no
+        acceptance-form row at all (`reviewers._pc_members_without_a_form_row`)
+        -- for both, there is no form to be the tier authority instead. For
+        everyone else the acceptance form's `PC membership` column is that
+        authority -- the tag mirrors it on ~474 accounts today and mostly
+        agrees, but the form is the answer the person actually gave.
         """
         found = TIER_TAGS.keys() & tag_names(self.tags)
         if len(found) != 1:
             return None
         return TIER_TAGS[found.pop()]
+
+    def top_topics(self, n: int, min_score: int = 1) -> list[str]:
+        """The `n` topics this account is most interested in, HotCRP's own scale.
+
+        Only positive scores count as a declared interest -- 0 is "no
+        preference", and this is standing in for the acceptance form's primary/
+        secondary/tertiary area questions, which nobody left pointed at a topic
+        they were not interested in. Ties broken alphabetically, the same
+        reason `reserve_reviewers.top_areas` does: reproducible regardless of
+        the export's column order.
+        """
+        ranked = sorted(
+            (t for t, score in self.topic_interests.items() if score >= min_score),
+            key=lambda t: (-self.topic_interests[t], t),
+        )
+        return ranked[:n]
 
 
 # ---------------------------------------------------------------------------
@@ -368,6 +401,45 @@ class PcIndex:
             return self._first(self.by_local[local]), "local"
 
         return None, ""
+
+
+def structural_role(acct: Account) -> str | None:
+    """Why this PC account needs no roster row to explain its membership.
+
+    Returns 'chair', 'trc', 'sysadmin' or 'area-chair' for an account on the
+    PC for a structural reason, or None if it needs an acceptance-form row or
+    a reserve-roster row to explain why it is there. Shared between
+    `audit_pc_roster.missing_category`, which reports an account nothing
+    explains, and `reviewers._pc_members_without_a_form_row`, which builds a
+    Reviewer for one -- the two must never disagree about who is a genuine
+    no-form-row reviewer candidate versus a role HotCRP already accounts for,
+    so the classification lives once.
+    """
+    tags = acct.tags.split()
+    if "chairs" in tags or "chair" in acct.roles.split():
+        return "chair"
+    if any(t.startswith("trc") for t in tags):
+        return "trc"
+    if "sysadmin" in acct.roles.split():
+        return "sysadmin"
+    if acct.is_area_chair:
+        return "area-chair"
+    return None
+
+
+def resolved_emails(index: PcIndex, email: str, first: str, last: str) -> set[str]:
+    """Every address this person is known by: their own, plus their account's.
+
+    Accepting from one address while holding the HotCRP account under another
+    is ordinary here, which is the whole reason this module exists. Comparing
+    raw addresses alone would file one person as two -- so a caller building a
+    "who is already accounted for" set folds both in.
+    """
+    found = {email.lower()}
+    acct, _ = index.match(email, first, last)
+    if acct is not None:
+        found.add(acct.email.lower())
+    return found
 
 
 def hotcrp_email_for(email: str, acct: Account | None, how: str) -> str:

@@ -39,6 +39,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from reviewer_match import affiliation_country as ac
+from reviewer_match import pc_membership
 from reviewer_match.roster import ROLES, load_roster, role_label
 
 DEFAULT_DATA = input_path("hpca2027-data.json")
@@ -282,8 +283,18 @@ def main() -> int:
 
     # Coverage the caps will actually see, counted over people rather than
     # strings -- one unplaced string a hundred authors share matters far more
-    # than a hundred nobody uses.
-    fresh = ac.load_layers(args.out, args.dblp_affiliations, args.profile_cache)
+    # than a hundred nobody uses. Includes the HotCRP-account layer here (but
+    # deliberately not in `layers` above, which feeds `suggested`): that layer
+    # is per-person, and two people can share one affiliation string with two
+    # different HotCRP countries, so there's no single per-string answer to
+    # suggest. `load_roster` above already requires this same PCINFO export by
+    # default, so it is guaranteed to exist and parse by this point --
+    # `load_pc_accounts` is cached on (path, mtime, size), so this is a cache
+    # hit, not a second read.
+    fresh = ac.load_layers(
+        args.out, args.dblp_affiliations, args.profile_cache,
+        pcinfo_index=pc_membership.load_pc_accounts(),
+    )
     by_email: dict[str, tuple[str, str]] = {}
     for role in roles:
         people = load_roster(role)

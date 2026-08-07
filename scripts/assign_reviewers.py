@@ -1907,7 +1907,22 @@ def main() -> int:
     paper_coverage: dict[int, tuple[int, int]] = {}
     thin_papers: list[int] = []
     if not args.no_same_country_cap:
-        layers = affiliation_country.load_layers(args.affiliation_countries)
+        # A fresh, independent load rather than reusing `index`/`pcinfo_index`
+        # from the area-chair or collaborator-COI blocks above: both are only
+        # assigned when their own flag is enabled, so referencing either here
+        # would risk a NameError depending on which flags are set.
+        # pc_membership.load_pc_accounts caches on (path, mtime, size), so this
+        # is a cache hit whenever one of those blocks already ran.
+        try:
+            country_pcinfo = pc_membership.load_pc_accounts(args.pcinfo)
+        except (FileNotFoundError, ValueError) as exc:
+            country_pcinfo = None
+            print(f"WARNING: {exc.__class__.__name__} reading {args.pcinfo}; the "
+                  f"same-country cap falls back to the affiliation-only layers and "
+                  f"cannot see HotCRP's own declared country", file=sys.stderr)
+        layers = affiliation_country.load_layers(
+            args.affiliation_countries, pcinfo_index=country_pcinfo
+        )
         countries, reviewer_country, paper_coverage, thin_papers = build_country_caps(
             papers, candidate_emails, reviewers_by_email, args.same_country_cap, layers,
             majority=args.region_majority, min_resolved=args.region_min_resolved,

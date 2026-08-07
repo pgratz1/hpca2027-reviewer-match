@@ -144,20 +144,6 @@ def load_area_chairs(
     return chairs
 
 
-def _resolved_emails(index, email: str, first: str, last: str) -> set[str]:
-    """Every address this person is known by: their own, plus their account's.
-
-    Accepting from one address while holding the HotCRP account under another is
-    ordinary here, which is the whole reason `pc_membership` exists. Comparing
-    raw addresses alone would file one person as two.
-    """
-    found = {email.lower()}
-    acct, _ = index.match(email, first, last)
-    if acct is not None:
-        found.add(acct.email.lower())
-    return found
-
-
 def _tagged_without_a_form_row(index, chairs: list[AreaChair], supplement) -> list[AreaChair]:
     """Area chairs HotCRP knows about that the acceptance form does not.
 
@@ -169,11 +155,11 @@ def _tagged_without_a_form_row(index, chairs: list[AreaChair], supplement) -> li
     """
     accounted: set[str] = set()
     for chair in chairs:
-        accounted |= _resolved_emails(index, chair.email, chair.first, chair.last)
+        accounted |= pc_membership.resolved_emails(index, chair.email, chair.first, chair.last)
 
     donors: dict[str, object] = {}
     for record in supplement:
-        for email in _resolved_emails(index, record.email, record.first, record.last):
+        for email in pc_membership.resolved_emails(index, record.email, record.first, record.last):
             donors.setdefault(email, record)
 
     added: list[AreaChair] = []
@@ -240,7 +226,7 @@ def area_chair_emails(
         index = pc_membership.load_pc_accounts(pcinfo_path)
         emails |= {a.email.lower() for a in index.accounts if a.is_area_chair}
         for chair in chairs:
-            emails |= _resolved_emails(index, chair.email, chair.first, chair.last)
+            emails |= pc_membership.resolved_emails(index, chair.email, chair.first, chair.last)
     return emails
 
 
@@ -257,7 +243,7 @@ def drop_area_chairs(people_by_email: dict, chair_emails: set[str], index=None) 
     for email, person in list(people_by_email.items()):
         known = {email.lower()}
         if index is not None:
-            known |= _resolved_emails(
+            known |= pc_membership.resolved_emails(
                 index, email, getattr(person, "first", ""), getattr(person, "last", "")
             )
         if known & chair_emails:

@@ -4,27 +4,39 @@ Country here means where the *institution* is, never anyone's nationality, and
 Hong Kong, Macao, Taiwan and Singapore are their own ISO 3166-1 alpha-2 codes:
 separate jurisdictions with separate communities, which is also how DBLP writes
 its affiliation notes and how the ccTLDs in the HotCRP export fall. Nothing is
-ever folded into another region by this module.
+ever folded into another region by this module -- with one deliberate
+exception, see layer 1.
 
-Four layers, first hit wins, and **nothing is guessed** — an affiliation none of
-them place stays UNRESOLVED so the caller can report the coverage instead of
-assuming:
+Five layers, first hit wins, and below layer 1 **nothing is guessed** — an
+affiliation none of them place stays UNRESOLVED so the caller can report the
+coverage instead of assuming:
 
-1. `affiliation_countries.csv`, the hand-maintained layer, matched on the
+1. The account holder's own `country` field from the HotCRP export
+   (`pc_membership.Account.country`), when the caller supplies a `PcIndex` --
+   what the person told HotCRP about themselves outranks anything this module
+   infers from an affiliation string, including the hand-maintained layer
+   below. That is a deliberate, accepted tradeoff, not an oversight: a
+   handful of Hong Kong- and Macao-affiliated accounts (CUHK, HKUST, HKUST-GZ,
+   University of Macau) have `China` in this field rather than the specific
+   SAR, so those people resolve to `CN` here even though every layer below
+   would correctly say `HK`/`MO`. Coverage is lower than the layers below it
+   (HotCRP's field is often blank), which is why it is a first-hit-wins layer
+   and not the only one.
+2. `affiliation_countries.csv`, the hand-maintained layer, matched on the
    normalized affiliation string. A blank `country` cell is a to-do marker, not
    a decision, and never masks a later layer.
-2. DBLP's `<note type="affiliation">`, which names the country outright ("Ant
+3. DBLP's `<note type="affiliation">`, which names the country outright ("Ant
    Research, Beijing, China"). A profile often carries several, and **their
    order means nothing** -- a Tsinghua professor's notes list UC Santa Barbara
    first -- so the note is chosen by how well it matches the affiliation the
    person gave HotCRP, and if none of them matches, this layer declines rather
    than picking a former employer's country.
-3. A country or region *name* in the affiliation string. Adjectives are
+4. A country or region *name* in the affiliation string. Adjectives are
    deliberately not names — "Chinese" would place "The Chinese University of
    Hong Kong" in CN, which is exactly the error a region cap must not make. Both
    DBLP and HotCRP do write "Hong Kong ..., China" and "University of Macau,
    China", so a region name always outranks the sovereign state it sits in.
-4. The email's ccTLD, ignoring the TLDs sold generically (.com, .io, .ai, .co
+5. The email's ccTLD, ignoring the TLDs sold generically (.com, .io, .ai, .co
    and friends), which say nothing about where anyone is.
 """
 
@@ -38,6 +50,8 @@ import re
 import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+
+from . import pc_membership
 
 DEFAULT_COUNTRIES = curated_path("affiliation_countries.csv")
 DEFAULT_DBLP_AFFILIATIONS = cache_path("dblp_affiliations.json")
@@ -214,10 +228,11 @@ _WS_RE = re.compile(r"\s+")
 
 @dataclass(frozen=True)
 class CountryLayers:
-    """The two file-backed layers, loaded once and shared by every lookup."""
+    """The three file-backed layers, loaded once and shared by every lookup."""
 
     overrides: dict[str, str] = field(default_factory=dict)  # normalized affil -> ISO
     dblp_by_pid: dict[str, list[str]] = field(default_factory=dict)  # PID -> notes
+    pcinfo_by_email: dict[str, str] = field(default_factory=dict)  # email -> ISO
 
 
 def normalize_affiliation(text: str) -> str:
@@ -240,6 +255,43 @@ def normalize_affiliation(text: str) -> str:
 def is_country_code(code: str) -> bool:
     """True if `code` is an ISO alpha-2 code this module can actually resolve."""
     return code in ISO_ALPHA2
+
+
+def country_from_pcinfo(raw: str) -> str:
+    """ISO code from one account's raw HotCRP `country` cell.
+
+    Almost always already a clean ISO alpha-2 code straight from HotCRP's own
+    country picker. A few accounts carry free text instead ("USA", "United
+    States of America") -- rather than a second validation scheme, those fall
+    back to the same `COUNTRY_NAMES` table `country_from_text` uses for
+    affiliation strings, which already has these spellings (and the HK/MO/SG/TW
+    full names) mapped. Unrecognized text is UNRESOLVED, not an error: this is
+    uncurated account-holder input, not a curator's own file, so the loud
+    `ValueError` `load_affiliation_countries` raises on a bad hand entry would
+    be the wrong response to someone else's typo.
+    """
+    code = (raw or "").strip().upper()
+    if is_country_code(code):
+        return code
+    return COUNTRY_NAMES.get(normalize_affiliation(raw), UNRESOLVED)
+
+
+def pcinfo_country_index(index: pc_membership.PcIndex) -> dict[str, str]:
+    """{email -> ISO code} over every account in the HotCRP export.
+
+    Every account, not just PC-marked ones: `author_country` needs to resolve
+    paper authors too, most of whom are never on the PC, and `PcIndex.by_email`
+    already indexes the whole export regardless of role. An account whose
+    `country` cell doesn't resolve is left out entirely rather than stored
+    empty, so a lookup miss and an unresolved value both read the same way to
+    a caller doing `.get(email, "")`.
+    """
+    out: dict[str, str] = {}
+    for acct in index.accounts:
+        code = country_from_pcinfo(acct.country)
+        if code:
+            out[acct.email.lower()] = code
+    return out
 
 
 def load_affiliation_countries(path: str = DEFAULT_COUNTRIES) -> dict[str, str]:
@@ -279,12 +331,19 @@ def load_layers(
     countries_path: str = DEFAULT_COUNTRIES,
     dblp_path: str = DEFAULT_DBLP_AFFILIATIONS,
     profile_cache: str = DEFAULT_PROFILE_CACHE,
+    *,
+    pcinfo_index: pc_membership.PcIndex | None = None,
 ) -> CountryLayers:
-    """Load the hand layer and the DBLP affiliation notes.
+    """Load the hand layer, the DBLP affiliation notes, and (if given) HotCRP's own.
 
     The offline snapshot (`dblp_affiliations.json`, near-complete for the roster)
     is layered over the network profile cache rather than replacing it, so PIDs
     fetched live but absent from the dump are still covered.
+
+    `pcinfo_index` is optional and keyword-only: a caller with no `PcIndex` in
+    hand (or one that deliberately doesn't want this layer -- see
+    `build_affiliation_countries.py`'s per-affiliation-string `suggested`
+    column) gets the pre-existing four-layer behavior back, unchanged.
     """
     dblp_by_pid: dict[str, list[str]] = {}
     for path, extract in ((profile_cache, _profile_affiliations), (dblp_path, _plain_affiliations)):
@@ -297,7 +356,8 @@ def load_layers(
             notes = extract(value)
             if notes:
                 dblp_by_pid[pid] = notes
-    return CountryLayers(load_affiliation_countries(countries_path), dblp_by_pid)
+    pcinfo_by_email = pcinfo_country_index(pcinfo_index) if pcinfo_index is not None else {}
+    return CountryLayers(load_affiliation_countries(countries_path), dblp_by_pid, pcinfo_by_email)
 
 
 def _profile_affiliations(value) -> list[str]:
@@ -400,12 +460,19 @@ def resolve_country(
     email: str = "",
     dblp_affiliations: Sequence[str] = (),
     overrides: Mapping[str, str] | None = None,
+    pcinfo_country: str = "",
 ) -> tuple[str, str]:
     """(ISO alpha-2 or UNRESOLVED, which layer answered).
 
     The layer name is returned so callers can report coverage per layer and so
     the generator can show its work; see the module docstring for the order.
+    `pcinfo_country` is checked first, above even `overrides` -- what the
+    account holder told HotCRP outranks anything inferred from an affiliation
+    string, including a human-curated one. See the module docstring for the
+    accepted HK/MO tradeoff that follows from that.
     """
+    if pcinfo_country:
+        return pcinfo_country, "pcinfo"
     if overrides:
         code = overrides.get(normalize_affiliation(affiliation))
         if code:
@@ -425,23 +492,35 @@ def resolve_country(
 def author_country(author: Mapping, layers: CountryLayers) -> tuple[str, str]:
     """Country of a HotCRP author/contact record.
 
-    Authors carry no DBLP PID, so only the hand, affiliation-text and ccTLD
-    layers can answer for them.
+    Authors carry no DBLP PID, so the DBLP-note layer never answers for them.
+    The HotCRP-account layer can, though, whenever the author also happens to
+    hold a HotCRP account under the same email -- `layers.pcinfo_by_email`
+    covers every account in the export, not just PC members.
     """
+    email = (author.get("email") or "").strip().lower()
     return resolve_country(
         author.get("affiliation") or "",
         author.get("email") or "",
         (),
         layers.overrides,
+        layers.pcinfo_by_email.get(email, ""),
     )
 
 
 def reviewer_country(reviewer, layers: CountryLayers) -> tuple[str, str]:
     """Country of a Reviewer/AreaChair record, using its DBLP PID when it has one."""
     pid = getattr(reviewer, "pid", None)
+    # The pcinfo layer is keyed on real HotCRP accounts (pcinfo_country_index
+    # reads straight off PcIndex.accounts), so it has to be looked up under
+    # `hotcrp_email` -- the address pc_membership actually resolved this
+    # person to -- not `email`, the acceptance-form address. Eleven reviewers
+    # on the live roster submitted under a second address, and `email` alone
+    # would silently miss this layer for every one of them.
+    hotcrp_email = (getattr(reviewer, "hotcrp_email", "") or getattr(reviewer, "email", "") or "").strip().lower()
     return resolve_country(
         getattr(reviewer, "affiliation", "") or "",
         getattr(reviewer, "email", "") or "",
         layers.dblp_by_pid.get(pid or "", ()),
         layers.overrides,
+        layers.pcinfo_by_email.get(hotcrp_email, ""),
     )

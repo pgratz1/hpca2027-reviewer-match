@@ -37,6 +37,7 @@ dblp-*.dtd
 dblp_*cache*.json
 dblp_affiliations.json
 dblp_overrides.csv
+pc_area_overrides.csv
 reserve_dblp_overrides.csv
 reserve_reviewer*.csv
 reserve_reviewer*.xlsx

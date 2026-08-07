@@ -227,12 +227,27 @@ $(COAUTHORS):
 	@echo "       assign without the co-author COI: make COAUTHOR_COI=--no-coauthor-coi" >&2
 	@exit 1
 
-# Same idiom, for the reserve half of the pool: only reached when missing.
-# RESERVE_CAP=off is no longer an escape from needing these: reserves elevated
-# to the PC (`~~ex-rr`) are assigned even when the reserve bench is not, and
-# their fingerprint and seniority row are only ever built here.
-$(RESERVE_FINGERPRINTS) $(RESERVE_SENIORITY):
-	@echo "ERROR: $@ not found; run make reserves" >&2
+# Same idiom, for the reserve half of the pool: reached when missing, and now
+# also when older than RESERVE_INFO -- fingerprint content is purely PID and
+# publications, so it only actually depends on identity, not on PCINFO's
+# tags. RESERVE_CAP=off is no escape either: reserves elevated to the PC
+# (`~~ex-rr`) are assigned even when the reserve bench is not, and their
+# fingerprint is only ever built here.
+$(RESERVE_FINGERPRINTS): $(RESERVE_INFO)
+	@echo "ERROR: $@ is missing or older than $(RESERVE_INFO); run make reserves" >&2
+	@echo "       (needed even with RESERVE_CAP=off, for the ex-reserves now on the PC)" >&2
+	@exit 1
+
+# Seniority is different: `classify_reviewers --role reserve` bakes the
+# `~~ex-rr` tier tag straight into the tier column, and that tag lives only in
+# PCINFO -- so a fresh export can promote or re-tier a reserve without
+# touching RESERVE_INFO at all. On 2026-08-06 that silently left two
+# ex-reserves with no seniority row and no area, still assigned, just under a
+# `[light/?]` unknown class nobody was told about. A named, loud error here
+# beats a silent one there, the same tradeoff every other "missing export"
+# check in this Makefile makes.
+$(RESERVE_SENIORITY): $(RESERVE_INFO) $(PCINFO)
+	@echo "ERROR: $@ is missing or older than $(RESERVE_INFO)/$(PCINFO); run make reserves" >&2
 	@echo "       (needed even with RESERVE_CAP=off, for the ex-reserves now on the PC)" >&2
 	@exit 1
 

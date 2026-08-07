@@ -176,16 +176,16 @@ def missing_category(acct, declined, by_tokens, by_local) -> tuple[str, str]:
     account is still on the PC because they are the chair, and filing them under
     `alternate_account` would put a settled row on the to-do list.
     """
-    tags = acct.tags.split()
-    if "chairs" in tags or "chair" in acct.roles.split():
+    role = pc_membership.structural_role(acct)
+    if role == "chair":
         return "chair", "on the PC as a chair"
-    if any(t.startswith("trc") for t in tags):
+    if role == "trc":
         return "trc", "on the PC for the TRC"
-    if "sysadmin" in acct.roles.split():
+    if role == "sysadmin":
         return "sysadmin", "administrative account"
     if acct.disabled:
         return "disabled", "account is disabled"
-    if acct.is_area_chair:
+    if role == "area-chair":
         return "area-chair", "tagged as an area chair"
 
     hits = by_tokens.get(acct.tokens) or by_local.get(acct.local) or []
