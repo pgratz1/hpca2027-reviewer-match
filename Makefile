@@ -13,6 +13,7 @@
 #   make affiliation-countries  resolve affiliation countries
 #   make reserves         enrich, fingerprint, and classify reserves
 #   make clear-uploads    HotCRP CSVs that wipe R1 reviews and the track tags
+#   make baselines        randomized arms: how much of the match is SPECTER2?
 #   make clean            remove assignment outputs only
 #   make clean-fingerprints  remove embedding caches, never DBLP caches
 
@@ -56,6 +57,9 @@ CURATED_DIR = data/curated
 CACHE_DIR = data/cache
 REPORT_DIR = outputs/reports
 ASSIGNMENT_DIR = outputs/assignments
+# Baselines land here and NOT in ASSIGNMENT_DIR: a randomized arm is a
+# measurement, and nothing that looks like an assignment should sit beside one.
+EVALUATION_DIR = outputs/evaluations
 
 CSV = $(INPUT_DIR)/HPCA'27 PC Member Acceptance Form (Responses) - Form Responses 1.csv
 CSV_DEP = data/inputs/HPCA'27\ PC\ Member\ Acceptance\ Form\ (Responses)\ -\ Form\ Responses\ 1.csv
@@ -130,10 +134,21 @@ REVIEWER_LIBS = src/reviewer_match/reviewers.py src/reviewer_match/dblp.py \
 	src/reviewer_match/pc_membership.py src/reviewer_match/paths.py
 EMBED_LIBS = src/reviewer_match/fingerprint.py src/reviewer_match/specter2_model.py
 
+# Everything an assign_reviewers run reads. Shared by the submitted assignment,
+# the complete-policy one and the baseline arms, which had drifted into three
+# copies of the same list.
+ASSIGN_DEPS = scripts/assign_reviewers.py src/reviewer_match/paper_matching.py \
+	scripts/classify_reviewers.py src/reviewer_match/affiliation_country.py \
+	src/reviewer_match/coauthor_coi.py src/reviewer_match/reserve_reviewers.py \
+	src/reviewer_match/area_chairs.py src/reviewer_match/pc_membership.py \
+	$(EMBED_LIBS) $(FINGERPRINTS) $(SENIORITY) $(DATA) $(COAUTHORS) \
+	$(AREA_CHAIR_CSV_DEP) $(PCINFO) $(COUNTRIES_DEP) \
+	$(RESERVE_INFO) $(RESERVE_FINGERPRINTS) $(RESERVE_SENIORITY)
+
 .DELETE_ON_ERROR:
 .PHONY: all enrich area-chairs reserve-need reserve-info reserve-pids reserves \
 	dblp-snapshot coauthor-coi collaborator-coi affiliation-countries pc-roster duplicates \
-	complete-papers area-chairs-complete clear-uploads clean clean-fingerprints
+	complete-papers area-chairs-complete clear-uploads baselines clean clean-fingerprints
 
 all: $(SENIORITY) enrich $(FINGERPRINTS)
 	$(RUN) scripts.build_fingerprints --csv "$(CSV)" --fingerprint-cache $(FINGERPRINTS)
@@ -264,32 +279,62 @@ $(SENIORITY): scripts/classify_reviewers.py $(REVIEWER_LIBS) $(CSV_DEP) $(OVERRI
 $(FINGERPRINTS): $(PUBLICATIONS) $(ABSTRACTS) scripts/build_fingerprints.py $(REVIEWER_LIBS) $(EMBED_LIBS) $(CSV_DEP) $(OVERRIDES) $(DBLP_PUBS) $(PCINFO)
 	$(RUN) scripts.build_fingerprints --csv "$(CSV)" --fingerprint-cache $@
 
-$(ASSIGNMENT) $(ASSIGNMENT_CSV) &: scripts/assign_reviewers.py src/reviewer_match/paper_matching.py \
-	scripts/classify_reviewers.py src/reviewer_match/affiliation_country.py \
-	src/reviewer_match/coauthor_coi.py src/reviewer_match/reserve_reviewers.py \
-	src/reviewer_match/area_chairs.py src/reviewer_match/pc_membership.py \
-	$(EMBED_LIBS) $(FINGERPRINTS) $(SENIORITY) $(DATA) $(COAUTHORS) \
-	$(AREA_CHAIR_CSV_DEP) $(PCINFO) $(COUNTRIES_DEP) \
-	$(RESERVE_INFO) $(RESERVE_FINGERPRINTS) $(RESERVE_SENIORITY)
+$(ASSIGNMENT) $(ASSIGNMENT_CSV) &: $(ASSIGN_DEPS)
 	$(RUN) scripts.assign_reviewers --paper-policy $(PAPER_POLICY) --csv "$(CSV)" \
 		--area-chair-csv "$(AREA_CHAIR_CSV)" \
 		--hotcrp-csv $(ASSIGNMENT_CSV) \
 		$(RESERVE_FLAG) $(PC_CHECK) $(AREA_CHAIR_CHECK) $(REGION_FLAG) $(JUNIOR_FLAG) $(COAUTHOR_COI) $(COLLABORATOR_COI) \
 		> $(ASSIGNMENT)
 
-$(COMPLETE_ASSIGNMENT) $(COMPLETE_ASSIGNMENT_CSV) &: scripts/assign_reviewers.py src/reviewer_match/paper_matching.py \
-	scripts/classify_reviewers.py src/reviewer_match/affiliation_country.py \
-	src/reviewer_match/coauthor_coi.py \
-	src/reviewer_match/area_chairs.py src/reviewer_match/pc_membership.py \
-	src/reviewer_match/reserve_reviewers.py \
-	$(EMBED_LIBS) $(FINGERPRINTS) $(SENIORITY) $(DATA) $(COAUTHORS) \
-	$(AREA_CHAIR_CSV_DEP) $(PCINFO) $(COUNTRIES_DEP) \
-	$(RESERVE_INFO) $(RESERVE_FINGERPRINTS) $(RESERVE_SENIORITY)
+$(COMPLETE_ASSIGNMENT) $(COMPLETE_ASSIGNMENT_CSV) &: $(ASSIGN_DEPS)
 	$(RUN) scripts.assign_reviewers --paper-policy complete --csv "$(CSV)" \
 		--area-chair-csv "$(AREA_CHAIR_CSV)" \
 		--hotcrp-csv $(COMPLETE_ASSIGNMENT_CSV) \
 		$(PC_CHECK) $(AREA_CHAIR_CHECK) $(REGION_FLAG) $(JUNIOR_FLAG) $(COAUTHOR_COI) $(COLLABORATOR_COI) \
 		> $(COMPLETE_ASSIGNMENT)
+
+# Randomized baselines: how much of the match quality is the SPECTER2 signal?
+# Arm A is the production configuration, B drops SPECTER2 and the declared-area
+# gate, C drops SPECTER2 only -- so A-C is what the embedding buys inside an
+# area and C-B is what the area gate buys. Identical policy flags by
+# construction, because they are the same variables the $(ASSIGNMENT) recipe
+# uses: SAME_COUNTRY_CAP=1 and MAX_JUNIORS=2 differ from the script's own
+# defaults, and a hand-typed command line gets them wrong.
+#
+# --surplus-per-paper 0 on every arm, and not negotiable: the surplus stage
+# offers slots to the worst-matched papers, "worst-matched" is measured on the
+# ranking score, and that means something different once the ranking is noise.
+# Arm A is re-run here rather than reused from $(ASSIGNMENT) so all three share
+# it. No --hotcrp-csv anywhere: a baseline slate must never be uploadable, which
+# assign_reviewers.py also refuses on its own.
+BASELINE_SEEDS ?= 1
+BASELINE_FLAGS = --paper-policy $(PAPER_POLICY) --csv "$(CSV)" \
+	--area-chair-csv "$(AREA_CHAIR_CSV)" --surplus-per-paper 0 \
+	$(RESERVE_FLAG) $(PC_CHECK) $(AREA_CHAIR_CHECK) $(REGION_FLAG) $(JUNIOR_FLAG) \
+	$(COAUTHOR_COI) $(COLLABORATOR_COI)
+
+# A random arm routinely leaves a paper short, so assign_reviewers exits 1 under
+# --paper-policy submitted. That is a finding, not a build failure -- the report
+# is wanted either way -- so the exit code is noted and the loop continues,
+# which also keeps .DELETE_ON_ERROR from removing the transcript.
+baselines: $(ASSIGN_DEPS) scripts/compare_baselines.py
+	@mkdir -p $(EVALUATION_DIR)
+	$(RUN) scripts.assign_reviewers $(BASELINE_FLAGS) \
+		--pairs-csv $(EVALUATION_DIR)/pairs-armA.csv \
+		> $(EVALUATION_DIR)/assignment-armA.txt
+	@for s in $(BASELINE_SEEDS); do \
+	  for arm in B:--no-area-gate C:; do \
+	    a=$${arm%%:*}; extra=$${arm#*:}; \
+	    echo "$(RUN) scripts.assign_reviewers ... --score-mode random --score-seed $$s $$extra"; \
+	    $(RUN) scripts.assign_reviewers $(BASELINE_FLAGS) --score-mode random \
+	      --score-seed $$s $$extra \
+	      --pairs-csv $(EVALUATION_DIR)/pairs-arm$$a-s$$s.csv \
+	      > $(EVALUATION_DIR)/assignment-arm$$a-s$$s.txt \
+	      || echo "arm $$a seed $$s: incomplete slate, see its shortage report" >&2; \
+	  done; \
+	done
+	$(RUN) scripts.compare_baselines $(EVALUATION_DIR)/pairs-armA.csv \
+		$(EVALUATION_DIR)/pairs-armB-*.csv $(EVALUATION_DIR)/pairs-armC-*.csv
 
 clean:
 	rm -f $(ASSIGNMENT) $(ASSIGNMENT_CSV) $(AREA_CHAIR_ASSIGNMENT) \
