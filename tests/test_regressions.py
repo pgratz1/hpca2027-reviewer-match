@@ -3,7 +3,9 @@ import contextlib
 import csv
 import io
 import json
+import os
 import random
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -1178,6 +1180,262 @@ class AssignmentPropertyTests(unittest.TestCase):
             [1], released_prefs, {1: 2 - len(slates[1])}, slates, used, caps, scores, set(caps)
         )
         self.assertEqual(["in_area", "near"], slates[1])
+
+
+class RandomizedBaselineTests(unittest.TestCase):
+    """--score-mode random: the matcher ranks on noise, the reports still
+    measure the true SPECTER2 affinity of the slate that produces."""
+
+    def reviewer(self, email, primary="Memory Systems"):
+        return Reviewer(
+            email=email, first="Test", last="Person", dblp_url="", pid=None,
+            affiliation="Example", primary=primary, secondary="", tertiary="",
+            keywords="", tier="full", override_cap=None,
+        )
+
+    def paper(self, pid, topics=("Memory Systems",), **kwargs):
+        base = {"pid": pid, "title": f"Paper {pid}.", "topics": list(topics),
+                "authors": [], "contacts": [], "pc_conflicts": {},
+                "reserve_reviewer": ""}
+        base.update(kwargs)
+        return base
+
+    def build(self, papers, reviewers, vectors=None, **kwargs):
+        """build_pair_scores over a tiny hand-built pool.
+
+        Every vector is the same unit vector unless a test supplies its own, so
+        by default every cosine is 1.0 and any spread in the pair lists is the
+        randomizer's doing and nothing else's.
+        """
+        emails = [r.email for r in reviewers]
+        matrix = (np.ones((len(emails), 3), dtype=np.float32)
+                  if vectors is None else np.array(vectors, dtype=np.float32))
+        cache = {str(p["pid"]): {"vector": [1.0, 0.0, 0.0]} for p in papers}
+        kwargs.setdefault("light_cap", 7)
+        kwargs.setdefault("full_cap", 15)
+        return assign_reviewers.build_pair_scores(
+            papers, cache, emails, matrix, {r.email: r for r in reviewers}, {}, **kwargs
+        )
+
+    def test_the_default_score_mode_ranks_and_measures_on_one_object(self):
+        # Not assertEqual: two dicts holding equal floats would drift the first
+        # time someone edits one branch and not the other. Identity is the only
+        # proof the production path cannot change, and it is what lets every
+        # measurement call site switch to affinity_lookup for free.
+        scores = self.build([self.paper(1)], [self.reviewer("a@x.edu")])
+        self.assertIs(scores.rank, scores.affinity)
+
+    def test_a_random_run_still_measures_the_true_specter2_affinity(self):
+        # The whole experiment: rank on noise, measure the cosine. If affinity
+        # were overwritten too, every arm would report the same meaningless
+        # mean and the comparison would silently be of nothing.
+        papers, revs = [self.paper(1)], [self.reviewer("a@x.edu")]
+        real = self.build(papers, revs)
+        random_run = self.build(papers, revs, score_mode="random", score_seed=1)
+        self.assertIsNot(random_run.rank, random_run.affinity)
+        self.assertEqual(real.affinity, random_run.affinity)
+        self.assertNotEqual(random_run.rank, random_run.affinity)
+
+    def test_the_gated_and_area_released_passes_agree_on_one_pairs_score(self):
+        # build_pair_scores scores each paper twice, once gated and once
+        # area-released. A stream RNG would hand the same pair two different
+        # draws, and the gated preference list would then disagree with the
+        # table deferred acceptance bumps on.
+        revs = [self.reviewer("in@x.edu"), self.reviewer("out@x.edu", primary="Security")]
+        scores = self.build([self.paper(1)], revs, score_mode="random", score_seed=3)
+        gated = dict(scores.eligible[1])
+        released = dict(scores.released[1])
+        self.assertEqual(["in@x.edu"], list(gated))
+        self.assertEqual({"in@x.edu", "out@x.edu"}, set(released))
+        self.assertEqual(released["in@x.edu"], gated["in@x.edu"])
+        self.assertEqual(scores.rank[("in@x.edu", 1)], gated["in@x.edu"])
+
+    def test_the_preference_lists_carry_the_score_the_matcher_bumps_on(self):
+        # deferred_acceptance's deferral deques assume the preference list is
+        # sorted by the score it bumps on ("the pref list is descending, so
+        # appends keep each deque sorted"). Leaving these lists on the cosine
+        # while ranking on the draw pops the wrong deferred candidate --
+        # silently, with no self-check that catches it.
+        revs = [self.reviewer(f"r{i}@x.edu") for i in range(8)]
+        # Descending cosines, so an un-rescored list would come out in email
+        # order and this test would pass by accident.
+        vectors = [[1.0 - i / 100, 0.0, 0.0] for i in range(8)]
+        scores = self.build([self.paper(1)], revs, vectors=vectors,
+                            score_mode="random", score_seed=5)
+        for pairs in (scores.eligible[1], scores.released[1]):
+            by_score = [e for e, _ in sorted(pairs, key=lambda es: -es[1])]
+            by_rank = sorted((e for e, _ in pairs),
+                             key=lambda e: -scores.rank[(e, 1)])
+            self.assertEqual(by_rank, by_score)
+        # And it really did reorder relative to affinity, or the check is vacuous.
+        by_affinity = sorted((e for e, _ in scores.eligible[1]),
+                             key=lambda e: -scores.affinity[(e, 1)])
+        self.assertNotEqual(by_affinity, [e for e, _ in sorted(
+            scores.eligible[1], key=lambda es: -es[1])])
+
+    def test_the_no_area_gate_pair_lists_stay_one_object(self):
+        # main() and the surplus stage both pass eligible and released prefs;
+        # under --no-area-gate they are the same pool, and rebuilding the list
+        # twice would be two independent re-scores to keep in step forever.
+        scores = self.build([self.paper(1)], [self.reviewer("a@x.edu")],
+                            area_gate=False, score_mode="random")
+        self.assertIs(scores.eligible[1], scores.released[1])
+
+    def test_the_random_score_does_not_move_when_python_reseeds_string_hash(self):
+        # hash() is salted per process -- the trap that once made the DBLP
+        # snapshot files reorder on every run and left cmp unable to tell a
+        # real change from none. A rerun of an arm has to be identical.
+        code = ("from scripts.assign_reviewers import random_pair_score;"
+                "print(random_pair_score(7, 'a@x.edu', 42))")
+        root = Path(__file__).resolve().parents[1]
+        seen = set()
+        for salt in ("0", "1", "random"):
+            env = {**os.environ, "PYTHONHASHSEED": salt,
+                   "PYTHONPATH": os.pathsep.join((str(root / "src"), str(root)))}
+            out = subprocess.run([sys.executable, "-c", code], env=env,
+                                 capture_output=True, text=True, check=True)
+            seen.add(out.stdout.strip())
+        self.assertEqual(1, len(seen), f"salt changed the draw: {seen}")
+
+    def test_two_seeds_disagree_on_the_same_pair(self):
+        self.assertNotEqual(assign_reviewers.random_pair_score(1, "a@x.edu", 3),
+                            assign_reviewers.random_pair_score(2, "a@x.edu", 3))
+
+    def test_the_random_scores_spread_over_the_unit_interval(self):
+        # Catches a digest wired up to return something near-constant, which
+        # would leave the arm a tie-break sweep rather than a randomization and
+        # would look like a suspiciously small affinity drop.
+        draws = [assign_reviewers.random_pair_score(1, f"r{i}@x.edu", 1)
+                 for i in range(1000)]
+        self.assertTrue(all(0.0 <= d < 1.0 for d in draws))
+        self.assertLess(min(draws), 0.05)
+        self.assertGreater(max(draws), 0.95)
+        self.assertAlmostEqual(0.5, sum(draws) / len(draws), delta=0.05)
+
+    def test_a_random_slate_still_has_no_blocking_pair(self):
+        # Stability is a property of the preference ORDER, not of what the
+        # numbers mean, so a randomized arm's F1 self-check must still be 0. A
+        # failure here means the seam desynchronized the preference lists from
+        # the score table, not that the theory stopped applying.
+        pids = list(range(6))
+        emails = [f"r{i}@x.edu" for i in range(9)]
+        scores = {(e, pid): assign_reviewers.random_pair_score(11, e, pid)
+                  for e in emails for pid in pids}
+        prefs = {pid: sorted(emails, key=lambda e: -scores[(e, pid)]) for pid in pids}
+        caps = {e: 3 for e in emails}
+        targets = {pid: 4 for pid in pids}
+        pairs = {pid: [(e, scores[(e, pid)]) for e in prefs[pid]] for pid in pids}
+        held = assign_reviewers.deferred_acceptance(pids, prefs, targets, caps, scores)
+        self.assertEqual(0, assign_reviewers.count_blocking_pairs(
+            pairs, held, caps, targets, scores))
+
+    def test_a_conflicted_reviewer_is_unreachable_however_the_pair_is_scored(self):
+        # COI is applied inside eligible_scores and the randomizer runs strictly
+        # after it. The risk is someone "optimising" by drawing scores over
+        # candidate_emails directly, which would put every conflict back.
+        clean = self.reviewer("clean@x.edu")
+        declared = self.reviewer("declared@x.edu")
+        author = self.reviewer("author@x.edu")
+        derived = self.reviewer("derived@x.edu")
+        p = self.paper(1, authors=[{"email": "Author@X.edu"}],
+                       pc_conflicts={declared.email: 1})
+        scores = assign_reviewers.build_pair_scores(
+            [p], {"1": {"vector": [1.0, 0.0, 0.0]}},
+            [r.email for r in (clean, declared, author, derived)],
+            np.ones((4, 3), dtype=np.float32),
+            {r.email: r for r in (clean, declared, author, derived)},
+            {1: {derived.email}},
+            score_mode="random", score_seed=1, light_cap=7, full_cap=15,
+        )
+        self.assertEqual([clean.email], [e for e, _ in scores.released[1]])
+        self.assertEqual([clean.email], [e for e, _ in scores.eligible[1]])
+        for blocked in (declared, author, derived):
+            self.assertNotIn((blocked.email, 1), scores.rank)
+            self.assertNotIn((blocked.email, 1), scores.affinity)
+
+    def test_a_random_run_refuses_to_write_the_production_hotcrp_csv(self):
+        # A baseline slate ignores affinity entirely. Nothing that can be fed
+        # to HotCRP should ever come out of one, whatever the filename says.
+        with (
+            mock.patch.object(sys, "argv", ["assign_reviewers.py", "--score-mode",
+                                            "random", "--hotcrp-csv", "out.csv"]),
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            assign_reviewers.main()
+        self.assertEqual(2, raised.exception.code)
+
+    def test_an_unknown_score_mode_is_rejected_before_io(self):
+        with (
+            mock.patch.object(sys, "argv", ["assign_reviewers.py", "--score-mode", "uniform"]),
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            assign_reviewers.main()
+        self.assertEqual(2, raised.exception.code)
+
+    def read_pairs(self, **kwargs):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "pairs.csv")
+            assign_reviewers.write_pairs_csv(path, **kwargs)
+            with open(path, newline="", encoding="utf-8") as f:
+                return list(csv.DictReader(f))
+
+    def test_the_pairs_csv_records_the_rank_score_beside_the_true_affinity(self):
+        # Two identical columns is the byte-level evidence a file came from the
+        # production path; two different ones, that it came from a random arm.
+        affinity = {("a@x.edu", 1): 0.9, ("b@x.edu", 1): 0.8}
+        same = self.read_pairs(
+            slates={1: ["a@x.edu", "b@x.edu"]}, assigned_via={(1, "a@x.edu"): "senior anchor"},
+            rank_lookup=affinity, affinity_lookup=affinity,
+        )
+        self.assertEqual(["a@x.edu", "b@x.edu"], [r["email"] for r in same])
+        self.assertEqual(["senior anchor", "fill"], [r["phase"] for r in same])
+        for row in same:
+            self.assertEqual(row["rank_score"], row["affinity"])
+        rank = {("a@x.edu", 1): 0.1, ("b@x.edu", 1): 0.7}
+        differ = self.read_pairs(
+            slates={1: ["a@x.edu", "b@x.edu"]}, assigned_via={},
+            rank_lookup=rank, affinity_lookup=affinity,
+        )
+        # Still ordered by affinity, not by the draw: the file is a measurement.
+        self.assertEqual(["a@x.edu", "b@x.edu"], [r["email"] for r in differ])
+        self.assertNotEqual(differ[0]["rank_score"], differ[0]["affinity"])
+
+    def test_the_pairs_csv_keeps_full_precision(self):
+        # The reports' three decimals cannot resolve the differences this repo
+        # already reasons about, which run to 0.0006.
+        scores = {("a@x.edu", 1): 0.96501234567}
+        row = self.read_pairs(slates={1: ["a@x.edu"]}, assigned_via={},
+                              rank_lookup=scores, affinity_lookup=scores)[0]
+        self.assertEqual(0.96501234567, float(row["affinity"]))
+
+    def test_the_goodness_ceiling_is_the_best_k_eligible_ignoring_capacity(self):
+        # The bracket exists so a drop can be read as a fraction of the range
+        # actually available. A ceiling that quietly counted fewer than k
+        # reviewers would inflate it and make every arm look closer to optimal.
+        report = self.goodness_report(
+            papers=[self.paper(1)],
+            goodness={1: 0.5},
+            floor={1: 0.25},
+            ceiling={1: 0.75},
+            ceiling_k=5,
+        )
+        self.assertIn("pool floor 0.250", report)
+        self.assertIn("best-5 ceiling 0.750", report)
+        self.assertIn("NOT jointly achievable", report)
+
+    def test_the_bracket_is_absent_when_it_was_not_computed(self):
+        # Every other caller of match_goodness_report, and the shape that keeps
+        # the production transcript unchanged when the bracket is not wanted.
+        self.assertNotIn("Bracket", self.goodness_report(
+            papers=[self.paper(1)], goodness={1: 0.5}))
+
+    def goodness_report(self, **kwargs):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            assign_reviewers.match_goodness_report(**kwargs)
+        return out.getvalue()
 
 
 class SurplusDistributionTests(unittest.TestCase):
