@@ -122,6 +122,7 @@ from reviewer_match.paths import assignment_path, cache_path, curated_path, inpu
 import argparse
 import csv
 import hashlib
+import heapq
 import json
 import os
 import sys
@@ -835,9 +836,22 @@ def paper_goodness(paper_held: dict[int, list[str]], score_lookup: dict[tuple[st
     }
 
 
-def match_goodness_report(papers: list[dict], goodness: dict[int, float | None]) -> None:
+def match_goodness_report(
+    papers: list[dict],
+    goodness: dict[int, float | None],
+    *,
+    floor: dict[int, float] | None = None,
+    ceiling: dict[int, float] | None = None,
+    ceiling_k: int | None = None,
+) -> None:
     """Print every paper's match goodness worst-first, so the papers whose
-    reviewer slates sit furthest from their topic are easy to spot."""
+    reviewer slates sit furthest from their topic are easy to spot.
+
+    `floor` and `ceiling` bracket the mean so it can be read as a fraction of
+    the range actually available, which is the only way to tell a 0.08 gap that
+    is most of the headroom from one that is a sliver of it. Both are averaged
+    over the same papers as the mean, so all three move together.
+    """
     scored = sorted(
         (p for p in papers if goodness[p["pid"]] is not None),
         key=lambda p: (goodness[p["pid"]], p["pid"]),
@@ -850,6 +864,20 @@ def match_goodness_report(papers: list[dict], goodness: dict[int, float | None])
         mean = sum(values) / len(values)
         std = (sum((v - mean) ** 2 for v in values) / len(values)) ** 0.5
         print(f"{len(scored)} paper(s): mean {mean:.3f}, std {std:.3f}")
+        if floor is not None and ceiling is not None:
+            lo = [floor[p["pid"]] for p in scored if p["pid"] in floor]
+            hi = [ceiling[p["pid"]] for p in scored if p["pid"] in ceiling]
+            if lo and hi:
+                print(
+                    f"Bracket: pool floor {sum(lo) / len(lo):.3f} over {len(lo)} paper(s) "
+                    f"— one reviewer drawn at random from what this run's own COI and "
+                    f"area gate left; best-{ceiling_k} ceiling {sum(hi) / len(hi):.3f} "
+                    f"over {len(hi)} paper(s) — each paper's {ceiling_k} closest eligible "
+                    f"reviewers ignoring every load and composition cap. The ceiling is a "
+                    f"per-paper maximum and is NOT jointly achievable: it would put the "
+                    f"same popular reviewers on dozens of papers each. It brackets, it "
+                    f"does not target."
+                )
         for p in scored:
             print(f"  {goodness[p['pid']]:.3f}  [{p['pid']}] {p['title']}")
     if unscored:
@@ -1579,6 +1607,60 @@ def build_pair_scores(
     return PairScores(eligible, released, rank, affinity, reviewer_cap)
 
 
+def write_pairs_csv(
+    path: str,
+    slates: Mapping[int, Sequence[str]],
+    assigned_via: Mapping[tuple[int, str], str],
+    rank_lookup: Mapping[tuple[str, int], float],
+    affinity_lookup: Mapping[tuple[str, int], float],
+) -> None:
+    """Atomically write one row per assigned pair, for comparing arms.
+
+    A measurement artifact, never an upload -- hence the roster `email` rather
+    than write_hotcrp_csv's `hotcrp_email`, which is the address HotCRP accepts
+    but not the key the fingerprint caches and seniority CSVs are keyed on.
+
+    `rank_score` and `affinity` are the same number under --score-mode specter2
+    and differ under a randomized arm, which makes the two columns side by side
+    the readable evidence of which run this was. Full repr, not the reports'
+    three decimals: the differences this repo already reasons about are
+    0.0006-scale and three decimals cannot resolve them.
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            newline="",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            temporary = Path(f.name)
+            writer = csv.writer(f)
+            writer.writerow(["pid", "email", "phase", "rank_score", "affinity"])
+            for pid in sorted(slates):
+                emails = sorted(
+                    slates[pid], key=lambda e: (-affinity_lookup[(e, pid)], e)
+                )
+                for email in emails:
+                    writer.writerow([
+                        pid,
+                        email,
+                        assigned_via.get((pid, email), "fill"),
+                        repr(rank_lookup[(email, pid)]),
+                        repr(affinity_lookup[(email, pid)]),
+                    ])
+        os.replace(temporary, target)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--data", default=DEFAULT_DATA, help="path to the HotCRP paper export JSON")
@@ -1653,6 +1735,13 @@ def main() -> int:
         help="seed for --score-mode random (default: %(default)s). The draw is a pure "
              "function of (seed, reviewer, paper), so a rerun is identical and the "
              "gated and area-released passes agree on every pair"
+    )
+    parser.add_argument(
+        "--pairs-csv", metavar="PATH",
+        help="write one row per assigned pair (pid, email, phase, rank_score, "
+             "affinity) for comparing arms; see scripts/compare_baselines.py. Unlike "
+             "--hotcrp-csv this is a measurement artifact and never an upload, so it "
+             "is written even when the slate is short"
     )
     parser.add_argument(
         "--seniority", default=DEFAULT_SENIORITY,
@@ -2349,7 +2438,26 @@ def main() -> int:
         f"{chairs_assigned} still assigned — should always be 0; "
     )
 
-    match_goodness_report(papers, goodness)
+    # The bracket, from data already in memory. eligible_by_pid, not
+    # released_by_pid, so each arm is bracketed by the pool it actually drew
+    # from -- released under --no-area-gate, gated otherwise. affinity_lookup,
+    # not the pairs' own second element: those carry the ranking score.
+    goodness_floor = {
+        pid: sum(affinity_lookup[(e, pid)] for e, _ in eligible_by_pid[pid])
+             / len(eligible_by_pid[pid])
+        for pid in pids if eligible_by_pid[pid]
+    }
+    goodness_ceiling = {
+        pid: sum(heapq.nlargest(
+            args.reviewers_per_paper,
+            (affinity_lookup[(e, pid)] for e, _ in eligible_by_pid[pid]),
+        )) / args.reviewers_per_paper
+        for pid in pids if len(eligible_by_pid[pid]) >= args.reviewers_per_paper
+    }
+    match_goodness_report(
+        papers, goodness, floor=goodness_floor, ceiling=goodness_ceiling,
+        ceiling_k=args.reviewers_per_paper,
+    )
     surplus_placed = surplus_report(
         papers, surplus_added, base_goodness, goodness, affinity_lookup,
         reviewers_by_email, seniority, assigned_via,
@@ -2383,6 +2491,18 @@ def main() -> int:
         f"{total_missing} reviewer-slot(s) unfilled — see shortage report above).",
         file=sys.stderr,
     )
+    if args.pairs_csv:
+        # Above the "refusing a partial result" guard, unlike --hotcrp-csv below
+        # it: a short slate is still a valid measurement, it is just not a valid
+        # upload. A randomized arm routinely under-fills, and that run is
+        # precisely the one worth comparing.
+        try:
+            write_pairs_csv(args.pairs_csv, paper_held, assigned_via,
+                            score_lookup, affinity_lookup)
+        except OSError as exc:
+            print(f"ERROR: could not write pairs CSV {args.pairs_csv}: {exc}",
+                  file=sys.stderr)
+            return 1
     if args.paper_policy == "submitted" and total_missing:
         print(
             "ERROR: submitted-paper assignment is incomplete; refusing a partial result",
