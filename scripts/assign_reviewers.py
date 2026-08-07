@@ -2,6 +2,8 @@
 
     python -m scripts.assign_reviewers
     python -m scripts.assign_reviewers --light-cap 7 --full-cap 15 --reviewers-per-paper 5
+    python -m scripts.assign_reviewers --score-mode random --surplus-per-paper 0
+    python -m scripts.assign_reviewers --score-mode random --no-area-gate --surplus-per-paper 0
 
 Unlike score_papers.py's independent per-paper ranking, a per-reviewer paper
 cap only makes sense considered across ALL papers at once: if two papers
@@ -87,6 +89,20 @@ reported. --same-country-cap 0 admits no same-country reviewer at all;
 --no-same-country-cap switches the policy off. See README, "Same-country cap",
 for the stability caveat this introduces.
 
+Randomized baselines (--score-mode random, --score-seed N) answer "how much of
+the match quality is actually the SPECTER2 signal?" The matcher ranks on a
+reproducible per-(reviewer, paper) draw instead of the cosine, while every COI
+layer, the senior anchor, the junior/out-of-area caps, the same-country cap and
+every reviewer load cap still bind exactly as they do in production. Reported
+match goodness stays the TRUE SPECTER2 similarity of whatever slate that
+produces, so the affinity drop is readable straight off the report. Two arms:
+area-blind (--score-mode random --no-area-gate) and area-aware (--score-mode
+random alone), which between them separate the declared-area gate's
+contribution from the embedding's. Compare arms at --surplus-per-paper 0, and
+see `make baselines`. This is a stable matching under random preferences, not a
+uniform draw over feasible assignments, and it is not an assignment:
+--hotcrp-csv is refused.
+
 Papers that break the criteria even after degradation are printed in a report
 at the end; every paper gets a "match goodness" score — the mean similarity
 of its assigned reviewers — summarized worst-first; and a relaxation &
@@ -105,6 +121,7 @@ from reviewer_match.paths import assignment_path, cache_path, curated_path, inpu
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import sys
@@ -151,6 +168,16 @@ DEFAULT_REVIEWERS_PER_PAPER = 5
 
 # Extra reviewers one paper may gain from capacity the fill phases left unspent.
 DEFAULT_SURPLUS_PER_PAPER = 1
+
+# What the matcher RANKS on. `random` is a baseline arm: it keeps every COI
+# layer, the senior anchor, the junior/out-of-area caps, the same-country cap
+# and every load cap, and drops only the affinity signal -- so the true-SPECTER2
+# match goodness the reports still print measures what the constraints alone are
+# worth. 2027 matches compare_abstract_rankings.py's seed; nothing depends on
+# the value.
+SCORE_MODES = ("specter2", "random")
+DEFAULT_SCORE_MODE = "specter2"
+DEFAULT_SCORE_SEED = 2027
 
 # A per-paper limit that doesn't name a paper doesn't bind it. An int keeps every
 # comparison integral -- no float('inf') leaking into counters or reports -- and
@@ -431,6 +458,26 @@ def reviewer_paper_cap(
     if r.tier == "reserve":
         return reserve_cap
     return full_cap
+
+
+def random_pair_score(seed: int, email: str, pid: int) -> float:
+    """A reproducible pseudo-random score in [0, 1) for one (reviewer, paper).
+
+    A pure function of its arguments, never a draw from a stream, for two
+    reasons. `build_pair_scores` scores each paper twice -- once gated, once
+    area-released -- and both lists must carry the same number for the same
+    pair, or a preference list disagrees with the score deferred acceptance
+    bumps on and the deferral deques stop being sorted. And a rerun has to be
+    identical, the contract every cache write in this repo keeps.
+
+    blake2b, not the builtin `hash()`: Python salts string hashing per process,
+    the trap that once made the DBLP snapshot files reorder on every run and
+    left `cmp` unable to tell a real change from none.
+    """
+    digest = hashlib.blake2b(
+        "\x00".join((str(seed), email, str(pid))).encode("utf-8"), digest_size=8
+    ).digest()
+    return int.from_bytes(digest, "big") / 2 ** 64
 
 
 def split_promoted_reserves(reserves, reviewers_by_email) -> tuple[list, list[str], list]:
@@ -773,6 +820,11 @@ def seniority_report(
 
 def paper_goodness(paper_held: dict[int, list[str]], score_lookup: dict[tuple[str, int], float]) -> dict[int, float | None]:
     """Per-paper match goodness: mean similarity of the assigned reviewers.
+
+    Means whatever score the caller passes: the matcher's ranking score inside
+    distribute_surplus, which is how a randomized arm stays blind to affinity
+    even when choosing who to boost, and the true SPECTER2 affinity in every
+    report. The same object unless --score-mode split them.
 
     None for papers with no reviewers — "no slate" is a shortage-report
     problem, not a goodness of 0.
@@ -1441,6 +1493,92 @@ def write_hotcrp_csv(
             temporary.unlink(missing_ok=True)
 
 
+@dataclass(frozen=True)
+class PairScores:
+    """The one place the matcher's ranking score can differ from true affinity.
+
+    `rank` is what every phase proposes, bumps, defers and self-checks on;
+    `affinity` is the SPECTER2 cosine every report prints. Under the default
+    --score-mode specter2 they are the SAME OBJECT, so the production path
+    cannot drift from the one this repo has always run -- two dicts holding
+    equal floats could, the first time someone edits one branch.
+
+    `eligible` and `released` are the gated and COI-only pair lists, both scored
+    by `rank`, because they become the preference lists.
+    """
+
+    eligible: dict[int, list[tuple[str, float]]]
+    released: dict[int, list[tuple[str, float]]]
+    rank: dict[tuple[str, int], float]
+    affinity: dict[tuple[str, int], float]
+    reviewer_cap: dict[str, int]
+
+
+def build_pair_scores(
+    papers: list[dict],
+    paper_cache: Mapping[str, dict],
+    candidate_emails: list[str],
+    candidate_matrix: np.ndarray,
+    reviewers_by_email: Mapping[str, object],
+    extra_conflicts: Mapping[int, set[str]],
+    *,
+    area_gate: bool = True,
+    score_mode: str = DEFAULT_SCORE_MODE,
+    score_seed: int = DEFAULT_SCORE_SEED,
+    light_cap: int,
+    full_cap: int,
+    reserve_cap: int = DEFAULT_RESERVE_CAP,
+) -> PairScores:
+    """Gated and area-released (reviewer, paper) pairs, plus per-reviewer caps.
+
+    Gated pairs drive the normal phases; area-released pairs (COI-only) back the
+    relaxation phases, so the score tables and the caps cover the superset.
+
+    Under --score-mode random the pairs are ranked by `random_pair_score`
+    instead of the cosine, which is what makes a baseline arm: COI, the area
+    gate, the anchors and every cap still bind, but nothing in the decision path
+    knows anything about affinity. The cosine is still computed -- `affinity`
+    keeps it -- because measuring the true affinity of the slate a blind matcher
+    produces is the entire point.
+    """
+    eligible: dict[int, list[tuple[str, float]]] = {}
+    released: dict[int, list[tuple[str, float]]] = {}
+    affinity: dict[tuple[str, int], float] = {}
+    rank = affinity if score_mode == "specter2" else {}
+    reviewer_cap: dict[str, int] = {}
+    for p in papers:
+        pid = p["pid"]
+        paper_vec = np.array(paper_cache[str(pid)]["vector"], dtype=np.float32)
+        conflicts = extra_conflicts.get(pid, frozenset())
+        pairs_all = eligible_scores(
+            p, candidate_emails, candidate_matrix, paper_vec, reviewers_by_email,
+            area_gate=False, extra_conflicts=conflicts,
+        )
+        pairs_gated = pairs_all if not area_gate else eligible_scores(
+            p, candidate_emails, candidate_matrix, paper_vec, reviewers_by_email,
+            extra_conflicts=conflicts,
+        )
+        for email, cosine in pairs_all:
+            affinity[(email, pid)] = cosine
+            if rank is not affinity:
+                rank[(email, pid)] = random_pair_score(score_seed, email, pid)
+            reviewer_cap[email] = reviewer_paper_cap(
+                reviewers_by_email[email], light_cap, full_cap, reserve_cap
+            )
+        # Re-scored off `rank`, unconditionally and never off the cosine: these
+        # lists become the preference lists, and deferred_acceptance's deferral
+        # deques assume their order matches the score it bumps on ("the pref
+        # list is descending, so appends keep each deque sorted"). Ordering by
+        # affinity while ranking on the draw would pop the wrong deferred
+        # candidate -- silently, with no self-check to catch it. In specter2
+        # mode rank[...] IS the cosine, so this is a no-op by construction.
+        released[pid] = [(e, rank[(e, pid)]) for e, _ in pairs_all]
+        eligible[pid] = released[pid] if pairs_gated is pairs_all else [
+            (e, rank[(e, pid)]) for e, _ in pairs_gated
+        ]
+    return PairScores(eligible, released, rank, affinity, reviewer_cap)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--data", default=DEFAULT_DATA, help="path to the HotCRP paper export JSON")
@@ -1500,6 +1638,21 @@ def main() -> int:
     parser.add_argument(
         "--no-area-gate", action="store_true",
         help="skip the hard area-eligibility gate; consider all non-conflicted reviewers"
+    )
+    parser.add_argument(
+        "--score-mode", choices=SCORE_MODES, default=DEFAULT_SCORE_MODE,
+        help="what the matcher RANKS on (default: %(default)s). `random` replaces the "
+             "SPECTER2 similarity with a reproducible per-(reviewer, paper) draw, "
+             "giving a randomized baseline that still honours every COI layer, the "
+             "senior anchor, the junior/out-of-area caps, the same-country cap and "
+             "every load cap. Reported match goodness stays the TRUE SPECTER2 "
+             "similarity either way, so the affinity drop is readable directly"
+    )
+    parser.add_argument(
+        "--score-seed", type=int, default=DEFAULT_SCORE_SEED, metavar="N",
+        help="seed for --score-mode random (default: %(default)s). The draw is a pure "
+             "function of (seed, reviewer, paper), so a rerun is identical and the "
+             "gated and area-released passes agree on every pair"
     )
     parser.add_argument(
         "--seniority", default=DEFAULT_SENIORITY,
@@ -1642,6 +1795,15 @@ def main() -> int:
             "Warning: --min-seniors exceeds --reviewers-per-paper; the criteria report will mark papers breaking",
             file=sys.stderr,
         )
+    if args.score_mode != "specter2" and args.hotcrp_csv:
+        parser.error(
+            f"--score-mode {args.score_mode} produces a measurement baseline, not an "
+            f"assignment anyone should upload; drop --hotcrp-csv (--pairs-csv is the "
+            f"machine-readable artifact for comparing arms)"
+        )
+    if args.score_mode == "specter2" and args.score_seed != DEFAULT_SCORE_SEED:
+        print("Warning: --score-seed has no effect under --score-mode specter2",
+              file=sys.stderr)
 
     seniority: dict[str, dict] | None = None
     if not args.no_seniority:
@@ -1859,30 +2021,47 @@ def main() -> int:
         collab_derived = collaborator_coi.derive_conflicts(papers, collab_profiles, pcinfo_index)
         collab_hard = collaborator_coi.hard_conflicts(collab_derived)
 
-    # Gated pairs drive the normal phases; area-released pairs (COI-only)
-    # back the relaxation phases, so score_lookup and caps cover the superset.
-    eligible_by_pid: dict[int, list[tuple[str, float]]] = {}
-    released_by_pid: dict[int, list[tuple[str, float]]] = {}
-    score_lookup: dict[tuple[str, int], float] = {}
-    reviewer_cap: dict[str, int] = {}
-    for p in papers:
-        pid = p["pid"]
-        paper_vec = np.array(paper_cache[str(pid)]["vector"], dtype=np.float32)
-        derived_conflicts = set(derived.get(pid, ())) | collab_hard.get(pid, set())
-        pairs_all = eligible_scores(
-            p, candidate_emails, candidate_matrix, paper_vec, reviewers_by_email,
-            area_gate=False, extra_conflicts=derived_conflicts,
-        )
-        released_by_pid[pid] = pairs_all
-        eligible_by_pid[pid] = pairs_all if args.no_area_gate else eligible_scores(
-            p, candidate_emails, candidate_matrix, paper_vec, reviewers_by_email,
-            extra_conflicts=derived_conflicts,
-        )
-        for email, score in pairs_all:
-            score_lookup[(email, pid)] = score
-            reviewer_cap[email] = reviewer_paper_cap(
-                reviewers_by_email[email], args.light_cap, args.full_cap, args.reserve_cap
-            )
+    pair_scores = build_pair_scores(
+        papers, paper_cache, candidate_emails, candidate_matrix, reviewers_by_email,
+        {p["pid"]: set(derived.get(p["pid"], ())) | collab_hard.get(p["pid"], set())
+         for p in papers},
+        area_gate=not args.no_area_gate,
+        score_mode=args.score_mode, score_seed=args.score_seed,
+        light_cap=args.light_cap, full_cap=args.full_cap, reserve_cap=args.reserve_cap,
+    )
+    # score_lookup is what every phase ranks, bumps and self-checks on;
+    # affinity_lookup is the true SPECTER2 cosine every report prints. The same
+    # object unless --score-mode random split them.
+    eligible_by_pid = pair_scores.eligible
+    released_by_pid = pair_scores.released
+    score_lookup = pair_scores.rank
+    affinity_lookup = pair_scores.affinity
+    reviewer_cap = pair_scores.reviewer_cap
+
+    if args.score_mode != "specter2":
+        # On stdout, not stderr: the transcript is the archived artifact, and a
+        # reader who finds one of these files months later has to be able to see
+        # from the file alone that it is not an assignment.
+        gate = "area-blind (--no-area-gate)" if args.no_area_gate else "area-aware"
+        print(f"\n=== Randomized baseline: --score-mode {args.score_mode}, "
+              f"seed {args.score_seed}, {gate} ===")
+        print("The matcher ranked on a reproducible per-(reviewer, paper) draw, not on "
+              "SPECTER2 similarity. Every COI layer, the senior anchor, the "
+              "junior/out-of-area caps, the same-country cap and every reviewer load "
+              "cap bound exactly as they do in production. Match goodness below is the "
+              "TRUE SPECTER2 similarity of the slate that produced.")
+        print("This is a stable matching under random preferences, NOT a uniform draw "
+              "over feasible assignments: the constraints alone shape the slate, which "
+              "is what the area-aware and area-blind arms exist to separate.")
+        print("Three sections below are NOT comparable against a production run. The "
+              "relaxation report: with --no-area-gate there is no gate left to release, "
+              "so every pick is labelled 'senior anchor'/'fill' and the arm looks like "
+              "it struggled less. The same-country 'traded a better-matched reviewer' "
+              "count: there is no better-matched reviewer when the ranking is noise. "
+              "And any full-slate goodness figure: the surplus stage offers slots to "
+              "the worst-matched papers, 'worst-matched' is measured on the ranking "
+              "score, and that means something different here -- compare arms at "
+              "--surplus-per-paper 0.")
 
     if area_chairs_dropped:
         # On stdout as well as stderr: assignment.txt is the archived artifact,
@@ -2062,7 +2241,7 @@ def main() -> int:
     # every base-target report still describe the assignment they described
     # before this ran. Snapshot goodness first: it is the figure comparable
     # against a run with the stage off, and paper_held mutates underneath.
-    base_goodness = paper_goodness(paper_held, score_lookup)
+    base_goodness = paper_goodness(paper_held, affinity_lookup)
     spare_before = spare_capacity(reviewer_cap, used)
     surplus_added, surplus_rounds = distribute_surplus(
         pids, paper_prefs, released_prefs, paper_held, used, reviewer_cap,
@@ -2072,11 +2251,11 @@ def main() -> int:
     spare_after = spare_capacity(reviewer_cap, used)
 
     # --- Report ---------------------------------------------------------------
-    goodness = paper_goodness(paper_held, score_lookup)
+    goodness = paper_goodness(paper_held, affinity_lookup)
     reviewer_load: dict[str, int] = defaultdict(int)
     for p in papers:
         pid = p["pid"]
-        assigned = sorted(paper_held[pid], key=lambda e: -score_lookup[(e, pid)])
+        assigned = sorted(paper_held[pid], key=lambda e: -affinity_lookup[(e, pid)])
         under_filled = "  *** UNDER-FILLED ***" if len(assigned) < args.reviewers_per_paper else ""
         # Mutually exclusive with the marker above, and the count stays the base
         # target: assign_area_chairs.py reads this line's leading number.
@@ -2090,7 +2269,7 @@ def main() -> int:
         for rank, email in enumerate(assigned, 1):
             r = reviewers_by_email[email]
             cls = "" if seniority is None else "/" + (seniority[email]["class"] if email in seniority else "?")
-            print(f"  {rank:2d}. {score_lookup[(email, pid)]:.3f}  {r.name} <{email}>  [{r.tier}{cls}]  ({r.primary})")
+            print(f"  {rank:2d}. {affinity_lookup[(email, pid)]:.3f}  {r.name} <{email}>  [{r.tier}{cls}]  ({r.primary})")
             reviewer_load[email] += 1
 
     total_pairs = sum(len(v) for v in paper_held.values())
@@ -2143,7 +2322,7 @@ def main() -> int:
     if not args.no_same_country_cap:
         country_over = country_cap_report(
             papers, paper_held, countries, reviewer_country, paper_coverage,
-            thin_papers, released_prefs, paper_target, score_lookup,
+            thin_papers, released_prefs, paper_target, affinity_lookup,
             {e for e in reviewer_cap if reviewer_load[e] < reviewer_cap[e]},
             cap=args.same_country_cap, majority=args.region_majority,
             min_resolved=args.region_min_resolved,
@@ -2172,7 +2351,7 @@ def main() -> int:
 
     match_goodness_report(papers, goodness)
     surplus_placed = surplus_report(
-        papers, surplus_added, base_goodness, goodness, score_lookup,
+        papers, surplus_added, base_goodness, goodness, affinity_lookup,
         reviewers_by_email, seniority, assigned_via,
         reviewers_per_paper=args.reviewers_per_paper,
         surplus_per_paper=args.surplus_per_paper,
@@ -2180,7 +2359,7 @@ def main() -> int:
     )
     n_excluded, n_relaxed = relaxation_report(
         skipped_papers, papers, paper_held, paper_target, assigned_via,
-        goodness, score_lookup, reviewers_by_email, seniority,
+        goodness, affinity_lookup, reviewers_by_email, seniority,
         itemize_excluded=args.paper_policy != "submitted",
     )
 
@@ -2212,7 +2391,7 @@ def main() -> int:
         return 1
     if args.hotcrp_csv:
         try:
-            write_hotcrp_csv(args.hotcrp_csv, paper_held, score_lookup, reviewers_by_email)
+            write_hotcrp_csv(args.hotcrp_csv, paper_held, affinity_lookup, reviewers_by_email)
         except OSError as exc:
             print(f"ERROR: could not write HotCRP CSV {args.hotcrp_csv}: {exc}", file=sys.stderr)
             return 1
