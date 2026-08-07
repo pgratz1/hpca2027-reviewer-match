@@ -678,6 +678,91 @@ make collaborator-coi                            # the itemised report, offline
 make COLLABORATOR_COI=--no-collaborator-coi       # assign without it
 ```
 
+### Randomized baselines — how much is the SPECTER2 signal worth?
+
+`make baselines` answers a question the pipeline could not previously answer
+about itself: of the 0.965 mean match goodness, how much comes from the
+embedding and how much would any constrained matcher have produced anyway?
+
+Three arms, identical policy flags, all at `--surplus-per-paper 0`:
+
+| Arm | Ranks on | Area gate |
+|---|---|---|
+| **A** production | SPECTER2 cosine | on |
+| **B** area-blind | reproducible random draw | **off** (`--no-area-gate`) |
+| **C** area-aware | reproducible random draw | on |
+
+Under `--score-mode random` the matcher ranks on a per-(reviewer, paper) draw
+instead of the cosine, while **every** COI layer, the senior anchor, the junior
+and out-of-area caps, the same-country cap and every reviewer load cap still
+bind. Reported match goodness stays the **true SPECTER2 similarity** of whatever
+slate that blind matcher produced, so the drop is readable directly.
+
+Seed 1, 1,157 submitted papers, all three arms filling completely at 5,785
+pairs:
+
+| | own pool floor | paper mean | worst-50 tail | vs A |
+|---|---|---|---|---|
+| **A** production | 0.948 | **0.9666** | 0.9368 | — |
+| **C** random, area-aware | 0.948 | 0.9485 | 0.9255 | −0.0182 |
+| **B** random, area-blind | 0.938 | 0.9383 | 0.9031 | −0.0284 |
+
+**Read the drop against the range, not in absolute terms.** SPECTER2 cosines on
+this corpus live in a band about 0.035 wide — the ungated pool averages 0.938
+and the best-5-per-paper ceiling is 0.973 — so a "small" 0.028 is most of what
+there was to win. Splitting that range:
+
+- the **declared-area gate** is worth 0.0102, about **29%** of the range;
+- the **SPECTER2 ranking on top of the gate** is worth 0.0182, about **52%**;
+- the remaining **18%** is headroom the load and composition caps cost, and is
+  not recoverable — the ceiling is a per-paper maximum that would put the same
+  popular reviewers on dozens of papers each.
+
+So the embedding does roughly **1.8× the work of the area gate**, and together
+they close 82% of the achievable range. Only 0.3% of papers came out better
+matched under arm B than under arm A, and 4.5% under arm C.
+
+Two numbers double as correctness checks. Each random arm lands **exactly on its
+own pool floor** (B 0.9383 vs 0.938, C 0.9485 vs 0.948), which is what a uniform
+draw from a pool must produce. And every arm still reports 0 F1 blocking pairs:
+stability is a property of the preference *order*, not of what the numbers mean.
+
+Both random arms filled every paper, which is itself a finding — the constraint
+system has enough slack that affinity is not what makes the assignment feasible.
+When an arm does under-fill, `scripts/compare_baselines.py` restricts every mean
+to the papers scored in *every* arm and prints a pair-weighted mean beside the
+mean-of-paper-means, because a partly filled slate has fewer marginal picks and
+so a **higher** mean — under-filling flatters a random arm and understates the
+drop.
+
+**What this does not show.** Not that arm A produces better *reviews*: the
+measured quantity is SPECTER2 cosine, which is the matcher's own objective, so
+arm A is being scored on the metric it optimizes. Not that B and C are "random
+assignments": they are stable matchings under random *preferences* subject to
+every constraint, which is exactly why arm C exists. And three sections of a
+random arm's transcript are not cross-arm comparable — the relaxation report
+(under `--no-area-gate` there is no gate left to release, so arm B shows 0
+relaxations against arm A's 48 and arm C's 65), the same-country "traded a
+better-matched reviewer" count, and any full-slate goodness figure. The run
+prints a banner saying so.
+
+The draw is a pure function of `(seed, email, pid)` via blake2b — not a stream
+RNG, because each paper is scored twice (gated and area-released) and both must
+agree, and not `hash()`, which Python salts per process. A rerun is identical.
+
+```bash
+make baselines                                   # 3 runs, ~2 min
+make baselines BASELINE_SEEDS="1 2 3 4 5"        # adds the seed-to-seed spread
+python -m scripts.assign_reviewers --score-mode random --surplus-per-paper 0
+python -m scripts.compare_baselines outputs/evaluations/pairs-arm*.csv
+```
+
+Output lands in `outputs/evaluations/`, deliberately not beside the real
+assignment. `--hotcrp-csv` is refused under a random mode: a baseline slate must
+never become an upload. `--pairs-csv` is the machine-readable artifact instead,
+and unlike `--hotcrp-csv` it is written even when the slate is short — a partial
+measurement is still a measurement.
+
 ### `scripts/audit_coauthor_conflicts.py` — conflicts nobody declared
 
 Writes `outputs/reports/coauthor_conflicts.csv`, one row per reviewer-paper

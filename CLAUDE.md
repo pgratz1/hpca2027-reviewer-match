@@ -150,6 +150,13 @@ contains spaces and parentheses — always quote it in shell commands).
   `assign_area_chairs.py`, never restated: a clearing file that spells a tag
   differently reports success and leaves it in place. `~~area-chairs`,
   conflicts and preferences are never touched.
+- `make baselines` runs the three randomized-baseline arms (§4c) into
+  `outputs/evaluations/` and prints `scripts/compare_baselines.py`'s table.
+  ~2 min for the default `BASELINE_SEEDS=1`; `make baselines BASELINE_SEEDS="1 2
+  3 4 5"` adds the seed-to-seed spread. A random arm exiting 1 on a short slate
+  is a **finding, not a build failure** — the recipe notes it and continues.
+  Never point it at `outputs/assignments/`, and never give an arm
+  `--hotcrp-csv`; `assign_reviewers.py` refuses that anyway.
 - `make complete-papers` and `make area-chairs-complete` retain the former
   completeness filter in separate `*-complete.txt` artifacts.
 - Library modules (imported, never run): `src/reviewer_match/reviewers.py`, `src/reviewer_match/dblp.py`,
@@ -166,7 +173,8 @@ contains spaces and parentheses — always quote it in shell commands).
   `scripts/estimate_reserve_need.py`, `scripts/build_reserve_reviewer_info.py`,
   `scripts/resolve_reserve_pids.py`, `scripts/build_dblp_snapshot_cache.py`,
   `scripts/build_affiliation_countries.py`, `scripts/generate_clear_uploads.py`,
-  `scripts/resolve_trc_members.py`, `scripts/main.py`.
+  `scripts/resolve_trc_members.py`, `scripts/compare_baselines.py`,
+  `scripts/main.py`.
 
 ## Architecture (filter-then-rank, then constrained assignment)
 
@@ -337,6 +345,28 @@ contains spaces and parentheses — always quote it in shell commands).
    capped papers); that is the documented consequence of a country class
    crossing the seniority classes, and `country_over == 0` is the invariant that
    replaces it — do not read it as a regression.
+4c. **Randomized baselines** (`--score-mode random`, `--score-seed N`, `make
+   baselines`): the matcher ranks on a per-(reviewer, paper) draw instead of the
+   cosine while every COI layer, the anchor and every cap still bind, and the
+   reports keep printing the **true SPECTER2 affinity** of the slate that
+   produces. Three arms at `--surplus-per-paper 0`: A production, C random +
+   area gate, B random + `--no-area-gate`. Seed 1, all three filling completely
+   at 5,785 pairs — A 0.9666, C 0.9485, B 0.9383. **Read the drop against the
+   range**: cosines here span only ~0.035 (ungated pool 0.938 → best-5 ceiling
+   0.973), so the area gate is worth 29% of the range, SPECTER2 on top of it
+   52%, and the caps cost the other 18%. Each random arm landing exactly on its
+   own pool floor is the check that the draw is real. Implementation: `rank` and
+   `affinity` are **the same dict object** under the default mode
+   (`PairScores`), which is what makes the production path provably unchanged —
+   `assertIs`, never `assertEqual`. Every *decision* reads `score_lookup`
+   (including `distribute_surplus`, so a baseline is blind end to end); every
+   printed number reads `affinity_lookup`. The trap: `eligible_by_pid` /
+   `released_by_pid` become the preference lists and **must be re-scored off
+   `rank`** — the deferral deques assume their order matches the score DA bumps
+   on, and a mismatch pops the wrong candidate with no self-check to catch it.
+   The draw is a pure function of `(seed, email, pid)`, never a stream (each
+   paper is scored twice, gated and released, and both must agree) and never
+   `hash()` (salted per process). `--hotcrp-csv` is refused under a random mode.
 4a. **Surplus distribution** (`--surplus-per-paper N`, **on by default at 1**;
    `0` is the off switch): `--reviewers-per-paper` is what every paper is
    *guaranteed*, and whatever capacity the six phases leave unspent then goes,
