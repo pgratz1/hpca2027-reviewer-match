@@ -12,6 +12,7 @@
 #   make collaborator-coi report conflicts declared collaborators/affiliation imply
 #   make affiliation-countries  resolve affiliation countries
 #   make reserves         enrich, fingerprint, and classify reserves
+#   make trc              enrich, fingerprint, and assign TRC (PhD student) reviews
 #   make clear-uploads    HotCRP CSVs that wipe R1 reviews and the track tags
 #   make baselines        randomized arms: how much of the match is SPECTER2?
 #   make clean            remove assignment outputs only
@@ -48,6 +49,25 @@ REGION_FLAG = $(if $(filter off,$(SAME_COUNTRY_CAP)),--no-same-country-cap,\
 MAX_JUNIORS ?= 2
 JUNIOR_FLAG = --max-juniors $(MAX_JUNIORS)
 
+# #1152 "Test TRC" is a standing administrative test submission (used for
+# exercising the track-tag setup in HotCRP), not a real paper, so it should
+# never get real reviewers or an area chair -- an operational default the
+# same way PAPER_POLICY is; the scripts' own default stays empty. Threaded
+# through every assign_reviewers/assign_area_chairs invocation so it never
+# reappears in a report or a baseline measurement. EXCLUDE_PIDS= (empty)
+# turns it off.
+EXCLUDE_PIDS ?= 1152
+EXCLUDE_FLAG = $(if $(EXCLUDE_PIDS),--exclude-pids $(EXCLUDE_PIDS),)
+
+# make trc's own operational defaults: at most one TRC reviewer per paper
+# (maximizes how many distinct papers get TRC-track coverage, over letting
+# students converge on the same few standout papers), and jsanmiguel@wisc.edu
+# is the sitting TRC chair -- no paper he is conflicted with ever enters the
+# TRC track. TRC_PAPER_CAP=0 removes the cap.
+TRC_CHAIR_EMAIL ?= jsanmiguel@wisc.edu
+TRC_ROUND ?= TRC
+TRC_PAPER_CAP ?= 1
+
 # Optional local secrets. Variables are exported for enrichment commands.
 -include .env
 export S2_API_KEY
@@ -65,6 +85,8 @@ CSV = $(INPUT_DIR)/HPCA'27 PC Member Acceptance Form (Responses) - Form Response
 CSV_DEP = data/inputs/HPCA'27\ PC\ Member\ Acceptance\ Form\ (Responses)\ -\ Form\ Responses\ 1.csv
 AREA_CHAIR_CSV = $(INPUT_DIR)/Area Chair Acceptance Form (Responses) - Form Responses 1.csv
 AREA_CHAIR_CSV_DEP = data/inputs/Area\ Chair\ Acceptance\ Form\ (Responses)\ -\ Form\ Responses\ 1.csv
+TRC_CSV = $(INPUT_DIR)/HPCA'27 TRC Member Acceptance Form (Responses) - Form Responses 1.csv
+TRC_CSV_DEP = data/inputs/HPCA'27\ TRC\ Member\ Acceptance\ Form\ (Responses)\ -\ Form\ Responses\ 1.csv
 DATA = $(INPUT_DIR)/hpca2027-data.json
 PCINFO = $(INPUT_DIR)/hpca2027-pcinfo.csv
 PCDB = $(INPUT_DIR)/PCDB_with_emails.csv
@@ -73,6 +95,7 @@ DBLP_SNAPSHOT = $(INPUT_DIR)/dblp-2026-07-01.xml
 
 OVERRIDES = $(CURATED_DIR)/dblp_overrides.csv
 RESERVE_OVERRIDES = $(CURATED_DIR)/reserve_dblp_overrides.csv
+TRC_OVERRIDES = $(CURATED_DIR)/trc_dblp_overrides.csv
 COUNTRIES = $(CURATED_DIR)/affiliation_countries.csv
 # The hand-maintained country layer feeds the same-country cap, so editing it has
 # to restage the assignment -- without this, filling in a blank `country` cell
@@ -89,6 +112,7 @@ FINGERPRINTS = $(CACHE_DIR)/fingerprints.json
 PAPER_FINGERPRINTS = $(CACHE_DIR)/paper_fingerprints.json
 AREA_CHAIR_FINGERPRINTS = $(CACHE_DIR)/area_chair_fingerprints.json
 RESERVE_FINGERPRINTS = $(CACHE_DIR)/reserve_fingerprints.json
+TRC_FINGERPRINTS = $(CACHE_DIR)/trc_fingerprints.json
 PUBLICATIONS = $(CACHE_DIR)/reviewer_publications.json
 ABSTRACTS = $(CACHE_DIR)/publication_abstracts.json
 
@@ -97,6 +121,10 @@ RESERVE_SENIORITY = $(REPORT_DIR)/reserve_seniority.csv
 RESERVE_INFO = $(REPORT_DIR)/reserve_reviewer_info.csv
 ASSIGNMENT = $(ASSIGNMENT_DIR)/assignment.txt
 ASSIGNMENT_CSV = $(ASSIGNMENT_DIR)/assignment.csv
+TRC_ASSIGNMENT = $(ASSIGNMENT_DIR)/trc_assignment.txt
+TRC_REVIEW_CSV = $(ASSIGNMENT_DIR)/trc_review_upload.csv
+TRC_TAG_CSV = $(ASSIGNMENT_DIR)/trc_track_tags.csv
+TRC_MISSING_TAG_CSV = $(ASSIGNMENT_DIR)/trc_missing_tags.csv
 COMPLETE_ASSIGNMENT = $(ASSIGNMENT_DIR)/assignment-complete.txt
 COMPLETE_ASSIGNMENT_CSV = $(ASSIGNMENT_DIR)/assignment-complete.csv
 AREA_CHAIR_ASSIGNMENT = $(ASSIGNMENT_DIR)/area_chair_assignment.txt
@@ -146,7 +174,7 @@ ASSIGN_DEPS = scripts/assign_reviewers.py src/reviewer_match/paper_matching.py \
 	$(RESERVE_INFO) $(RESERVE_FINGERPRINTS) $(RESERVE_SENIORITY)
 
 .DELETE_ON_ERROR:
-.PHONY: all enrich area-chairs reserve-need reserve-info reserve-pids reserves \
+.PHONY: all enrich area-chairs reserve-need reserve-info reserve-pids reserves trc \
 	dblp-snapshot coauthor-coi collaborator-coi affiliation-countries pc-roster duplicates \
 	complete-papers area-chairs-complete clear-uploads baselines clean clean-fingerprints
 
@@ -164,7 +192,7 @@ area-chairs:
 	$(RUN) scripts.build_fingerprints --role area-chair --csv "$(AREA_CHAIR_CSV)" \
 		--fingerprint-cache $(AREA_CHAIR_FINGERPRINTS) --years $(AREA_CHAIR_YEARS)
 	$(RUN) scripts.assign_area_chairs --paper-policy $(PAPER_POLICY) \
-		--csv "$(AREA_CHAIR_CSV)" $(COAUTHOR_COI) $(COLLABORATOR_COI) \
+		--csv "$(AREA_CHAIR_CSV)" $(COAUTHOR_COI) $(COLLABORATOR_COI) $(EXCLUDE_FLAG) \
 		--account-tag-csv $(AREA_CHAIR_ACCOUNT_TAGS) --paper-tag-csv $(AREA_CHAIR_PAPER_TAGS) \
 		> $(AREA_CHAIR_ASSIGNMENT)
 
@@ -214,6 +242,26 @@ reserves:
 	$(RUN) scripts.classify_reviewers --role reserve --csv $(RESERVE_INFO) --data $(DATA) \
 		$(PC_CHECK) --out $(RESERVE_SENIORITY)
 
+# Independent of `make`/`make area-chairs` (no shared prerequisites beyond
+# the paper export), the same way `make reserves` stands alone. No seniority
+# classification step -- TRC members are matched by nearest-neighbor
+# similarity, not run through the PC's junior/senior deferred-acceptance
+# constraints, so scripts.classify_reviewers has nothing to contribute here.
+trc:
+	@test -f "$(TRC_CSV)" || { echo "ERROR: $(TRC_CSV) not found" >&2; exit 1; }
+	@test -f $(ASSIGNMENT_CSV) || { echo "ERROR: $(ASSIGNMENT_CSV) not found; run make first (a TRC member must never be assigned a paper their advisor is already reviewing, which this checks against the main slate)" >&2; exit 1; }
+	$(RUN) scripts.enrich_publications --role trc --csv "$(TRC_CSV)"
+	$(RUN) scripts.build_fingerprints --role trc --csv "$(TRC_CSV)" \
+		--fingerprint-cache $(TRC_FINGERPRINTS)
+	$(RUN) scripts.assign_trc_reviews --trc-csv "$(TRC_CSV)" --pc-csv "$(CSV)" \
+		--data $(DATA) --paper-policy $(PAPER_POLICY) $(EXCLUDE_FLAG) \
+		--fingerprint-cache $(TRC_FINGERPRINTS) --paper-cap $(TRC_PAPER_CAP) \
+		--chair-email $(TRC_CHAIR_EMAIL) --round $(TRC_ROUND) \
+		--assignment-csv $(ASSIGNMENT_CSV) \
+		--review-csv $(TRC_REVIEW_CSV) --tag-csv $(TRC_TAG_CSV) \
+		--missing-tag-csv $(TRC_MISSING_TAG_CSV) \
+		> $(TRC_ASSIGNMENT)
+
 affiliation-countries: scripts/build_affiliation_countries.py src/reviewer_match/affiliation_country.py
 	$(RUN) scripts.build_affiliation_countries --data $(DATA)
 
@@ -226,7 +274,7 @@ area-chairs-complete: $(COMPLETE_ASSIGNMENT)
 		--fingerprint-cache $(AREA_CHAIR_FINGERPRINTS) --years $(AREA_CHAIR_YEARS)
 	$(RUN) scripts.assign_area_chairs --paper-policy complete \
 		--reviewer-assignment $(COMPLETE_ASSIGNMENT) --csv "$(AREA_CHAIR_CSV)" \
-		$(COAUTHOR_COI) $(COLLABORATOR_COI) \
+		$(COAUTHOR_COI) $(COLLABORATOR_COI) $(EXCLUDE_FLAG) \
 		--account-tag-csv $(AREA_CHAIR_ACCOUNT_TAGS_COMPLETE) --paper-tag-csv $(AREA_CHAIR_PAPER_TAGS_COMPLETE) \
 		> $(AREA_CHAIR_COMPLETE)
 
@@ -283,14 +331,14 @@ $(ASSIGNMENT) $(ASSIGNMENT_CSV) &: $(ASSIGN_DEPS)
 	$(RUN) scripts.assign_reviewers --paper-policy $(PAPER_POLICY) --csv "$(CSV)" \
 		--area-chair-csv "$(AREA_CHAIR_CSV)" \
 		--hotcrp-csv $(ASSIGNMENT_CSV) \
-		$(RESERVE_FLAG) $(PC_CHECK) $(AREA_CHAIR_CHECK) $(REGION_FLAG) $(JUNIOR_FLAG) $(COAUTHOR_COI) $(COLLABORATOR_COI) \
+		$(RESERVE_FLAG) $(PC_CHECK) $(AREA_CHAIR_CHECK) $(REGION_FLAG) $(JUNIOR_FLAG) $(COAUTHOR_COI) $(COLLABORATOR_COI) $(EXCLUDE_FLAG) \
 		> $(ASSIGNMENT)
 
 $(COMPLETE_ASSIGNMENT) $(COMPLETE_ASSIGNMENT_CSV) &: $(ASSIGN_DEPS)
 	$(RUN) scripts.assign_reviewers --paper-policy complete --csv "$(CSV)" \
 		--area-chair-csv "$(AREA_CHAIR_CSV)" \
 		--hotcrp-csv $(COMPLETE_ASSIGNMENT_CSV) \
-		$(PC_CHECK) $(AREA_CHAIR_CHECK) $(REGION_FLAG) $(JUNIOR_FLAG) $(COAUTHOR_COI) $(COLLABORATOR_COI) \
+		$(PC_CHECK) $(AREA_CHAIR_CHECK) $(REGION_FLAG) $(JUNIOR_FLAG) $(COAUTHOR_COI) $(COLLABORATOR_COI) $(EXCLUDE_FLAG) \
 		> $(COMPLETE_ASSIGNMENT)
 
 # Randomized baselines: how much of the match quality is the SPECTER2 signal?
@@ -311,7 +359,7 @@ BASELINE_SEEDS ?= 1
 BASELINE_FLAGS = --paper-policy $(PAPER_POLICY) --csv "$(CSV)" \
 	--area-chair-csv "$(AREA_CHAIR_CSV)" --surplus-per-paper 0 \
 	$(RESERVE_FLAG) $(PC_CHECK) $(AREA_CHAIR_CHECK) $(REGION_FLAG) $(JUNIOR_FLAG) \
-	$(COAUTHOR_COI) $(COLLABORATOR_COI)
+	$(COAUTHOR_COI) $(COLLABORATOR_COI) $(EXCLUDE_FLAG)
 
 # A random arm routinely leaves a paper short, so assign_reviewers exits 1 under
 # --paper-policy submitted. That is a finding, not a build failure -- the report
@@ -340,7 +388,8 @@ clean:
 	rm -f $(ASSIGNMENT) $(ASSIGNMENT_CSV) $(AREA_CHAIR_ASSIGNMENT) \
 		$(COMPLETE_ASSIGNMENT) $(COMPLETE_ASSIGNMENT_CSV) $(AREA_CHAIR_COMPLETE) \
 		$(AREA_CHAIR_ACCOUNT_TAGS) $(AREA_CHAIR_PAPER_TAGS) \
-		$(AREA_CHAIR_ACCOUNT_TAGS_COMPLETE) $(AREA_CHAIR_PAPER_TAGS_COMPLETE)
+		$(AREA_CHAIR_ACCOUNT_TAGS_COMPLETE) $(AREA_CHAIR_PAPER_TAGS_COMPLETE) \
+		$(TRC_ASSIGNMENT) $(TRC_REVIEW_CSV) $(TRC_TAG_CSV) $(TRC_MISSING_TAG_CSV)
 
 clean-fingerprints:
-	rm -f $(FINGERPRINTS) $(PAPER_FINGERPRINTS) $(AREA_CHAIR_FINGERPRINTS)
+	rm -f $(FINGERPRINTS) $(PAPER_FINGERPRINTS) $(AREA_CHAIR_FINGERPRINTS) $(TRC_FINGERPRINTS)

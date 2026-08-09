@@ -38,7 +38,7 @@ import json
 
 from . import pc_membership
 from .dblp import parse_pid
-from .reviewers import Reviewer
+from .reviewers import DEFAULT_CAP_OVERRIDES, Reviewer, load_cap_overrides
 
 DEFAULT_INFO = report_path("reserve_reviewer_info.csv")
 DEFAULT_DATA = input_path("hpca2027-data.json")
@@ -113,6 +113,7 @@ def load_reserve_reviewers(
     *,
     max_areas: int = DEFAULT_MAX_AREAS,
     pcinfo_path: str | None = pc_membership.DEFAULT_PCINFO,
+    cap_overrides_path: str = DEFAULT_CAP_OVERRIDES,
 ) -> list[Reviewer]:
     """Load the reserve roster, deriving each one's areas from their papers.
 
@@ -133,6 +134,11 @@ def load_reserve_reviewers(
     than `reserve`. Without the export there are no tags, so nobody is promoted
     and everyone here stays a reserve — the same degradation the area-chair tag
     has, and the reason `audit_pc_roster.py`'s un-gated view is unaffected.
+
+    A reserve reviewer never fills in an acceptance form, so
+    `reviewer_cap_overrides.csv` (see `reviewers.load_cap_overrides`) is the
+    only way to reduce one's load below the reserve cap -- there is no form
+    column to fall back to, unlike a PC member.
     """
     with open(data_path, encoding="utf-8") as f:
         papers = json.load(f)
@@ -142,6 +148,7 @@ def load_reserve_reviewers(
     with open(info_path, newline="", encoding="utf-8-sig") as f:
         rows = list(csv.DictReader(f))
     index = pc_membership.load_pc_accounts(pcinfo_path) if pcinfo_path else None
+    cap_overrides = load_cap_overrides(cap_overrides_path)
 
     reserves = []
     dropped: list[str] = []
@@ -190,7 +197,7 @@ def load_reserve_reviewers(
                 tertiary=areas[2],
                 keywords="",
                 tier=tier,
-                override_cap=None,
+                override_cap=cap_overrides.get(email),
                 # The roster is itself the hand-maintained identity layer
                 # (reserve_dblp_overrides.csv feeds it), so every PID here is a
                 # decision someone made rather than a form cell.

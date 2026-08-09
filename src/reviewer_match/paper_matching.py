@@ -85,8 +85,28 @@ def completeness_gaps(paper: dict) -> list[str]:
     return gaps
 
 
-def selection_gaps(paper: dict, paper_policy: str) -> list[str]:
-    """Reasons `paper` is excluded under the requested selection policy."""
+def parse_exclude_pids(value: str) -> frozenset[int]:
+    """Parse a `--exclude-pids` value: comma-separated paper IDs, e.g. "1152,1200".
+
+    An empty string (the default) excludes nothing.
+    """
+    value = value.strip()
+    if not value:
+        return frozenset()
+    return frozenset(int(pid) for pid in value.split(","))
+
+
+def selection_gaps(
+    paper: dict, paper_policy: str, exclude_pids: frozenset[int] = frozenset()
+) -> list[str]:
+    """Reasons `paper` is excluded under the requested selection policy.
+
+    `exclude_pids` is checked before the policy itself, so a manually
+    excluded paper (a known test/administrative submission) is skipped under
+    every policy, not just the one it happens to fail on its own content.
+    """
+    if paper.get("pid") in exclude_pids:
+        return ["manually excluded"]
     if paper_policy == "registered":
         return registration_gaps(paper)
     if paper_policy == "submitted":
@@ -100,7 +120,8 @@ def selection_gaps(paper: dict, paper_policy: str) -> list[str]:
 
 
 def load_papers(
-    path: str, *, paper_policy: str = "registered", with_skipped: bool = False
+    path: str, *, paper_policy: str = "registered",
+    exclude_pids: frozenset[int] = frozenset(), with_skipped: bool = False
 ):
     """Select assignable papers from a HotCRP export.
 
@@ -109,12 +130,14 @@ def load_papers(
     The default ``registered`` policy takes every non-withdrawn paper whose
     content is real (see `registration_gaps`); ``submitted`` trusts HotCRP
     status alone, and ``complete`` preserves the older completeness checks.
+    `exclude_pids` (see `parse_exclude_pids`) removes specific papers on top
+    of whichever policy is in effect.
     """
     with open(path, encoding="utf-8") as f:
         papers = json.load(f)
     selected, skipped = [], []
     for p in papers:
-        gaps = selection_gaps(p, paper_policy)
+        gaps = selection_gaps(p, paper_policy, exclude_pids)
         if gaps:
             skipped.append({"pid": p["pid"], "title": p.get("title") or "", "missing": gaps})
         else:

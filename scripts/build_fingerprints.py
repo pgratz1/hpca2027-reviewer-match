@@ -129,7 +129,7 @@ def main() -> int:
         help=f"HotCRP paper export, for --role reserve area derivation (default: {DEFAULT_DATA})",
     )
     parser.add_argument(
-        "--role", choices=("reviewer", "area-chair", "reserve"), default="reviewer",
+        "--role", choices=("reviewer", "area-chair", "reserve", "trc"), default="reviewer",
         help="acceptance-form schema to load (default: reviewer)",
     )
     parser.add_argument("--cache", default=DEFAULT_CACHE, help="path to the writable DBLP title cache")

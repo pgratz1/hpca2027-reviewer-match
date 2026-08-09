@@ -52,14 +52,17 @@ DEFAULT_ACCOUNT_TAG_OUT = assignment_path("clear_account_tags.csv")
 # The round assign_reviewers.py installs into, and so the one to clear.
 DEFAULT_ROUND = "R1"
 
-# A tag naming one of the per-chair tracks, in either namespace and in any of
-# the spellings a hand-made tag takes: `track_7` is what this repo writes, but
-# `track1` and `~~track1` are both live on the current export, left behind by
-# setting the mechanism up by hand. A wipe that cleared only the canonical
-# range would leave those exact tags behind, which is the whole failure it
-# exists to prevent. `TRC-track` deliberately does not match -- it is a
-# separate track, not a chair's, and is nobody's to clear here.
-TRACK_TAG_RE = re.compile(r"^track[_-]?\d+$", re.IGNORECASE)
+# A tag naming one of the per-chair tracks, in either namespace: the account
+# grant is `~~track_7`, the paper tag is `~~paper_track_7` (both written by
+# this repo), plus any hand-made variant of either spelling -- `track1` and
+# `~~track1` were both live on a past export, left behind by setting the
+# mechanism up by hand. A wipe that cleared only the canonical range would
+# leave a hand-made or out-of-range tag behind, which is the whole failure
+# this regex exists to prevent -- it has to keep matching outside the current
+# canonical range, not just the exact strings `paper_track_tag`/
+# `account_track_tag` produce today. `TRC-track` deliberately does not match
+# -- it is a separate track, not a chair's, and is nobody's to clear here.
+TRACK_TAG_RE = re.compile(r"^(?:paper_)?track[_-]?\d+$", re.IGNORECASE)
 
 
 def is_track_tag(tag: str) -> bool:
@@ -229,7 +232,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--track-clear-ceiling", type=int, default=DEFAULT_TRACK_CLEAR_CEILING,
-        help="clear track_0..track_(N-1) and ~~track_0..~~track_(N-1) (default: %(default)s)",
+        help="clear ~~paper_track_0..~~paper_track_(N-1) and ~~track_0..~~track_(N-1) "
+             "(default: %(default)s)",
     )
     parser.add_argument("--assignment-out", default=DEFAULT_ASSIGNMENT_OUT)
     parser.add_argument("--paper-tag-out", default=DEFAULT_PAPER_TAG_OUT)
@@ -250,7 +254,7 @@ def main() -> int:
     scope = "every round" if not review_round else f"round {review_round}"
     print(f"{args.assignment_out}: Assignments -> Bulk update; clears all reviews in {scope}")
     print(f"{args.paper_tag_out}: Assignments -> Bulk update; clears "
-          f"track_0..track_{args.track_clear_ceiling - 1} from all papers"
+          f"~~paper_track_0..~~paper_track_{args.track_clear_ceiling - 1} from all papers"
           + (f", plus {', '.join(strays)}" if strays else ""))
     print(f"{args.account_tag_out}: Settings -> Accounts; removes "
           f"~~track_0..~~track_{args.track_clear_ceiling - 1} from {len(rows)} account(s) "

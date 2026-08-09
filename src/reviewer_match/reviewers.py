@@ -29,6 +29,14 @@ DEFAULT_OVERRIDES = curated_path("dblp_overrides.csv")
 # declared primary/secondary/tertiary there.
 DEFAULT_AREA_OVERRIDES = curated_path("pc_area_overrides.csv")
 
+# Hand-maintained per-reviewer paper-cap overrides, keyed by email so they
+# survive re-exports of the acceptance CSV -- the same reason dblp_overrides
+# exists. Covers both PC members and reserve reviewers (reserves have no
+# acceptance form to declare an override on at all). Wins over the PC form's
+# own "Override paper assignment number" column, the same relationship
+# dblp_overrides.csv has to the form's DBLP column.
+DEFAULT_CAP_OVERRIDES = curated_path("reviewer_cap_overrides.csv")
+
 # HotCRP's reserve-reviewer bulk upload -- read here only to recognise a raw
 # recruit whose reserve-side identity never resolved (build_reserve_reviewer_
 # info.py held them back in reserve_reviewer_unresolved.csv). Without this,
@@ -81,14 +89,19 @@ def field(row: dict[str, str], needle: str) -> str:
     raise KeyError(f"no column header contains {needle!r}")
 
 
-def _parse_override_cap(email: str, override_raw: str) -> int | None:
-    """Parse the free-text 'Override paper assignment number' cell.
+def _parse_override_cap(
+    email: str, override_raw: str, source: str = "'Override paper assignment number'"
+) -> int | None:
+    """Parse a free-text paper-cap override cell.
 
-    Blank means no override. A non-blank, non-integer value (the column has
-    no numeric validation on the form side) fails loudly with the offending
-    reviewer's email rather than a bare ValueError, since load_reviewers is
-    called by every script in the pipeline — one bad cell shouldn't take all
-    of them down with an unhelpful traceback.
+    Blank means no override. A non-blank, non-integer value (neither the PC
+    form nor reviewer_cap_overrides.csv has numeric validation) fails loudly
+    with the offending reviewer's email rather than a bare ValueError, since
+    load_reviewers is called by every script in the pipeline — one bad cell
+    shouldn't take all of them down with an unhelpful traceback. `source`
+    names the cell in the error message, since this parses both the form's
+    "Override paper assignment number" column and reviewer_cap_overrides.csv's
+    `cap` column.
     """
     if not override_raw:
         return None
@@ -96,11 +109,11 @@ def _parse_override_cap(email: str, override_raw: str) -> int | None:
         value = int(override_raw)
     except ValueError:
         raise ValueError(
-            f"{email}: 'Override paper assignment number' must be a whole number, got {override_raw!r}"
+            f"{email}: {source} must be a whole number, got {override_raw!r}"
         ) from None
     if value < 0:
         raise ValueError(
-            f"{email}: 'Override paper assignment number' must be non-negative, got {value}"
+            f"{email}: {source} must be non-negative, got {value}"
         )
     return value
 
@@ -168,6 +181,37 @@ def load_area_overrides(path: str = DEFAULT_AREA_OVERRIDES) -> dict[str, tuple[s
     return overrides
 
 
+def load_cap_overrides(path: str = DEFAULT_CAP_OVERRIDES) -> dict[str, int]:
+    """Load the hand-maintained paper-cap override file: email -> cap.
+
+    Format: a CSV with columns `email`, `cap`, `note` (note is free text and
+    ignored here). A row with a blank email or a blank `cap` is skipped, the
+    same "blank means no override yet" rule every other override file here
+    uses. A non-blank `cap` that isn't a non-negative whole number fails
+    loudly with the offending email, the same validation
+    `_parse_override_cap` applies to the form's own override column, since a
+    silent skip would make the override mysteriously not take effect.
+
+    Covers both PC members and reserve reviewers -- reserves never fill in an
+    acceptance form, so this is the only place their load can be reduced.
+    Returns {} if the file doesn't exist.
+    """
+    try:
+        f = open(path, newline="", encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    overrides: dict[str, int] = {}
+    with f:
+        for row in csv.DictReader(f):
+            email = (row.get("email") or "").strip().lower()
+            raw = (row.get("cap") or "").strip()
+            if not email or not raw:
+                continue
+            cap = _parse_override_cap(email, raw, source=f"{path}'s `cap` column")
+            overrides[email] = cap
+    return overrides
+
+
 def _reserve_upload_emails(path: str) -> set[str]:
     """Emails HotCRP's reserve-reviewer upload named, resolved or not.
 
@@ -218,6 +262,7 @@ def load_reviewers(
     pcinfo_path: str | None = pc_membership.DEFAULT_PCINFO,
     area_overrides_path: str = DEFAULT_AREA_OVERRIDES,
     reserve_upload_path: str = DEFAULT_RESERVE_UPLOAD,
+    cap_overrides_path: str = DEFAULT_CAP_OVERRIDES,
 ) -> list[Reviewer]:
     """Load accepted PC members from the acceptance CSV.
 
@@ -241,6 +286,12 @@ def load_reviewers(
     whose email matches no accepted reviewer are reported to stderr so a
     typo'd email doesn't silently do nothing.
 
+    Likewise, a `reviewer_cap_overrides.csv` row wins over the form's own
+    "Override paper assignment number" cell -- the form column stays live for
+    a PC member to self-declare through, but the curated file is the durable,
+    re-export-proof layer (and the only one reserve reviewers can use at all,
+    since they have no form). See `load_cap_overrides`.
+
     Finally, `_pc_members_without_a_form_row` adds anyone the HotCRP export
     marks `pc` that the form never explains at all — someone added to the
     committee straight in HotCRP after the acceptance form closed. See its
@@ -250,6 +301,7 @@ def load_reviewers(
         rows = list(csv.DictReader(f))
     overrides = load_dblp_overrides(overrides_path)
     area_overrides = load_area_overrides(area_overrides_path)
+    cap_overrides = load_cap_overrides(cap_overrides_path)
     index = pc_membership.load_pc_accounts(pcinfo_path) if pcinfo_path else None
 
     reviewers: list[Reviewer] = []
@@ -274,6 +326,7 @@ def load_reviewers(
                 continue
             hotcrp_email = pc_membership.hotcrp_email_for(email, acct, how)
         dblp_url = field(row, "DBLP")
+        form_cap = _parse_override_cap(email, field(row, "Override paper assignment number"))
         reviewers.append(
             Reviewer(
                 email=email,
@@ -288,7 +341,7 @@ def load_reviewers(
                 tertiary=field(row, "tertiary area"),
                 keywords=field(row, "keywords"),
                 tier=tier,
-                override_cap=_parse_override_cap(email, field(row, "Override paper assignment number")),
+                override_cap=cap_overrides.get(email, form_cap),
                 pid_from_override=email in overrides,
             )
         )
@@ -316,7 +369,7 @@ def load_reviewers(
         reserve_upload_emails = _reserve_upload_emails(reserve_upload_path)
         reviewers.extend(
             _pc_members_without_a_form_row(
-                index, reviewers, overrides, area_overrides, reserve_upload_emails
+                index, reviewers, overrides, area_overrides, reserve_upload_emails, cap_overrides
             )
         )
 
@@ -347,6 +400,7 @@ def _pc_members_without_a_form_row(
     overrides: dict[str, str],
     area_overrides: dict[str, tuple[str, str, str]],
     reserve_upload_emails: set[str],
+    cap_overrides: dict[str, int],
 ) -> list[Reviewer]:
     """PC members HotCRP knows about that the acceptance form does not.
 
@@ -369,6 +423,10 @@ def _pc_members_without_a_form_row(
         does not exclude the account — it just cannot pass the area gate for
         any paper until one exists, which is reported so it doesn't go
         unnoticed.
+      * cap override — a `reviewer_cap_overrides.csv` row for the email, the
+        same file and precedence a form row's own cell would carry (there is
+        no form cell to compare against here, so the curated file is simply
+        the only source).
       * tier — `pc-full`/`pc-light` is the *only* place this can come from
         when there is no form. A `pc-full`/`pc-light` tag is also the
         candidacy signal, not just the tier value: this loader only ever sees
@@ -442,7 +500,7 @@ def _pc_members_without_a_form_row(
                 tertiary=areas[2],
                 keywords="",
                 tier=tier,
-                override_cap=None,
+                override_cap=cap_overrides.get(email),
                 pid_from_override=email in overrides,
             )
         )

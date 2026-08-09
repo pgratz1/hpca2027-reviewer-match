@@ -80,6 +80,15 @@ def load_area_chairs(
     needs the export, so it is skipped along with the membership check when
     `pcinfo_path` is None -- which keeps `audit_pc_roster.py`'s un-gated view of
     the form exactly as it was.
+
+    A PC chair is never an area chair, even if they accepted the area-chair
+    form -- they already make the final call on the same papers, so chairing
+    one is a conflict, not a second job. `pc_membership.structural_role`
+    already recognises a PC chair from HotCRP's own `roles`/`tags` columns
+    (the same check that keeps a PC chair from being auto-added as a plain
+    reviewer in `reviewers._pc_members_without_a_form_row`); applying it here
+    too needs no hardcoded name or email and follows the role automatically
+    if it ever changes.
     """
     with open(csv_path, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
@@ -88,6 +97,7 @@ def load_area_chairs(
 
     chairs = []
     dropped: list[str] = []
+    chair_conflicts: list[str] = []
     timestamps: dict[str, datetime.datetime] = {}
     for row in _latest_rows_by_email(rows):
         membership = field(row, "Area Chair membership")
@@ -101,6 +111,9 @@ def load_area_chairs(
             acct, how = index.match(email, first, last)
             if acct is None:
                 dropped.append(email)
+                continue
+            if pc_membership.structural_role(acct) == "chair":
+                chair_conflicts.append(email)
                 continue
             hotcrp_email = pc_membership.hotcrp_email_for(email, acct, how)
         dblp_url = field(row, "DBLP")
@@ -123,6 +136,13 @@ def load_area_chairs(
 
     if index is not None:
         pc_membership.report_pruned(dropped, len(chairs), "area chairs", index)
+    if chair_conflicts:
+        print(
+            f"{len(chair_conflicts)} area-chair acceptance(s) skipped — already a "
+            f"PC chair, so chairing would conflict with the same papers: "
+            f"{', '.join(sorted(chair_conflicts))}",
+            file=sys.stderr,
+        )
 
     # Same reasoning as reviewers.py: a chair who resubmitted under a second
     # real address is two rows here for one HotCRP account, and the later
@@ -152,6 +172,10 @@ def _tagged_without_a_form_row(index, chairs: list[AreaChair], supplement) -> li
     declared areas cannot be fingerprinted, and so cannot be assigned a paper.
     Anyone tagged who is on no roster at all is named and skipped: emitting a
     record that cannot be fingerprinted would fail later and further away.
+
+    A PC chair is skipped here too, same as the form-row loop in
+    `load_area_chairs` -- future-proofing against a PC chair's account someday
+    also picking up the `~~area-chairs` tag in HotCRP.
     """
     accounted: set[str] = set()
     for chair in chairs:
@@ -164,8 +188,12 @@ def _tagged_without_a_form_row(index, chairs: list[AreaChair], supplement) -> li
 
     added: list[AreaChair] = []
     unprofiled: list[str] = []
+    chair_conflicts: list[str] = []
     for acct in index.accounts:
         if not acct.is_area_chair:
+            continue
+        if pc_membership.structural_role(acct) == "chair":
+            chair_conflicts.append(acct.email.lower())
             continue
         email = acct.email.lower()
         if email in accounted:
@@ -202,6 +230,13 @@ def _tagged_without_a_form_row(index, chairs: list[AreaChair], supplement) -> li
               f"roster, so they have no DBLP page or areas and cannot chair anything: "
               f"{', '.join(sorted(unprofiled))} — add them to a roster or remove the tag",
               file=sys.stderr)
+    if chair_conflicts:
+        print(
+            f"{len(chair_conflicts)} account(s) tagged `~~area-chairs` skipped — "
+            f"already a PC chair, so chairing would conflict with the same papers: "
+            f"{', '.join(sorted(chair_conflicts))}",
+            file=sys.stderr,
+        )
     return added
 
 

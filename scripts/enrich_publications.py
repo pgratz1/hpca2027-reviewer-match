@@ -184,7 +184,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--csv", default=None)
     parser.add_argument(
-        "--role", choices=("reviewer", "area-chair", "reserve"), default="reviewer",
+        "--role", choices=("reviewer", "area-chair", "reserve", "trc"), default="reviewer",
         help="roster to load (default: reviewer)",
     )
     parser.add_argument(

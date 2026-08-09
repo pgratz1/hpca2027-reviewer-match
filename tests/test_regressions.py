@@ -38,6 +38,9 @@ from reviewer_match import paper_matching
 from reviewer_match import fingerprint
 from reviewer_match import paths
 from scripts import resolve_trc_members
+from reviewer_match import trc_reviewers
+from reviewer_match.trc_reviewers import TrcMember
+from scripts import assign_trc_reviews
 from scripts import score_abstract_evaluation
 from scripts import audit_coauthor_conflicts
 from scripts import audit_pc_roster
@@ -150,12 +153,12 @@ class AreaChairTrackTagCsvTests(unittest.TestCase):
             return list(csv.reader(f))
 
     def test_paper_and_account_track_tags_are_zero_indexed_and_spelled_apart(self):
-        # The paper tag names the track and stays plain so the chair can see
-        # and search it; the account grant stays `~~` so the chair-to-track
-        # mapping is chair-only. One spelling for both hid the tag from the
-        # person it exists for.
-        self.assertEqual("track_0", assign_area_chairs.paper_track_tag(0))
-        self.assertEqual("track_23", assign_area_chairs.paper_track_tag(23))
+        # Both the paper tag and the account grant stay `~~` so both are
+        # chair-only; they still spell apart (`paper_track_N` vs `track_N`)
+        # so a stray in one namespace never gets excluded as canonical in
+        # the other.
+        self.assertEqual("~~paper_track_0", assign_area_chairs.paper_track_tag(0))
+        self.assertEqual("~~paper_track_23", assign_area_chairs.paper_track_tag(23))
         self.assertEqual("~~track_0", assign_area_chairs.account_track_tag(0))
         self.assertEqual("~~track_23", assign_area_chairs.account_track_tag(23))
         self.assertNotEqual(
@@ -215,9 +218,9 @@ class AreaChairTrackTagCsvTests(unittest.TestCase):
         self.assertEqual(
             [
                 ["paper", "action", "email", "tag", "round"],
-                ["1", "tag", "", "track_0", ""],
-                ["5", "tag", "", "track_1", ""],
-                ["20", "tag", "", "track_1", ""],
+                ["1", "tag", "", "~~paper_track_0", ""],
+                ["5", "tag", "", "~~paper_track_1", ""],
+                ["20", "tag", "", "~~paper_track_1", ""],
             ],
             rows,
         )
@@ -232,10 +235,10 @@ class AreaChairTrackTagCsvTests(unittest.TestCase):
         self.assertEqual(
             [
                 ["paper", "action", "email", "tag", "round"],
-                ["all", "cleartag", "", "track_0", ""],
-                ["all", "cleartag", "", "track_1", ""],
-                ["all", "cleartag", "", "track_2", ""],
-                ["1", "tag", "", "track_0", ""],
+                ["all", "cleartag", "", "~~paper_track_0", ""],
+                ["all", "cleartag", "", "~~paper_track_1", ""],
+                ["all", "cleartag", "", "~~paper_track_2", ""],
+                ["1", "tag", "", "~~paper_track_0", ""],
             ],
             rows,
         )
@@ -822,6 +825,31 @@ class PaperCompletenessTests(unittest.TestCase):
             [(3, ["status draft"]), (4, ["status withdrawn"])],
             [(s["pid"], s["missing"]) for s in skipped],
         )
+
+    def test_exclude_pids_overrides_every_policy(self):
+        # A test paper like "Test TRC" can carry a real submitted status and
+        # a title that isn't the bare placeholder "test", so no policy check
+        # catches it on content alone -- exclude_pids is the explicit escape
+        # hatch, checked before any policy-specific logic runs.
+        papers = [self.COMPLETE, {**self.COMPLETE, "pid": 2, "title": "Test TRC"}]
+        with tempfile.TemporaryDirectory() as td:
+            path = str(Path(td) / "papers.json")
+            Path(path).write_text(json.dumps(papers))
+            with contextlib.redirect_stderr(io.StringIO()):
+                selected, skipped = paper_matching.load_papers(
+                    path, paper_policy="submitted",
+                    exclude_pids=paper_matching.parse_exclude_pids("2"),
+                    with_skipped=True,
+                )
+        self.assertEqual([1], [p["pid"] for p in selected])
+        self.assertEqual([(2, ["manually excluded"])],
+                          [(s["pid"], s["missing"]) for s in skipped])
+
+    def test_parse_exclude_pids_reads_a_comma_separated_list(self):
+        self.assertEqual(frozenset(), paper_matching.parse_exclude_pids(""))
+        self.assertEqual(frozenset(), paper_matching.parse_exclude_pids("  "))
+        self.assertEqual({1152}, paper_matching.parse_exclude_pids("1152"))
+        self.assertEqual({1152, 1200}, paper_matching.parse_exclude_pids("1152,1200"))
 
     def test_complete_policy_retains_legacy_checks(self):
         papers = [
@@ -2183,6 +2211,380 @@ SNAPSHOT_FIXTURE = """<?xml version="1.0" encoding="ISO-8859-1"?>
 """
 
 
+TRC_FIELDS = [
+    "Timestamp", "Email address", "TRC membership", "First Name", "Last Name",
+    "Institutional Affiliation", "DBLP Link", "primary area", "keywords",
+    "secondary area", "tertiary area", "Advisor's Full Name", "Advisor's Email Address",
+]
+
+
+def write_trc_csv(path, rows):
+    path = Path(path)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=TRC_FIELDS)
+        w.writeheader()
+        for row in rows:
+            w.writerow({field: row.get(field, "") for field in TRC_FIELDS})
+    return path
+
+
+def trc_row(email, **kwargs):
+    row = {
+        "Timestamp": "1/1/2026 00:00:00",
+        "Email address": email,
+        "TRC membership": "Yes, I accept as a TRC member",
+        "First Name": "Test",
+        "Last Name": "Student",
+        "Institutional Affiliation": "Somewhere",
+        "DBLP Link": "https://dblp.org/pid/1/Test.html",
+        "primary area": "Memory Systems",
+        "keywords": "",
+        "secondary area": "",
+        "tertiary area": "",
+        "Advisor's Full Name": "",
+        "Advisor's Email Address": "",
+    }
+    row.update(kwargs)
+    return row
+
+
+class TrcReviewersTests(unittest.TestCase):
+    """trc_reviewers.py: the TRC acceptance form, its own membership authority."""
+
+    def load(self, rows, pcinfo=None):
+        tmp = Path(tempfile.mkdtemp())
+        csv_path = write_trc_csv(tmp / "trc.csv", rows)
+        pcinfo_path = None
+        if pcinfo is not None:
+            pcinfo_path = str(write_pcinfo(tmp / "pcinfo.csv", pcinfo))
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            students = trc_reviewers.load_trc_members(
+                str(csv_path), pcinfo_path=pcinfo_path
+            )
+        return students, stderr.getvalue()
+
+    def test_dedupe_keeps_latest_timestamp_row(self):
+        rows = [
+            trc_row("a@x.edu", Timestamp="1/1/2026 00:00:00", keywords="old"),
+            trc_row("a@x.edu", Timestamp="2/1/2026 00:00:00", keywords="new"),
+        ]
+        students, _ = self.load(rows)
+        self.assertEqual(1, len(students))
+        self.assertEqual("new", students[0].keywords)
+
+    def test_decline_is_skipped(self):
+        rows = [trc_row("a@x.edu", **{"TRC membership": "Unable to accept"})]
+        students, _ = self.load(rows)
+        self.assertEqual([], students)
+
+    def test_malformed_email_row_is_skipped_not_guessed(self):
+        rows = [trc_row('bad"email.edu'), trc_row("good@x.edu")]
+        students, stderr = self.load(rows)
+        self.assertEqual(["good@x.edu"], [s.email for s in students])
+        self.assertIn('bad"email.edu', stderr)
+
+    def test_dblp_link_resolves_to_a_pid(self):
+        rows = [trc_row("a@x.edu", **{"DBLP Link": "https://dblp.org/pid/9/Zed.html"})]
+        students, _ = self.load(rows)
+        self.assertEqual("9/Zed", students[0].pid)
+
+    def test_none_dblp_link_leaves_pid_unset_and_is_reported(self):
+        rows = [trc_row("a@x.edu", **{"DBLP Link": "none"})]
+        students, stderr = self.load(rows)
+        self.assertIsNone(students[0].pid)
+        self.assertIn("a@x.edu", stderr)
+        self.assertIn("no DBLP link", stderr)
+
+    def test_override_wins_over_forms_own_dblp_link(self):
+        tmp = Path(tempfile.mkdtemp())
+        overrides = tmp / "trc_dblp_overrides.csv"
+        overrides.write_text("email,dblp,note\na@x.edu,7/Over,\n", encoding="utf-8")
+        csv_path = write_trc_csv(
+            tmp / "trc.csv",
+            [trc_row("a@x.edu", **{"DBLP Link": "https://dblp.org/pid/9/Form.html"})],
+        )
+        students = trc_reviewers.load_trc_members(
+            str(csv_path), overrides_path=str(overrides), pcinfo_path=None
+        )
+        self.assertEqual("7/Over", students[0].pid)
+        self.assertTrue(students[0].pid_from_override)
+
+    def test_advisor_emails_split_on_semicolon_and_lowercased(self):
+        rows = [trc_row("a@x.edu", **{
+            "Advisor's Full Name": "Ada; Bob",
+            "Advisor's Email Address": " Ada@X.edu ; bob@x.edu",
+        })]
+        students, _ = self.load(rows)
+        self.assertEqual(("ada@x.edu", "bob@x.edu"), students[0].advisor_emails)
+
+    def test_no_advisor_declared_is_an_empty_tuple(self):
+        students, _ = self.load([trc_row("a@x.edu")])
+        self.assertEqual((), students[0].advisor_emails)
+
+    def test_cross_check_warns_both_directions_without_pruning(self):
+        # The acceptance form is the membership authority for TRC -- unlike
+        # every other roster, a tag disagreement must never drop a row.
+        # (A real export always has plenty of `pc`-role accounts alongside
+        # the `trc`-tagged, non-`pc` ones; load_pc_accounts refuses an
+        # export with none at all, so the fixture needs one too.)
+        pcinfo = [
+            pc_account("a@x.edu", tags="trc", roles=""),
+            pc_account("chair@x.edu", roles="pc"),
+        ]
+        students, stderr = self.load(
+            [trc_row("a@x.edu"), trc_row("untagged@x.edu")], pcinfo=pcinfo,
+        )
+        self.assertEqual(
+            {"a@x.edu", "untagged@x.edu"}, {s.email for s in students}
+        )
+        self.assertIn("untagged@x.edu", stderr)
+        self.assertIn("no `trc`-tagged HotCRP account", stderr)
+
+    def test_missing_tag_emails_returns_both_directions_as_data(self):
+        # The function a caller (assign_trc_reviews.py's --missing-tag-csv)
+        # uses to act on the disagreement, not just read it off stderr.
+        tmp = Path(tempfile.mkdtemp())
+        pcinfo_path = str(write_pcinfo(tmp / "pcinfo.csv", [
+            pc_account("a@x.edu", tags="trc", roles=""),
+            pc_account("tagged-not-accepted@x.edu", tags="trc", roles=""),
+            pc_account("chair@x.edu", roles="pc"),
+        ]))
+        students = [
+            TrcMember(
+                email="a@x.edu", first="A", last="B", dblp_url="", pid=None,
+                affiliation="", primary="Memory", secondary="", tertiary="",
+                keywords="", tier="trc", override_cap=None,
+            ),
+            TrcMember(
+                email="untagged@x.edu", first="U", last="V", dblp_url="", pid=None,
+                affiliation="", primary="Memory", secondary="", tertiary="",
+                keywords="", tier="trc", override_cap=None,
+            ),
+        ]
+        with contextlib.redirect_stderr(io.StringIO()):
+            not_yet_tagged, not_yet_accepted = trc_reviewers.missing_tag_emails(
+                students, pcinfo_path
+            )
+        self.assertEqual(["untagged@x.edu"], not_yet_tagged)
+        self.assertEqual(["tagged-not-accepted@x.edu"], not_yet_accepted)
+
+    def test_missing_tag_emails_degrades_quietly_without_pcinfo(self):
+        students = [TrcMember(
+            email="a@x.edu", first="A", last="B", dblp_url="", pid=None,
+            affiliation="", primary="Memory", secondary="", tertiary="",
+            keywords="", tier="trc", override_cap=None,
+        )]
+        self.assertEqual(([], []), trc_reviewers.missing_tag_emails(students, None))
+
+    def test_tier_is_trc_and_hotcrp_email_defaults_to_email(self):
+        students, _ = self.load([trc_row("a@x.edu")])
+        self.assertEqual("trc", students[0].tier)
+        self.assertEqual("a@x.edu", students[0].hotcrp_email)
+
+
+class AssignTrcReviewsTests(unittest.TestCase):
+    """assign_trc_reviews.py: nearest-neighbor top-N, not deferred acceptance."""
+
+    def test_person_conflict_pids_checks_all_four_layers_independently(self):
+        own_by_pid = {1: {"a@x.com"}, 2: set(), 3: {"b@x.com"}}
+        pcc_by_pid = {1: set(), 2: {"c@x.com"}, 3: set()}
+        coauthor_derived = {2: {"d@x.com": object()}}
+        collab_hard = {3: {"e@x.com"}}
+        pids = [1, 2, 3, 4]
+        check = lambda email: assign_trc_reviews.person_conflict_pids(
+            {email}, pids, own_by_pid, pcc_by_pid, coauthor_derived, collab_hard,
+        )
+        self.assertEqual({1}, check("a@x.com"))
+        self.assertEqual({2}, check("c@x.com"))
+        self.assertEqual({2}, check("d@x.com"))
+        self.assertEqual({3}, check("e@x.com"))
+        self.assertEqual(set(), check("nobody@x.com"))
+
+    def test_person_conflict_pids_unions_every_known_address(self):
+        # An advisor's known-address set: authorship under either address
+        # must be caught, since accepting under one and authoring under
+        # another is ordinary here.
+        own_by_pid = {1: {"declared@x.com"}, 2: {"alt@x.com"}}
+        pids = [1, 2, 3]
+        result = assign_trc_reviews.person_conflict_pids(
+            {"declared@x.com", "alt@x.com"}, pids, own_by_pid, {}, {}, {},
+        )
+        self.assertEqual({1, 2}, result)
+
+    def test_eligible_pids_excludes_own_and_advisor_conflicts(self):
+        own_by_pid = {1: {"student@x.com"}, 2: {"advisor@x.com"}, 3: set()}
+        topics_by_pid = {1: {"memory"}, 2: {"memory"}, 3: {"memory"}}
+        pids, relaxed = assign_trc_reviews.eligible_pids_for_student(
+            "student@x.com", {"advisor@x.com"}, [1, 2, 3],
+            own_by_pid, {}, {}, {}, topics_by_pid, "Memory", "",
+            area_gate=True, advisor_coi=True, target=1,
+        )
+        self.assertEqual([3], pids)
+        self.assertFalse(relaxed)
+
+    def test_no_advisor_coi_flag_restores_the_advisors_papers(self):
+        own_by_pid = {1: {"advisor@x.com"}}
+        topics_by_pid = {1: {"memory"}}
+        pids, _ = assign_trc_reviews.eligible_pids_for_student(
+            "student@x.com", {"advisor@x.com"}, [1],
+            own_by_pid, {}, {}, {}, topics_by_pid, "Memory", "",
+            area_gate=True, advisor_coi=False, target=1,
+        )
+        self.assertEqual([1], pids)
+
+    def test_eligible_pids_excludes_papers_the_advisor_already_reviews(self):
+        # Not a conflict -- a plain overlap the student's own review should
+        # stay independent of.
+        topics_by_pid = {1: {"memory"}, 2: {"memory"}}
+        pids, relaxed = assign_trc_reviews.eligible_pids_for_student(
+            "student@x.com", {"advisor@x.com"}, [1, 2],
+            {}, {}, {}, {}, topics_by_pid, "Memory", "",
+            area_gate=True, advisor_coi=True, target=1,
+            advisor_assigned_pids=frozenset({1}),
+        )
+        self.assertEqual([2], pids)
+        self.assertFalse(relaxed)
+
+    def test_advisor_review_exclusion_is_never_restored_by_relaxation(self):
+        # Hard exclusion, the same as COI everywhere else -- a thin area-gate
+        # pool must not resurrect a paper the advisor is already reviewing.
+        topics_by_pid = {1: {"memory"}, 2: {"gpus"}}
+        pids, relaxed = assign_trc_reviews.eligible_pids_for_student(
+            "student@x.com", set(), [1, 2], {}, {}, {}, {}, topics_by_pid,
+            "Memory", "", area_gate=True, target=2,
+            advisor_assigned_pids=frozenset({2}),
+        )
+        self.assertTrue(relaxed)
+        self.assertEqual([1], pids)
+
+    def test_load_reviewer_assignments_skips_the_wipe_row(self):
+        tmp = Path(tempfile.mkdtemp()) / "assignment.csv"
+        tmp.write_text(
+            "paper,action,email,round\n"
+            "all,clearreview,all,R1\n"
+            "12,primaryreview,Advisor@X.edu,R1\n"
+            "34,primaryreview,advisor@x.edu,R1\n"
+            "56,primaryreview,other@x.edu,R1\n",
+            encoding="utf-8",
+        )
+        assigned = assign_trc_reviews.load_reviewer_assignments(str(tmp))
+        self.assertEqual({12, 34}, assigned["advisor@x.edu"])
+        self.assertEqual({56}, assigned["other@x.edu"])
+        self.assertNotIn("all", assigned)
+
+    def test_tag_csv_rows_clear_before_reapplying(self):
+        # A paper that drops out of the TRC track on a later run must
+        # actually lose the tag, not just never gain a new `tag` row.
+        rows = assign_trc_reviews.build_tag_csv_rows([12, 5], "TRC-track")
+        self.assertEqual(
+            [
+                ["all", "cleartag", "", "TRC-track", ""],
+                [12, "tag", "", "TRC-track", ""],
+                [5, "tag", "", "TRC-track", ""],
+            ],
+            rows,
+        )
+
+    def test_tag_csv_rows_still_clear_when_nothing_is_assigned(self):
+        # Every TRC-track paper reassigned away must still be cleared, even
+        # if the current run's slate is empty.
+        rows = assign_trc_reviews.build_tag_csv_rows([], "TRC-track")
+        self.assertEqual([["all", "cleartag", "", "TRC-track", ""]], rows)
+
+    def test_area_gate_relaxes_when_the_strict_pool_is_too_thin(self):
+        # A narrow declared interest must not leave a student under-filled
+        # when the COI-eligible pool could still cover them.
+        own_by_pid = {}
+        topics_by_pid = {1: {"memory"}, 2: {"gpus"}, 3: {"security"}}
+        pids, relaxed = assign_trc_reviews.eligible_pids_for_student(
+            "student@x.com", set(), [1, 2, 3], own_by_pid, {}, {}, {},
+            topics_by_pid, "Memory", "", area_gate=True, advisor_coi=True, target=2,
+        )
+        self.assertTrue(relaxed)
+        self.assertEqual([1, 2, 3], pids)
+
+    def test_area_gate_stays_strict_when_the_pool_is_big_enough(self):
+        own_by_pid = {}
+        topics_by_pid = {1: {"memory"}, 2: {"gpus"}, 3: {"memory"}}
+        pids, relaxed = assign_trc_reviews.eligible_pids_for_student(
+            "student@x.com", set(), [1, 2, 3], own_by_pid, {}, {}, {},
+            topics_by_pid, "Memory", "", area_gate=True, advisor_coi=True, target=2,
+        )
+        self.assertFalse(relaxed)
+        self.assertEqual({1, 3}, set(pids))
+
+    def test_no_area_gate_never_relaxes_because_it_never_gated(self):
+        own_by_pid = {}
+        topics_by_pid = {1: {"gpus"}}
+        pids, relaxed = assign_trc_reviews.eligible_pids_for_student(
+            "student@x.com", set(), [1], own_by_pid, {}, {}, {},
+            topics_by_pid, "Memory", "", area_gate=False, advisor_coi=True, target=2,
+        )
+        self.assertFalse(relaxed)
+        self.assertEqual([1], pids)
+
+    def test_greedy_assign_caps_a_paper_and_gives_it_to_the_higher_score(self):
+        triples = [
+            (0.9, "b@x.com", 1),
+            (0.8, "a@x.com", 1),
+            (0.7, "a@x.com", 2),
+        ]
+        picks, load = assign_trc_reviews.greedy_assign(triples, 2, 1)
+        self.assertEqual([1], [pid for pid, _ in picks["b@x.com"]])
+        self.assertEqual([2], [pid for pid, _ in picks["a@x.com"]])
+        self.assertEqual(1, load[1])
+
+    def test_greedy_assign_stops_each_student_at_the_target(self):
+        triples = [(0.9, "a@x.com", 1), (0.8, "a@x.com", 2), (0.7, "a@x.com", 3)]
+        picks, _ = assign_trc_reviews.greedy_assign(triples, 2, 1)
+        self.assertEqual(2, len(picks["a@x.com"]))
+        self.assertEqual({1, 2}, {pid for pid, _ in picks["a@x.com"]})
+
+    def test_greedy_assign_zero_cap_means_unlimited(self):
+        triples = [(0.9, "a@x.com", 1), (0.8, "b@x.com", 1)]
+        picks, load = assign_trc_reviews.greedy_assign(triples, 1, 0)
+        self.assertEqual([1], [pid for pid, _ in picks["a@x.com"]])
+        self.assertEqual([1], [pid for pid, _ in picks["b@x.com"]])
+        self.assertEqual(2, load[1])
+
+    def test_resolve_advisor_finds_pid_via_the_pc_roster_directly(self):
+        adv = reviewer(pid="5/Adv")
+        pc_reviewers_by_email = {adv.email: adv}
+        found, addrs = assign_trc_reviews.resolve_advisor(
+            adv.email, pc_reviewers_by_email, None
+        )
+        self.assertIs(adv, found)
+        self.assertIn(adv.email, addrs)
+
+    def test_resolve_advisor_falls_back_to_pc_index_for_a_second_address(self):
+        # Accepting under one address while authoring under another is
+        # ordinary here -- resolve_advisor must find the pid either way.
+        adv = reviewer(pid="5/Adv")
+        acct = pc_membership.Account({
+            "email": adv.email, "given_name": "Test", "family_name": "Person",
+            "roles": "pc",
+        })
+        index = pc_membership.PcIndex([acct], "fake")
+        pc_reviewers_by_email = {adv.email: adv}
+        found, addrs = assign_trc_reviews.resolve_advisor(
+            "other-address@x.com", pc_reviewers_by_email, index
+        )
+        # The declared address alone resolves nothing by email, but the
+        # index has nobody matching it by name/local-part either in this
+        # fixture, so no PC reviewer is found -- only the declared address
+        # itself is known.
+        self.assertIsNone(found)
+        self.assertEqual({"other-address@x.com"}, addrs)
+
+    def test_resolve_advisor_with_no_pc_match_keeps_the_declared_address(self):
+        found, addrs = assign_trc_reviews.resolve_advisor(
+            "external@nowhere.edu", {}, None
+        )
+        self.assertIsNone(found)
+        self.assertEqual({"external@nowhere.edu"}, addrs)
+
+
 class DblpSnapshotTests(unittest.TestCase):
     """build_dblp_snapshot_cache.py: serving publications from the local dump."""
 
@@ -2396,7 +2798,7 @@ class BackoffTests(unittest.TestCase):
 class ReserveReviewerLoaderTests(unittest.TestCase):
     """reserve_reviewers.py: a roster with no acceptance form behind it."""
 
-    def load(self, roster, papers, pcinfo=None):
+    def load(self, roster, papers, pcinfo=None, cap_overrides=None):
         tmp = Path(tempfile.mkdtemp())
         info, data = tmp / "info.csv", tmp / "papers.json"
         with info.open("w", newline="", encoding="utf-8") as f:
@@ -2410,8 +2812,14 @@ class ReserveReviewerLoaderTests(unittest.TestCase):
         path = None
         if pcinfo is not None:
             path = str(write_pcinfo(tmp / "pcinfo.csv", pcinfo))
+        cap_overrides_path = tmp / "reviewer_cap_overrides.csv"
+        with cap_overrides_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["email", "cap", "note"])
+            writer.writeheader()
+            for email, cap in (cap_overrides or {}).items():
+                writer.writerow({"email": email, "cap": cap, "note": ""})
         return reserve_reviewers.load_reserve_reviewers(
-            str(info), str(data), pcinfo_path=path
+            str(info), str(data), pcinfo_path=path, cap_overrides_path=str(cap_overrides_path)
         )
 
     def paper(self, topics, authors=(), nominates=""):
@@ -2500,6 +2908,23 @@ class ReserveReviewerLoaderTests(unittest.TestCase):
 
         # And the conflict outranks the area match on their own paper.
         self.assertEqual([], paper_matching.eligible_scores(own, *args, area_gate=True))
+
+    def test_a_curated_cap_override_reduces_a_reserves_load(self):
+        # Reserves never fill in an acceptance form, so reviewer_cap_overrides.csv
+        # is the only way to reduce one below the reserve cap at all.
+        reserves = self.load(
+            [("a@x.edu", "Ada Lovelace", "https://dblp.org/pid/1/A.html")],
+            [self.paper(["Memory Systems"], ["a@x.edu"])],
+            cap_overrides={"a@x.edu": "2"},
+        )
+        self.assertEqual(2, reserves[0].override_cap)
+
+    def test_with_no_curated_override_a_reserve_has_none(self):
+        reserves = self.load(
+            [("a@x.edu", "Ada Lovelace", "https://dblp.org/pid/1/A.html")],
+            [self.paper(["Memory Systems"], ["a@x.edu"])],
+        )
+        self.assertIsNone(reserves[0].override_cap)
 
 
 class OwnPaperConflictTests(unittest.TestCase):
@@ -3928,6 +4353,83 @@ class ReviewerLoaderTests(unittest.TestCase):
         self.assertEqual([], people)
         self.assertNotIn("typo", stderr.getvalue())
 
+    def test_the_forms_own_cell_still_sets_the_cap_with_no_curated_override(self):
+        tmp = Path(tempfile.mkdtemp())
+        form = tmp / "form.csv"
+        with form.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(self.HEADERS)
+            writer.writerow(self.row("here@a.edu", first="Alan", last="Turing", override="4"))
+        pcinfo = write_pcinfo(tmp / "pc.csv", [pc_account("here@a.edu", "Alan", "Turing")])
+        with contextlib.redirect_stderr(io.StringIO()):
+            people = reviewers_mod.load_reviewers(
+                str(form), str(tmp / "missing-dblp-overrides.csv"), pcinfo_path=str(pcinfo),
+                cap_overrides_path=str(tmp / "missing-cap-overrides.csv"),
+            )
+        self.assertEqual(4, people[0].override_cap)
+
+    def test_a_curated_cap_override_wins_over_the_forms_own_cell(self):
+        # reviewer_cap_overrides.csv is the durable, re-export-proof layer --
+        # same relationship dblp_overrides.csv has to the form's DBLP column.
+        tmp = Path(tempfile.mkdtemp())
+        form = tmp / "form.csv"
+        with form.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(self.HEADERS)
+            writer.writerow(self.row("here@a.edu", first="Alan", last="Turing", override="7"))
+        pcinfo = write_pcinfo(tmp / "pc.csv", [pc_account("here@a.edu", "Alan", "Turing")])
+        cap_overrides = tmp / "cap_overrides.csv"
+        with cap_overrides.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["email", "cap", "note"])
+            writer.writeheader()
+            writer.writerow({"email": "here@a.edu", "cap": "4", "note": ""})
+        with contextlib.redirect_stderr(io.StringIO()):
+            people = reviewers_mod.load_reviewers(
+                str(form), str(tmp / "missing-dblp-overrides.csv"), pcinfo_path=str(pcinfo),
+                cap_overrides_path=str(cap_overrides),
+            )
+        self.assertEqual(4, people[0].override_cap)
+
+
+class CapOverrideLoaderTests(unittest.TestCase):
+    """reviewers.py: reviewer_cap_overrides.csv, the durable per-person load cap
+    covering both PC members and reserve reviewers.
+    """
+
+    def write(self, tmp, rows):
+        path = tmp / "cap_overrides.csv"
+        with path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["email", "cap", "note"])
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+        return path
+
+    def test_a_missing_file_has_no_overrides(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.assertEqual({}, reviewers_mod.load_cap_overrides(str(tmp / "absent.csv")))
+
+    def test_a_blank_email_or_cap_is_skipped(self):
+        tmp = Path(tempfile.mkdtemp())
+        path = self.write(tmp, [
+            {"email": "", "cap": "4", "note": ""},
+            {"email": "a@x.edu", "cap": "", "note": "not decided yet"},
+            {"email": "b@x.edu", "cap": "4", "note": ""},
+        ])
+        self.assertEqual({"b@x.edu": 4}, reviewers_mod.load_cap_overrides(str(path)))
+
+    def test_a_bad_cap_fails_loudly_with_the_email(self):
+        tmp = Path(tempfile.mkdtemp())
+        path = self.write(tmp, [{"email": "a@x.edu", "cap": "two", "note": ""}])
+        with self.assertRaisesRegex(ValueError, "a@x.edu"):
+            reviewers_mod.load_cap_overrides(str(path))
+
+    def test_a_negative_cap_is_rejected(self):
+        tmp = Path(tempfile.mkdtemp())
+        path = self.write(tmp, [{"email": "a@x.edu", "cap": "-1", "note": ""}])
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            reviewers_mod.load_cap_overrides(str(path))
+
 
 class PcMembersWithoutFormRowTests(unittest.TestCase):
     """reviewers.py: a PC account HotCRP knows about that the acceptance form
@@ -3935,7 +4437,7 @@ class PcMembersWithoutFormRowTests(unittest.TestCase):
     """
 
     def load(self, accounts, *, form_rows=None, dblp_overrides=None, area_overrides=None,
-             reserve_upload=None):
+             reserve_upload=None, cap_overrides=None):
         tmp = Path(tempfile.mkdtemp())
         form = tmp / "form.csv"
         with form.open("w", newline="", encoding="utf-8") as f:
@@ -3969,12 +4471,20 @@ class PcMembersWithoutFormRowTests(unittest.TestCase):
             for email in (reserve_upload or []):
                 writer.writerow({"email": email, "name": "", "roles": "pc", "tags": ""})
 
+        cap_overrides_path = tmp / "reviewer_cap_overrides.csv"
+        with cap_overrides_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["email", "cap", "note"])
+            writer.writeheader()
+            for email, cap in (cap_overrides or {}).items():
+                writer.writerow({"email": email, "cap": cap, "note": ""})
+
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
             people = reviewers_mod.load_reviewers(
                 str(form), str(overrides_path), pcinfo_path=str(pcinfo),
                 area_overrides_path=str(area_overrides_path),
                 reserve_upload_path=str(reserve_upload_path),
+                cap_overrides_path=str(cap_overrides_path),
             )
         return people, stderr.getvalue()
 
@@ -4071,6 +4581,16 @@ class PcMembersWithoutFormRowTests(unittest.TestCase):
         )
         self.assertEqual([], people)
         self.assertNotIn("reserve-like@a.edu", stderr)
+
+    def test_a_cap_override_reaches_a_no_form_row_addition(self):
+        # There is no form cell to compare against here, so the curated file
+        # is simply the only source -- unlike a form row, where it wins.
+        people, _ = self.load(
+            [pc_account("new@a.edu", "Grace", "Hopper", tags="pc-full",
+                        **{"topic: Memory Systems": "2"})],
+            cap_overrides={"new@a.edu": "3"},
+        )
+        self.assertEqual(3, people[0].override_cap)
 
     def test_a_raw_reserve_upload_recruit_is_not_mistaken_for_a_pc_addition(self):
         # Observed on the live export: HotCRP had already tagged an account
@@ -4263,6 +4783,65 @@ class AreaChairExclusionTests(unittest.TestCase):
             )
         self.assertEqual([], chairs)
         self.assertIn("nowhere@a.edu", stderr.getvalue())
+
+    def test_a_pc_chair_is_never_an_area_chair_even_if_they_accept(self):
+        # A PC chair already makes the final call on every paper, so chairing
+        # one too is a conflict, not a second job -- even though they
+        # accepted the area-chair form. structural_role reads this off
+        # HotCRP's own roles="chair pc" / tags="chairs", the same signal that
+        # already keeps a PC chair from being auto-added as a plain reviewer.
+        tmp = Path(tempfile.mkdtemp())
+        form = tmp / "chairs.csv"
+        with form.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(self.AC_HEADERS)
+            writer.writerows([
+                self.ac_row("chair@a.edu", first="Paul", last="Gratz"),
+                self.ac_row("onform@a.edu"),
+            ])
+        pcinfo = write_pcinfo(tmp / "pcinfo.csv", [
+            pc_account("chair@a.edu", "Paul", "Gratz", roles="chair pc", tags="chairs"),
+            pc_account("onform@a.edu", "Ada", "Lovelace", tags="pc-full"),
+        ])
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            chairs = area_chairs.load_area_chairs(
+                str(form), str(tmp / "missing.csv"), pcinfo_path=str(pcinfo), supplement=[],
+            )
+        self.assertEqual(["onform@a.edu"], [c.email for c in chairs])
+        self.assertIn("chair@a.edu", stderr.getvalue())
+
+    def test_a_pc_chair_tagged_area_chair_with_no_form_row_is_still_skipped(self):
+        # Future-proofing: neither PC chair carries ~~area-chairs today, but
+        # if one someday does, the tag-supplement path must not add them back.
+        tmp = Path(tempfile.mkdtemp())
+        form = tmp / "chairs.csv"
+        with form.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(self.AC_HEADERS)
+        pcinfo = write_pcinfo(tmp / "pcinfo.csv", [
+            pc_account("chair@a.edu", "Paul", "Gratz", roles="chair pc",
+                       tags="chairs ~~area-chairs"),
+        ])
+        donor = self.person("chair@a.edu", "Paul", "Gratz")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            chairs = area_chairs.load_area_chairs(
+                str(form), str(tmp / "missing.csv"), pcinfo_path=str(pcinfo), supplement=[donor],
+            )
+        self.assertEqual([], chairs)
+        self.assertIn("chair@a.edu", stderr.getvalue())
+
+    def test_area_chair_emails_still_excludes_a_pc_chair_as_a_reviewer(self):
+        # load_area_chairs no longer treats them as a chair, but the
+        # reviewer-pool exclusion set (area_chair_emails) is separate and
+        # deliberately untouched: a PC chair still shouldn't review either,
+        # and this confirms that wasn't broken by the roster-side fix.
+        found = self.chair_emails(
+            [self.ac_row("chair@a.edu", first="Paul", last="Gratz")],
+            [pc_account("chair@a.edu", "Paul", "Gratz", roles="chair pc", tags="chairs")],
+        )
+        self.assertIn("chair@a.edu", found)
 
 
 class RosterDispatchTests(unittest.TestCase):
@@ -4705,19 +5284,31 @@ class ClearUploadTests(unittest.TestCase):
         rows = self.run_generator([pc_account("a@x.edu")],
                                   extra_argv=["--track-clear-ceiling", "3"])["paper"]
         self.assertEqual([["paper", "action", "email", "tag", "round"],
-                          ["all", "cleartag", "", "track_0", ""],
-                          ["all", "cleartag", "", "track_1", ""],
-                          ["all", "cleartag", "", "track_2", ""]], rows)
+                          ["all", "cleartag", "", "~~paper_track_0", ""],
+                          ["all", "cleartag", "", "~~paper_track_1", ""],
+                          ["all", "cleartag", "", "~~paper_track_2", ""]], rows)
 
     def test_a_hand_made_track_tag_outside_the_range_is_cleared_too(self):
-        # `track1` is live on the current export, left behind by setting the
-        # track mechanism up by hand; clearing only `track_N` would strand it.
+        # `track1` is live on a past export, left behind by setting the
+        # track mechanism up by hand; clearing only `~~paper_track_N` would
+        # strand it.
         rows = self.run_generator(
             [pc_account("a@x.edu")],
             papers=[{"pid": 1, "tags": ["track1#0"]}],
             extra_argv=["--track-clear-ceiling", "2"],
         )["paper"]
         self.assertIn(["all", "cleartag", "", "track1", ""], rows)
+
+    def test_an_out_of_range_paper_track_tag_is_cleared_too(self):
+        # A chair-roster shrink can leave a paper carrying a track number
+        # above the current ceiling; it must still be recognized and swept,
+        # the same way a hand-made spelling is.
+        rows = self.run_generator(
+            [pc_account("a@x.edu")],
+            papers=[{"pid": 1, "tags": ["~~paper_track_47#0"]}],
+            extra_argv=["--track-clear-ceiling", "2"],
+        )["paper"]
+        self.assertIn(["all", "cleartag", "", "~~paper_track_47", ""], rows)
 
     def test_a_tag_that_merely_contains_the_word_track_is_left_alone(self):
         rows = self.run_generator(

@@ -130,7 +130,7 @@ contains spaces and parentheses — always quote it in shell commands).
 - `make clear-uploads` writes the **undo half** of the two HotCRP uploads —
   `outputs/assignments/clear_assignment.csv` (one `all,clearreview,all,R1` row;
   `CLEAR_ROUND=all` widens it to every round), `clear_paper_tags.csv`
-  (`all,cleartag,,track_N,`) and `clear_account_tags.csv`
+  (`all,cleartag,,~~paper_track_N,`) and `clear_account_tags.csv`
   (`email,remove_tags,add_tags`, the last cell empty — **the empty column has
   to be there**: `p_profile.php`'s `save_bulk` reads a first line holding under
   two commas as a plain list of emails unless it also passes the newer
@@ -143,7 +143,8 @@ contains spaces and parentheses — always quote it in shell commands).
   which is what reaches a chair who left the roster still carrying `~~track_N`
   (the roster is unioned in as a second source, since an export predating the
   last upload cannot know what it wrote); and **non-canonical spellings are
-  cleared too** (`track1`/`~~track1` are live on this data), while a tag merely
+  cleared too** (`track1`/`~~track1` have been seen live, left behind by
+  setting the mechanism up by hand), while a tag merely
   containing the word — `TRC-track` — is not. Every row names an address the
   export lists, because HotCRP's bulk user importer **creates** an account for
   an unknown email. Tag spellings and the ceiling are imported from
@@ -403,6 +404,22 @@ complete` retains the former pre-registration completeness checks in
 `*-complete.txt` artifacts. The registered set (~1400 papers) far exceeds total
 PC review capacity, so large shortage/relaxation reports are expected under
 that policy, not a bug.
+
+`--exclude-pids` (comma-separated paper IDs) removes specific papers
+regardless of policy — for a known administrative/test submission that a
+content or status check can't catch on its own (a title like "Test TRC" isn't
+the bare placeholder "test", and a real `status: submitted` passes the
+`submitted` policy same as any other paper). Checked first in
+`paper_matching.selection_gaps`, so it applies under every policy and shows
+up in the exclusion report as `manually excluded`. **The Makefile's
+`EXCLUDE_PIDS` defaults to `1152`** (paper #1152, "Test TRC", a standing
+HotCRP test submission) and is threaded through every
+`assign_reviewers`/`assign_area_chairs` invocation including the baselines,
+the same operational-default shape as `PAPER_POLICY`; the scripts' own
+default stays empty. `make EXCLUDE_PIDS=` (empty) turns it off. Both
+`assign_reviewers.py` and `assign_area_chairs.py` need the **same** value —
+`assign_area_chairs.py` cross-checks its paper set against the reviewer
+assignment, and a mismatch fails loudly rather than silently.
 
 ## Data, caches, and PII
 

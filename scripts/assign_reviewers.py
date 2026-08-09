@@ -144,6 +144,7 @@ from reviewer_match.paper_matching import (
     build_paper_fingerprints,
     eligible_scores,
     load_papers,
+    parse_exclude_pids,
 )
 from reviewer_match import pc_membership
 from reviewer_match.area_chairs import area_chair_emails, drop_area_chairs
@@ -152,7 +153,7 @@ from reviewer_match.reserve_reviewers import DEFAULT_DATA as DEFAULT_RESERVE_DAT
 from reviewer_match.reserve_reviewers import DEFAULT_INFO as DEFAULT_RESERVE_INFO
 from reviewer_match.reserve_reviewers import TIER as RESERVE_TIER
 from reviewer_match.reserve_reviewers import load_reserve_reviewers
-from reviewer_match.reviewers import load_reviewers
+from reviewer_match.reviewers import DEFAULT_CAP_OVERRIDES, load_cap_overrides, load_reviewers
 
 DEFAULT_CSV = input_path("HPCA'27 PC Member Acceptance Form (Responses) - Form Responses 1.csv")
 DEFAULT_DATA = input_path("hpca2027-data.json")
@@ -1672,7 +1673,19 @@ def main() -> int:
         "--paper-policy", choices=PAPER_POLICIES, default="registered",
         help="paper selection policy (default: registered)",
     )
+    parser.add_argument(
+        "--exclude-pids", type=parse_exclude_pids, default=frozenset(),
+        help="comma-separated paper IDs to exclude regardless of policy, "
+             "e.g. a known test submission (default: none)",
+    )
     parser.add_argument("--csv", default=DEFAULT_CSV, help="path to the reviewer CSV")
+    parser.add_argument(
+        "--cap-overrides", default=DEFAULT_CAP_OVERRIDES,
+        help="hand-maintained per-reviewer paper-cap override CSV (email,cap,note), "
+             "covering both PC members and reserve reviewers; wins over the PC "
+             "acceptance form's own 'Override paper assignment number' column "
+             "(default: %(default)s)",
+    )
     parser.add_argument("--pcinfo", default=pc_membership.DEFAULT_PCINFO, help="HotCRP user export deciding who is still on the PC (default: %(default)s)")
     parser.add_argument("--no-pc-check", action="store_true", help="keep everyone the roster lists, even if HotCRP no longer marks them pc")
     parser.add_argument(
@@ -1907,7 +1920,8 @@ def main() -> int:
             return 1
 
     papers, skipped_papers = load_papers(
-        args.data, paper_policy=args.paper_policy, with_skipped=True
+        args.data, paper_policy=args.paper_policy, exclude_pids=args.exclude_pids,
+        with_skipped=True
     )
     if not papers:
         print(f"No papers found in {args.data}", file=sys.stderr)
@@ -1922,7 +1936,9 @@ def main() -> int:
     pcinfo = None if args.no_pc_check else args.pcinfo
     try:
         reviewers_by_email = {
-            r.email: r for r in load_reviewers(args.csv, pcinfo_path=pcinfo)
+            r.email: r for r in load_reviewers(
+                args.csv, pcinfo_path=pcinfo, cap_overrides_path=args.cap_overrides
+            )
         }
     except (FileNotFoundError, ValueError) as exc:
         if pcinfo and str(exc).startswith(pcinfo):
@@ -1939,7 +1955,8 @@ def main() -> int:
     if pcinfo:
         try:
             reserves = load_reserve_reviewers(
-                args.reserve_info, args.data, pcinfo_path=pcinfo
+                args.reserve_info, args.data, pcinfo_path=pcinfo,
+                cap_overrides_path=args.cap_overrides,
             )
         except FileNotFoundError:
             if args.include_reserves:
@@ -1948,7 +1965,10 @@ def main() -> int:
                   f"promoted to the PC cannot be identified and are absent from the "
                   f"pool; run `make reserve-info`", file=sys.stderr)
     elif args.include_reserves:
-        reserves = load_reserve_reviewers(args.reserve_info, args.data, pcinfo_path=None)
+        reserves = load_reserve_reviewers(
+            args.reserve_info, args.data, pcinfo_path=None,
+            cap_overrides_path=args.cap_overrides,
+        )
         print("WARNING: --no-pc-check leaves the `~~ex-rr` tag unreadable, so any "
               "reserve since promoted to the PC is assigned at the reserve cap",
               file=sys.stderr)
@@ -2021,6 +2041,21 @@ def main() -> int:
             print(f"Reserve reviewers included: {len(true_reserves)} roster, "
                   f"{len(reserve_fp)} fingerprinted, {len(reserve_seniority)} classified "
                   f"(cap {args.reserve_cap} papers each)", file=sys.stderr)
+
+    # Checked once here, after both rosters are merged into one dict -- doing
+    # it inside load_reviewers or load_reserve_reviewers individually would
+    # misreport the other roster's emails as typos, since neither loader can
+    # see the other's pool.
+    cap_overrides = load_cap_overrides(args.cap_overrides)
+    unmatched_caps = sorted(set(cap_overrides) - set(reviewers_by_email))
+    if unmatched_caps:
+        print(
+            f"WARNING: {len(unmatched_caps)} {args.cap_overrides} email(s) match "
+            f"neither a PC member nor a reserve reviewer in the pool (typo, or "
+            f"they left?): {', '.join(unmatched_caps[:5])}"
+            f"{' ...' if len(unmatched_caps) > 5 else ''}",
+            file=sys.stderr,
+        )
 
     # An area chair chairs papers and reviews none. This has to run after the
     # reserve merge above, not inside the PC load: a reserve can be an area

@@ -45,6 +45,7 @@ from reviewer_match.paper_matching import (
     build_paper_fingerprints,
     load_papers,
     own_paper_conflicts,
+    parse_exclude_pids,
 )
 
 DEFAULT_CSV = input_path("Area Chair Acceptance Form (Responses) - Form Responses 1.csv")
@@ -283,22 +284,26 @@ def maximize_balanced_affinity(
 def paper_track_tag(n: int) -> str:
     """Chair index n's paper tag -- the tag that *names* the HotCRP track.
 
-    Plain, not `~~`-prefixed, so the chair can see it on their own papers and
-    search `#track_N` to pull up their pile; a `~~` tag is chair-hidden and
-    invisible to the very person it exists for. Naming a track is enough to
-    make HotCRP register the tag chair-readonly, so an ordinary PC member
-    still cannot tag a paper into a track.
+    `~~`-prefixed, so hidden from ordinary PC the same way the account grant
+    is -- including from the chair it names: HotCRP's track-membership check
+    (`Conf::check_tracks`) is a raw, viewer-independent string test on the
+    tag, so a hidden tag still grants the chair's reviewer-identity and
+    comment permissions correctly. All that is lost is the chair's own
+    `#track_N` search shortcut in the HotCRP UI; `outputs/assignments/area_chair_assignment.txt`
+    already lists each chair's papers by ID and title, so that report is the
+    replacement, not a gap.
     """
-    return f"track_{n}"
+    return f"~~paper_track_{n}"
 
 
 def account_track_tag(n: int) -> str:
     """Chair index n's PC-account grant -- what the track's permissions name.
 
-    Stays `~~`-prefixed, and so chair-only: this is the chair-to-track
-    mapping, which the PC has no reason to see. Paper tags and account tags
-    are separate HotCRP namespaces, so this differs from `paper_track_tag`
-    only in visibility, never in which track it refers to.
+    `~~`-prefixed, and so chair-only: this is the chair-to-track mapping,
+    which the PC has no reason to see. Paper tags and account tags are
+    separate HotCRP namespaces, so this differs from `paper_track_tag` in
+    name (`track_N` vs `paper_track_N`) as well as which object it tags,
+    never in which track it refers to.
     """
     return f"~~track_{n}"
 
@@ -402,6 +407,13 @@ def main() -> int:
         "--paper-policy", choices=PAPER_POLICIES, default="registered",
         help="paper selection policy (default: registered)",
     )
+    parser.add_argument(
+        "--exclude-pids", type=parse_exclude_pids, default=frozenset(),
+        help="comma-separated paper IDs to exclude regardless of policy, "
+             "e.g. a known test submission (default: none); must match "
+             "assign_reviewers.py's setting or the reviewer-assignment "
+             "cross-check fails",
+    )
     parser.add_argument("--fingerprint-cache", default=DEFAULT_FINGERPRINT_CACHE)
     parser.add_argument("--paper-cache", default=DEFAULT_PAPER_CACHE)
     parser.add_argument(
@@ -445,13 +457,13 @@ def main() -> int:
     )
     parser.add_argument(
         "--paper-tag-csv",
-        help="write a HotCRP Assignments bulk-update CSV tagging each paper into its chair's track_N",
+        help="write a HotCRP Assignments bulk-update CSV tagging each paper into its chair's ~~paper_track_N",
     )
     parser.add_argument(
         "--track-clear-ceiling", type=int, default=DEFAULT_TRACK_CLEAR_CEILING,
-        help="clear track_0..track_(N-1) from papers, and ~~track_0..~~track_(N-1) from "
-             "chair accounts, before reapplying; covers a shrunk chair roster too "
-             "(default: %(default)s)",
+        help="clear ~~paper_track_0..~~paper_track_(N-1) from papers, and "
+             "~~track_0..~~track_(N-1) from chair accounts, before reapplying; "
+             "covers a shrunk chair roster too (default: %(default)s)",
     )
     args = parser.parse_args()
     if not 0 <= args.load_tolerance < 1:
@@ -470,7 +482,9 @@ def main() -> int:
         print(f"ERROR: no reviewer-assigned papers found in {args.reviewer_assignment}", file=sys.stderr)
         return 1
 
-    selected_papers = load_papers(args.data, paper_policy=args.paper_policy)
+    selected_papers = load_papers(
+        args.data, paper_policy=args.paper_policy, exclude_pids=args.exclude_pids
+    )
     papers_by_pid = {p["pid"]: p for p in selected_papers}
     unknown = [pid for pid in assigned_pids if pid not in papers_by_pid]
     if unknown:

@@ -82,6 +82,17 @@ title-≥3-words/abstract/topics/authors and withdrawn checks.
 scripts themselves still default to `registered` when run by hand; `make
 PAPER_POLICY=registered` restores the pre-deadline view.
 
+**Excluding specific papers:** `--exclude-pids` (comma-separated IDs, checked
+before any policy logic) removes papers a policy can't catch on content or
+status alone — a standing test submission with a real `submitted` status and
+a title that isn't the bare placeholder "test" passes every check on its own
+merits. `assign_reviewers.py` and `assign_area_chairs.py` both take it; the
+Makefile's `EXCLUDE_PIDS` defaults to `1152` (a HotCRP test paper, "Test
+TRC") and threads it through every invocation of both, including the
+baselines, so it never reappears in a report. `make EXCLUDE_PIDS=` turns it
+off. Give both scripts the same value: `assign_area_chairs.py` cross-checks
+its paper set against the reviewer assignment and fails loudly on a mismatch.
+
 ## Start-to-finish workflow
 
 1. **Drop the inputs in place**: the latest acceptance-form CSV export (keep
@@ -1287,15 +1298,19 @@ review themselves. Each chair is numbered 0-indexed in the same order the
 different tags in two separate HotCRP namespaces**; the report prints both
 under each chair's `track:` line for a human-auditable record:
 
-- the **papers** of track N are tagged plain `track_N`. Not `~~track_N`: a
-  `~~` tag is chair-hidden, so the tag would be invisible — and unsearchable —
-  to the one person it exists for, the chair who wants `#track_N` to pull up
-  their pile. Nothing is lost by making it plain, because HotCRP registers any
-  tag that *names* a track as chair-readonly (`TF_TRACK | TFM_ADMIN_PUBLIC |
-  TF_CHAIR_READONLY`, `lib/tagger.php` upstream), so an ordinary PC member
-  still cannot tag a paper into a track. Track membership itself is a raw
-  `$prow->has_tag()` string test (`Conf::check_tracks`), viewer-independent, so
-  the spelling changes visibility and nothing else.
+- the **papers** of track N are tagged `~~paper_track_N`, chair-hidden the
+  same way the account grant is — including from the chair it names, since a
+  `~~` tag is invisible to `#tag` search. That costs the chair the
+  `#paper_track_N` search shortcut to pull up their own pile in the HotCRP
+  UI; `outputs/assignments/area_chair_assignment.txt` already lists each
+  chair's papers by ID and title, so that report is the replacement, not a
+  gap. Nothing else is lost: HotCRP registers any tag that *names* a track as
+  chair-readonly (`TF_TRACK | TFM_ADMIN_PUBLIC | TF_CHAIR_READONLY`,
+  `lib/tagger.php` upstream) regardless of spelling, so an ordinary PC member
+  still cannot tag a paper into a track, and track membership itself is a raw
+  `$prow->has_tag()` string test (`Conf::check_tracks`), viewer-independent —
+  so the chair's reviewer-name visibility and comment rights work whether or
+  not they can see the tag.
 - the **chair's PC account** is tagged `~~track_N`, and stays chair-only:
   it is the chair-to-track mapping, which the PC has no reason to see. This is
   the tag the track's permissions name, under Settings → Tags & tracks (`Who
@@ -1303,8 +1318,9 @@ under each chair's `track:` line for a human-auditable record:
   members with tag `~~track_N`").
 
 The tracks themselves are **not** created by this repo — they're set up by
-hand in HotCRP first, one per chair, named `track_0` .. `track_23` for 24
-chairs, and these CSVs only bulk-assign existing tags:
+hand in HotCRP first, one per chair, identified by the paper tag
+`~~paper_track_0` .. `~~paper_track_23` for 24 chairs, and these CSVs only
+bulk-assign existing tags:
 
 - `outputs/assignments/area_chair_account_tags.csv` — upload via **Settings →
   Accounts** bulk update, header `email,remove_tags,add_tags`, one row per
@@ -1332,7 +1348,7 @@ previous run has to go, not just accumulate alongside the new one.
 count so a shrunk roster's stale higher-numbered tags still get cleared)
 governs how many track numbers get cleared before reapplying, in each
 namespace's own spelling: `area_chair_paper_tags.csv` opens with one
-`all,cleartag,,track_N,` row per track (paper tags), and each row of
+`all,cleartag,,~~paper_track_N,` row per track (paper tags), and each row of
 `area_chair_account_tags.csv` carries the full `~~track_N` range in
 `remove_tags` before `add_tags` grants the current one (account tags).
 Re-running `make area-chairs` and re-uploading both files is therefore
@@ -1360,9 +1376,9 @@ formats:
   only one cleared by default; `make clear-uploads CLEAR_ROUND=all` leaves the
   round cell empty, which HotCRP reads as every round.
 - `outputs/assignments/clear_paper_tags.csv` — **Assignments → Bulk update**,
-  one `all,cleartag,,track_N,` row per track number. `cleartag` takes the tag
-  off every paper carrying it, so this is one row per track regardless of how
-  many papers hold it.
+  one `all,cleartag,,~~paper_track_N,` row per track number. `cleartag` takes
+  the tag off every paper carrying it, so this is one row per track
+  regardless of how many papers hold it.
 - `outputs/assignments/clear_account_tags.csv` — **Settings → Accounts**, one
   `email,remove_tags,add_tags` row per account, `remove_tags` carrying the
   whole `~~track_N` range and `add_tags` left empty. The plain `tags` column
@@ -1396,11 +1412,14 @@ Two things it does that re-running `make area-chairs` cannot:
   **creates** an account for an unknown email, so a clearing file naming a
   form-only address would quietly add users.
 - **Track tags outside the canonical range are cleared too**, read off the
-  paper export and the user export rather than assumed. Setting the track
-  mechanism up by hand left a `track1`/`~~track1` pair on the live data that
-  clearing `track_0..track_49` would strand. A tag that merely contains the
-  word (`TRC-track`) does not match — that is a separate track and is nobody's
-  to clear here.
+  paper export and the user export rather than assumed. The regex recognizes
+  both namespaces' shapes (`~~paper_track_N` for papers, `~~track_N` for
+  accounts) so a chair-roster shrink that strands a higher-numbered tag, or a
+  hand-made variant like `track1`/`~~track1` (both seen live on a past
+  export, from setting the mechanism up by hand) still gets swept, not just
+  the exact range `--track-clear-ceiling` covers. A tag that merely contains
+  the word (`TRC-track`) does not match — that is a separate track and is
+  nobody's to clear here.
 
 The tag spellings and the clear ceiling are imported from
 `assign_area_chairs.py`, never restated: a clearing file that spelled a tag

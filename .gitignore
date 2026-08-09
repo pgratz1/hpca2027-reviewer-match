@@ -27,9 +27,11 @@ archive/historical-snapshots/*
 # once already and the cost of a redundant rule is nothing.
 *PC Member Acceptance Form*
 *Area Chair Acceptance Form*
+*TRC Member Acceptance Form*
 hpca2027-pcinfo.csv
 hpca2027-data*.json
 hpca2027-trc*.csv
+trc_dblp_overrides.csv
 PCDB_with_emails.csv
 dblp-*.xml
 dblp-*.xml.gz
@@ -55,6 +57,10 @@ pc_roster_pruned.csv
 pc_roster_missing.csv
 assignment*.txt
 area_chair_assignment*.txt
+trc_assignment*.txt
+trc_review_upload.csv
+trc_track_tags.csv
+trc_missing_tags.csv
 abstract-evaluation*.csv
 
 # Optional local comparison datasets.

@@ -20,8 +20,9 @@ from .area_chairs import load_area_chairs
 from .reserve_reviewers import DEFAULT_DATA, DEFAULT_INFO
 from .reserve_reviewers import load_reserve_reviewers
 from .reviewers import load_reviewers
+from .trc_reviewers import DEFAULT_TRC_CSV, load_trc_members
 
-ROLES = ("reviewer", "area-chair", "reserve")
+ROLES = ("reviewer", "area-chair", "reserve", "trc")
 
 DEFAULT_CSV = input_path("HPCA'27 PC Member Acceptance Form (Responses) - Form Responses 1.csv")
 DEFAULT_AREA_CHAIR_CSV = input_path("Area Chair Acceptance Form (Responses) - Form Responses 1.csv")
@@ -31,6 +32,7 @@ DEFAULT_ROSTERS = {
     "reviewer": DEFAULT_CSV,
     "area-chair": DEFAULT_AREA_CHAIR_CSV,
     "reserve": DEFAULT_INFO,
+    "trc": DEFAULT_TRC_CSV,
 }
 
 
@@ -64,6 +66,12 @@ def load_roster(
         )
     if role == "reserve":
         return load_reserve_reviewers(path, data_path, pcinfo_path=pcinfo_path)
+    if role == "trc":
+        # Not membership-gated against pcinfo the way the other three are --
+        # TRC accounts don't carry the `pc` role, so pcinfo_path here is only
+        # used for the non-fatal tag cross-check. See trc_reviewers' module
+        # docstring.
+        return load_trc_members(path, pcinfo_path=pcinfo_path)
     return load_reviewers(path, pcinfo_path=pcinfo_path)
 
 
@@ -94,4 +102,5 @@ def role_label(role: str) -> str:
         "reviewer": "reviewers",
         "area-chair": "area chairs",
         "reserve": "reserve reviewers",
+        "trc": "TRC members",
     }[role]
