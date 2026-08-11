@@ -1025,6 +1025,28 @@ def relaxation_report(
     return len(skipped), len(relaxed_papers)
 
 
+def reviewer_assignments_report(
+    papers: list[dict],
+    reviewer_papers: dict[str, list[int]],
+    reviewers_by_email: dict,
+    affinity_lookup: dict[tuple[str, int], float],
+    seniority: dict[str, dict] | None,
+) -> None:
+    """Print every reviewer's assigned papers, alphabetically by name, so a
+    chair who knows a reviewer's expertise can spot-check their slate without
+    scanning the paper-major listing above for their name.
+    """
+    title_by_pid = {p["pid"]: p["title"] for p in papers}
+    print("\n=== Reviewer assignments (alphabetical by name) ===")
+    for email in sorted(reviewer_papers, key=lambda e: reviewers_by_email[e].name.lower()):
+        r = reviewers_by_email[email]
+        pids = sorted(reviewer_papers[email], key=lambda pid: -affinity_lookup[(email, pid)])
+        cls = "" if seniority is None else "/" + (seniority[email]["class"] if email in seniority else "?")
+        print(f"\n  {r.name} <{email}>  [{r.tier}{cls}]  ({r.primary}) — {len(pids)} paper(s)")
+        for pid in pids:
+            print(f"      {affinity_lookup[(email, pid)]:.3f}  [{pid}] {title_by_pid[pid]}")
+
+
 DEFAULT_SAME_COUNTRY_CAP = 2
 DEFAULT_REGION_MAJORITY = 0.5
 DEFAULT_REGION_MIN_RESOLVED = 0.5
@@ -2377,6 +2399,7 @@ def main() -> int:
     # --- Report ---------------------------------------------------------------
     goodness = paper_goodness(paper_held, affinity_lookup)
     reviewer_load: dict[str, int] = defaultdict(int)
+    reviewer_papers: dict[str, list[int]] = defaultdict(list)
     for p in papers:
         pid = p["pid"]
         assigned = sorted(paper_held[pid], key=lambda e: -affinity_lookup[(e, pid)])
@@ -2395,6 +2418,7 @@ def main() -> int:
             cls = "" if seniority is None else "/" + (seniority[email]["class"] if email in seniority else "?")
             print(f"  {rank:2d}. {affinity_lookup[(email, pid)]:.3f}  {r.name} <{email}>  [{r.tier}{cls}]  ({r.primary})")
             reviewer_load[email] += 1
+            reviewer_papers[email].append(pid)
 
     total_pairs = sum(len(v) for v in paper_held.values())
     # Counted per tier rather than by naming 'light' and 'full': a tier the
@@ -2504,6 +2528,9 @@ def main() -> int:
         skipped_papers, papers, paper_held, paper_target, assigned_via,
         goodness, affinity_lookup, reviewers_by_email, seniority,
         itemize_excluded=args.paper_policy != "submitted",
+    )
+    reviewer_assignments_report(
+        papers, reviewer_papers, reviewers_by_email, affinity_lookup, seniority,
     )
 
     print(

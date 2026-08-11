@@ -118,7 +118,9 @@ its paper set against the reviewer assignment and fails loudly on a mismatch.
    IEEE/ACM abstract enrichment, reviewer fingerprints, then the assignment. The final
    outputs land in **`outputs/assignments/assignment.txt`** and
    **`outputs/assignments/assignment.csv`**. The text file contains the per-paper
-   reviewer slates, per-area shortage report, and seniority criteria report. The
+   reviewer slates, per-area shortage report, seniority criteria report, and — at
+   the end — a per-reviewer listing of every paper each reviewer was assigned,
+   alphabetical by name, for spot-checking reviewers you know by hand. The
    CSV is ready for HotCRP's Assignments → Bulk update page: it first clears all
    existing R1 review assignments, then installs the new slate as mandatory
    primary R1 reviews. Always use HotCRP's preview before approving the upload.
@@ -1294,14 +1296,14 @@ review content — hidden from non-conflicted PC by default — and post
 discussion comments on their own papers without being expected to write a
 review themselves. Each chair is numbered 0-indexed in the same order the
 `.txt` report already prints them (`sorted(chair_emails, key=lambda e:
-(chairs_by_email[e].name.lower(), e))`), and track N is written with **two
-different tags in two separate HotCRP namespaces**; the report prints both
+(chairs_by_email[e].name.lower(), e))`), and track N is written as **the same
+`~~track_N` tag in two separate HotCRP namespaces**; the report prints it
 under each chair's `track:` line for a human-auditable record:
 
-- the **papers** of track N are tagged `~~paper_track_N`, chair-hidden the
+- the **papers** of track N are tagged `~~track_N`, chair-hidden the
   same way the account grant is — including from the chair it names, since a
   `~~` tag is invisible to `#tag` search. That costs the chair the
-  `#paper_track_N` search shortcut to pull up their own pile in the HotCRP
+  `#track_N` search shortcut to pull up their own pile in the HotCRP
   UI; `outputs/assignments/area_chair_assignment.txt` already lists each
   chair's papers by ID and title, so that report is the replacement, not a
   gap. Nothing else is lost: HotCRP registers any tag that *names* a track as
@@ -1315,11 +1317,13 @@ under each chair's `track:` line for a human-auditable record:
   it is the chair-to-track mapping, which the PC has no reason to see. This is
   the tag the track's permissions name, under Settings → Tags & tracks (`Who
   can see reviewer names?` / `Which non-reviewers can add comments?` → "PC
-  members with tag `~~track_N`").
+  members with tag `~~track_N`"). Paper tags and account tags are separate
+  HotCRP namespaces, so the identical spelling on both sides never collides —
+  only the object it tags differs.
 
 The tracks themselves are **not** created by this repo — they're set up by
-hand in HotCRP first, one per chair, identified by the paper tag
-`~~paper_track_0` .. `~~paper_track_23` for 24 chairs, and these CSVs only
+hand in HotCRP first, one per chair, identified by the tag
+`~~track_0` .. `~~track_23` for 24 chairs, and these CSVs only
 bulk-assign existing tags:
 
 - `outputs/assignments/area_chair_account_tags.csv` — upload via **Settings →
@@ -1347,8 +1351,8 @@ previous run has to go, not just accumulate alongside the new one.
 `--track-clear-ceiling` (default 50, comfortably above any realistic chair
 count so a shrunk roster's stale higher-numbered tags still get cleared)
 governs how many track numbers get cleared before reapplying, in each
-namespace's own spelling: `area_chair_paper_tags.csv` opens with one
-`all,cleartag,,~~paper_track_N,` row per track (paper tags), and each row of
+namespace: `area_chair_paper_tags.csv` opens with one
+`all,cleartag,,~~track_N,` row per track (paper tags), and each row of
 `area_chair_account_tags.csv` carries the full `~~track_N` range in
 `remove_tags` before `add_tags` grants the current one (account tags).
 Re-running `make area-chairs` and re-uploading both files is therefore
@@ -1376,7 +1380,7 @@ formats:
   only one cleared by default; `make clear-uploads CLEAR_ROUND=all` leaves the
   round cell empty, which HotCRP reads as every round.
 - `outputs/assignments/clear_paper_tags.csv` — **Assignments → Bulk update**,
-  one `all,cleartag,,~~paper_track_N,` row per track number. `cleartag` takes
+  one `all,cleartag,,~~track_N,` row per track number. `cleartag` takes
   the tag off every paper carrying it, so this is one row per track
   regardless of how many papers hold it.
 - `outputs/assignments/clear_account_tags.csv` — **Settings → Accounts**, one
@@ -1413,13 +1417,15 @@ Two things it does that re-running `make area-chairs` cannot:
   form-only address would quietly add users.
 - **Track tags outside the canonical range are cleared too**, read off the
   paper export and the user export rather than assumed. The regex recognizes
-  both namespaces' shapes (`~~paper_track_N` for papers, `~~track_N` for
-  accounts) so a chair-roster shrink that strands a higher-numbered tag, or a
-  hand-made variant like `track1`/`~~track1` (both seen live on a past
-  export, from setting the mechanism up by hand) still gets swept, not just
-  the exact range `--track-clear-ceiling` covers. A tag that merely contains
-  the word (`TRC-track`) does not match — that is a separate track and is
-  nobody's to clear here.
+  `~~track_N` in both namespaces (papers and accounts), plus `~~paper_track_N`
+  — this repo's own paper-tag spelling before the two namespaces were unified
+  onto the same name — so a chair-roster shrink that strands a higher-numbered
+  tag, an older run's pre-unification spelling, or a hand-made variant like
+  `track1`/`~~track1` (both seen live on a past export, from setting the
+  mechanism up by hand) still gets swept, not just the exact range
+  `--track-clear-ceiling` covers. A tag that merely contains the word
+  (`TRC-track`) does not match — that is a separate track and is nobody's to
+  clear here.
 
 The tag spellings and the clear ceiling are imported from
 `assign_area_chairs.py`, never restated: a clearing file that spelled a tag

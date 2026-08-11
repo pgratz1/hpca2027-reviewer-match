@@ -281,29 +281,22 @@ def maximize_balanced_affinity(
     return result
 
 
-def paper_track_tag(n: int) -> str:
-    """Chair index n's paper tag -- the tag that *names* the HotCRP track.
+def track_tag(n: int) -> str:
+    """Chair index n's track tag -- the same `~~track_N` spelling in both
 
-    `~~`-prefixed, so hidden from ordinary PC the same way the account grant
-    is -- including from the chair it names: HotCRP's track-membership check
-    (`Conf::check_tracks`) is a raw, viewer-independent string test on the
-    tag, so a hidden tag still grants the chair's reviewer-identity and
-    comment permissions correctly. All that is lost is the chair's own
-    `#track_N` search shortcut in the HotCRP UI; `outputs/assignments/area_chair_assignment.txt`
-    already lists each chair's papers by ID and title, so that report is the
-    replacement, not a gap.
-    """
-    return f"~~paper_track_{n}"
-
-
-def account_track_tag(n: int) -> str:
-    """Chair index n's PC-account grant -- what the track's permissions name.
-
-    `~~`-prefixed, and so chair-only: this is the chair-to-track mapping,
-    which the PC has no reason to see. Paper tags and account tags are
-    separate HotCRP namespaces, so this differs from `paper_track_tag` in
-    name (`track_N` vs `paper_track_N`) as well as which object it tags,
-    never in which track it refers to.
+    of the two HotCRP namespaces this repo writes it into: the paper tag that
+    *names* the track, and the chair's own PC-account grant that the track's
+    permissions name. `~~`-prefixed, so hidden from ordinary PC in both
+    namespaces -- including from the chair it names: HotCRP's
+    track-membership check (`Conf::check_tracks`) is a raw, viewer-independent
+    string test on the tag, so a hidden paper tag still grants the chair's
+    reviewer-identity and comment permissions correctly. All that is lost is
+    the chair's own `#track_N` search shortcut in the HotCRP UI;
+    `outputs/assignments/area_chair_assignment.txt` already lists each
+    chair's papers by ID and title, so that report is the replacement, not a
+    gap. Paper tags and account tags are separate HotCRP namespaces, so the
+    identical spelling never collides -- only the object it tags, and thus
+    which side of Settings -> Tags & tracks reads it, differs.
     """
     return f"~~track_{n}"
 
@@ -344,11 +337,11 @@ def write_account_tag_csv(
             temporary = Path(f.name)
             writer = csv.writer(f)
             writer.writerow(["email", "remove_tags", "add_tags"])
-            remove_tags = " ".join(account_track_tag(n) for n in range(clear_through))
+            remove_tags = " ".join(track_tag(n) for n in range(clear_through))
             for email in sorted(track_number):
                 hotcrp_email = chairs_by_email[email].hotcrp_email
                 writer.writerow(
-                    [hotcrp_email, remove_tags, account_track_tag(track_number[email])]
+                    [hotcrp_email, remove_tags, track_tag(track_number[email])]
                 )
         os.replace(temporary, target)
         temporary = None
@@ -386,9 +379,9 @@ def write_paper_tag_csv(
             writer = csv.writer(f)
             writer.writerow(["paper", "action", "email", "tag", "round"])
             for n in range(clear_through):
-                writer.writerow(["all", "cleartag", "", paper_track_tag(n), ""])
+                writer.writerow(["all", "cleartag", "", track_tag(n), ""])
             for email in sorted(by_chair):
-                tag = paper_track_tag(track_number[email])
+                tag = track_tag(track_number[email])
                 for pid in sorted(by_chair[email]):
                     writer.writerow([pid, "tag", "", tag, ""])
         os.replace(temporary, target)
@@ -457,13 +450,12 @@ def main() -> int:
     )
     parser.add_argument(
         "--paper-tag-csv",
-        help="write a HotCRP Assignments bulk-update CSV tagging each paper into its chair's ~~paper_track_N",
+        help="write a HotCRP Assignments bulk-update CSV tagging each paper into its chair's ~~track_N",
     )
     parser.add_argument(
         "--track-clear-ceiling", type=int, default=DEFAULT_TRACK_CLEAR_CEILING,
-        help="clear ~~paper_track_0..~~paper_track_(N-1) from papers, and "
-             "~~track_0..~~track_(N-1) from chair accounts, before reapplying; "
-             "covers a shrunk chair roster too (default: %(default)s)",
+        help="clear ~~track_0..~~track_(N-1) from papers and from chair accounts, "
+             "before reapplying; covers a shrunk chair roster too (default: %(default)s)",
     )
     args = parser.parse_args()
     if not 0 <= args.load_tolerance < 1:
@@ -603,8 +595,7 @@ def main() -> int:
         print(f"\n=== {chair.name} <{email}>")
         print(
             f"    primary area: {chair.primary}\n"
-            f"    track: {paper_track_tag(track_number[email])} "
-            f"(account tag {account_track_tag(track_number[email])})\n"
+            f"    track: {track_tag(track_number[email])}\n"
             f"    assigned {loads[email]} papers; mean affinity {mean_label}"
         )
         for pid in pids:

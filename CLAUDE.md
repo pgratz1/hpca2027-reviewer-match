@@ -130,7 +130,7 @@ contains spaces and parentheses — always quote it in shell commands).
 - `make clear-uploads` writes the **undo half** of the two HotCRP uploads —
   `outputs/assignments/clear_assignment.csv` (one `all,clearreview,all,R1` row;
   `CLEAR_ROUND=all` widens it to every round), `clear_paper_tags.csv`
-  (`all,cleartag,,~~paper_track_N,`) and `clear_account_tags.csv`
+  (`all,cleartag,,~~track_N,`) and `clear_account_tags.csv`
   (`email,remove_tags,add_tags`, the last cell empty — **the empty column has
   to be there**: `p_profile.php`'s `save_bulk` reads a first line holding under
   two commas as a plain list of emails unless it also passes the newer

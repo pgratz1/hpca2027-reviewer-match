@@ -50,6 +50,10 @@ from reviewer_match import pc_membership
 from reviewer_match import reviewers as reviewers_mod
 from reviewer_match import roster as roster_mod
 from reviewer_match.reviewers import Reviewer, _parse_override_cap
+from reviewer_match import assignment_io
+from reviewer_match.assignment_io import Pair
+from scripts import diff_assignments
+from scripts import fill_open_slots
 
 PCINFO_FIELDS = [
     "given_name", "family_name", "email", "affiliation", "orcid", "country",
@@ -152,18 +156,12 @@ class AreaChairTrackTagCsvTests(unittest.TestCase):
         with Path(path).open(newline="", encoding="utf-8") as f:
             return list(csv.reader(f))
 
-    def test_paper_and_account_track_tags_are_zero_indexed_and_spelled_apart(self):
-        # Both the paper tag and the account grant stay `~~` so both are
-        # chair-only; they still spell apart (`paper_track_N` vs `track_N`)
-        # so a stray in one namespace never gets excluded as canonical in
-        # the other.
-        self.assertEqual("~~paper_track_0", assign_area_chairs.paper_track_tag(0))
-        self.assertEqual("~~paper_track_23", assign_area_chairs.paper_track_tag(23))
-        self.assertEqual("~~track_0", assign_area_chairs.account_track_tag(0))
-        self.assertEqual("~~track_23", assign_area_chairs.account_track_tag(23))
-        self.assertNotEqual(
-            assign_area_chairs.paper_track_tag(0), assign_area_chairs.account_track_tag(0)
-        )
+    def test_paper_and_account_track_tags_are_zero_indexed_and_spelled_alike(self):
+        # The paper tag and the account grant are the same `~~track_N`
+        # spelling in both HotCRP namespaces -- only the object it tags
+        # (paper vs. account) differs.
+        self.assertEqual("~~track_0", assign_area_chairs.track_tag(0))
+        self.assertEqual("~~track_23", assign_area_chairs.track_tag(23))
 
     def test_account_tag_csv_is_sorted_by_email_and_uses_safe_add_remove_columns(self):
         track_number = {"b@example.com": 1, "a@example.com": 0}
@@ -218,9 +216,9 @@ class AreaChairTrackTagCsvTests(unittest.TestCase):
         self.assertEqual(
             [
                 ["paper", "action", "email", "tag", "round"],
-                ["1", "tag", "", "~~paper_track_0", ""],
-                ["5", "tag", "", "~~paper_track_1", ""],
-                ["20", "tag", "", "~~paper_track_1", ""],
+                ["1", "tag", "", "~~track_0", ""],
+                ["5", "tag", "", "~~track_1", ""],
+                ["20", "tag", "", "~~track_1", ""],
             ],
             rows,
         )
@@ -235,10 +233,10 @@ class AreaChairTrackTagCsvTests(unittest.TestCase):
         self.assertEqual(
             [
                 ["paper", "action", "email", "tag", "round"],
-                ["all", "cleartag", "", "~~paper_track_0", ""],
-                ["all", "cleartag", "", "~~paper_track_1", ""],
-                ["all", "cleartag", "", "~~paper_track_2", ""],
-                ["1", "tag", "", "~~paper_track_0", ""],
+                ["all", "cleartag", "", "~~track_0", ""],
+                ["all", "cleartag", "", "~~track_1", ""],
+                ["all", "cleartag", "", "~~track_2", ""],
+                ["1", "tag", "", "~~track_0", ""],
             ],
             rows,
         )
@@ -1656,6 +1654,369 @@ class SurplusDistributionTests(unittest.TestCase):
             )
         self.assertEqual(0, placed)
         self.assertIn("17 reviewer-slot(s) left unspent", buf.getvalue())
+
+    def test_reviewer_assignments_report_lists_papers_alphabetically_by_name(self):
+        papers = [
+            {"pid": 1, "title": "Paper One"},
+            {"pid": 2, "title": "Paper Two"},
+        ]
+        reviewer_papers = {"b@example.com": [1, 2], "a@example.com": [1]}
+        reviewers_by_email = {
+            "b@example.com": argparse.Namespace(name="Bob", primary="Memory", tier="full"),
+            "a@example.com": argparse.Namespace(name="Alice", primary="Memory", tier="light"),
+        }
+        affinity_lookup = {
+            ("b@example.com", 1): 0.5, ("b@example.com", 2): 0.9,
+            ("a@example.com", 1): 0.7,
+        }
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            assign_reviewers.reviewer_assignments_report(
+                papers, reviewer_papers, reviewers_by_email, affinity_lookup, None,
+            )
+        out = buf.getvalue()
+        # Alice sorts before Bob alphabetically, regardless of dict insertion order.
+        self.assertLess(out.index("Alice"), out.index("Bob"))
+        # Bob's own papers rank by score descending: [2] (0.900) before [1] (0.500).
+        bob_block = out[out.index("Bob"):]
+        self.assertLess(bob_block.index("[2] Paper Two"), bob_block.index("[1] Paper One"))
+        self.assertIn("2 paper(s)", out)
+
+
+class AssignmentIoTests(unittest.TestCase):
+    def write_hotcrp_csv_fixture(self, path, rows):
+        with Path(path).open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(list(assignment_io.HOTCRP_CSV_HEADER))
+            writer.writerow(["all", "clearreview", "all", "R1"])
+            for pid, email in rows:
+                writer.writerow([pid, "primaryreview", email, "R1"])
+
+    def test_sniff_format_rejects_an_unknown_header(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bad.csv"
+            path.write_text("a,b,c\n1,2,3\n", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                assignment_io.sniff_format(str(path))
+
+    def test_load_assignment_pairs_skips_the_clearreview_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "assignment.csv"
+            self.write_hotcrp_csv_fixture(path, [(1, "a@example.com"), (1, "b@example.com")])
+            fmt, pairs = assignment_io.load_assignment_pairs(str(path))
+        self.assertEqual("hotcrp", fmt)
+        self.assertEqual({"a@example.com", "b@example.com"}, set(pairs[1]))
+
+    def test_load_assignment_pairs_skips_non_primaryreview_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "assignment.csv"
+            with path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(list(assignment_io.HOTCRP_CSV_HEADER))
+                writer.writerow(["all", "clearreview", "all", "R1"])
+                writer.writerow([1, "secondaryreview", "c@example.com", "R1"])
+                writer.writerow([1, "primaryreview", "a@example.com", "R1"])
+            fmt, pairs = assignment_io.load_assignment_pairs(str(path))
+        self.assertEqual({"a@example.com"}, set(pairs[1]))
+
+    def test_round_trips_write_hotcrp_csv(self):
+        slates = {1: ["a@example.com", "b@example.com"]}
+        scores = {("a@example.com", 1): 0.9, ("b@example.com", 1): 0.5}
+        reviewers_by_email = {e: reviewer_with_email(e) for e in slates[1]}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "assignment.csv"
+            assign_reviewers.write_hotcrp_csv(str(path), slates, scores, reviewers_by_email)
+            fmt, pairs = assignment_io.load_assignment_pairs(str(path))
+        self.assertEqual("hotcrp", fmt)
+        self.assertEqual({"a@example.com", "b@example.com"}, set(pairs[1]))
+
+    def test_round_trips_write_pairs_csv(self):
+        slates = {1: ["a@example.com"]}
+        assigned_via = {(1, "a@example.com"): "fill"}
+        scores = {("a@example.com", 1): 0.75}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "pairs.csv"
+            assign_reviewers.write_pairs_csv(str(path), slates, assigned_via, scores, scores)
+            fmt, pairs = assignment_io.load_assignment_pairs(str(path))
+        self.assertEqual("pairs", fmt)
+        self.assertEqual("fill", pairs[1]["a@example.com"].phase)
+        self.assertAlmostEqual(0.75, pairs[1]["a@example.com"].affinity)
+
+    def test_hotcrp_email_map_and_remap_pairs(self):
+        reviewers_by_email = {
+            "form@example.com": reviewer_with_email("form@example.com", hotcrp_email="real@other.edu"),
+            "same@example.com": reviewer_with_email("same@example.com"),
+        }
+        email_map = assignment_io.hotcrp_email_map(reviewers_by_email)
+        self.assertEqual(
+            {"form@example.com": "real@other.edu", "same@example.com": "same@example.com"}, email_map
+        )
+        pairs = {1: {"form@example.com": Pair(), "unknown@example.com": Pair()}}
+        remapped = assignment_io.remap_pairs(pairs, email_map)
+        self.assertEqual({"real@other.edu", "unknown@example.com"}, set(remapped[1]))
+
+
+class DiffAssignmentsTests(unittest.TestCase):
+    def test_identical_files_have_zero_churn(self):
+        old = {1: {"a@example.com": Pair()}, 2: {"b@example.com": Pair()}}
+        new = {1: {"a@example.com": Pair()}, 2: {"b@example.com": Pair()}}
+        changed, load_delta = diff_assignments.diff_pairs(old, new)
+        self.assertEqual({}, changed)
+        self.assertEqual(Counter(), load_delta)
+
+    def test_added_and_removed_are_detected(self):
+        old = {1: {"a@example.com": Pair()}}
+        new = {1: {"b@example.com": Pair()}}
+        changed, load_delta = diff_assignments.diff_pairs(old, new)
+        self.assertEqual(({"a@example.com"}, {"b@example.com"}), changed[1])
+        self.assertEqual(-1, load_delta["a@example.com"])
+        self.assertEqual(1, load_delta["b@example.com"])
+
+    def test_reviewer_lineup_changes_finds_a_net_zero_swap_load_delta_misses(self):
+        # a@example.com loses pid 1 and gains pid 2 -- net load delta 0, but
+        # their actual paper lineup is entirely different.
+        old = {1: {"a@example.com": Pair()}, 2: {}}
+        new = {1: {}, 2: {"a@example.com": Pair()}}
+        changed, load_delta = diff_assignments.diff_pairs(old, new)
+        self.assertEqual(0, load_delta["a@example.com"])
+        lineups = diff_assignments.reviewer_lineup_changes(changed)
+        self.assertEqual(({1}, {2}), lineups["a@example.com"])
+
+    def test_reviewer_lineup_changes_distinguishes_gained_only_from_lost_only(self):
+        old = {1: {"lost@example.com": Pair()}, 2: {}}
+        new = {1: {}, 2: {"gained@example.com": Pair()}}
+        changed, _ = diff_assignments.diff_pairs(old, new)
+        lineups = diff_assignments.reviewer_lineup_changes(changed)
+        self.assertEqual(({1}, set()), lineups["lost@example.com"])
+        self.assertEqual((set(), {2}), lineups["gained@example.com"])
+        self.assertNotIn("untouched@example.com", lineups)
+
+    def test_normalization_prevents_false_churn_across_hotcrp_and_roster_email(self):
+        # Same reviewer, one file keyed on hotcrp_email (a hotcrp-csv), the
+        # other on the roster email (a pairs-csv) -- comparing raw would read
+        # as one reviewer leaving and a different one arriving.
+        old = {1: {"real@other.edu": Pair()}}
+        new = {1: {"form@example.com": Pair()}}
+        email_map = {"form@example.com": "real@other.edu"}
+        normalized_old = assignment_io.remap_pairs(old, {})
+        normalized_new = assignment_io.remap_pairs(new, email_map)
+        changed, _ = diff_assignments.diff_pairs(normalized_old, normalized_new)
+        self.assertEqual({}, changed)
+        changed_raw, _ = diff_assignments.diff_pairs(old, new)
+        self.assertEqual(({"real@other.edu"}, {"form@example.com"}), changed_raw[1])
+
+    def test_goodness_delta_uses_paper_goodness_and_skips_unscored_papers(self):
+        changed = {
+            1: (set(), {"a@example.com"}),
+            2: (set(), {"b@example.com"}),
+        }
+        old = {
+            1: {"old-a@example.com": Pair(affinity=0.6)},
+            2: {"old-b@example.com": Pair(affinity=0.5)},
+        }
+        new = {
+            1: {"old-a@example.com": Pair(affinity=0.6), "a@example.com": Pair(affinity=1.0)},
+            2: {"old-b@example.com": Pair(affinity=0.5), "b@example.com": Pair(affinity=None)},
+        }
+        scorable, skipped = diff_assignments.goodness_delta(changed, old, new)
+        self.assertEqual([2], skipped)
+        self.assertAlmostEqual(0.2, scorable[1])  # old mean 0.6 -> new mean (0.6+1.0)/2 = 0.8
+
+    def test_backfill_affinity_matches_the_cached_cosine(self):
+        pairs = {1: {"a@example.com": Pair()}}
+        paper_cache = {"1": {"vector": [1.0, 0.0]}}
+        reviewer_fp = {"a@example.com": {"vector": [1.0, 0.0]}}
+        backfilled, misses = diff_assignments.backfill_affinity(pairs, paper_cache, reviewer_fp)
+        self.assertEqual(0, misses)
+        self.assertAlmostEqual(1.0, backfilled[1]["a@example.com"].affinity, places=5)
+
+    def test_backfill_affinity_counts_a_missing_fingerprint_without_crashing(self):
+        pairs = {1: {"a@example.com": Pair()}}
+        backfilled, misses = diff_assignments.backfill_affinity(pairs, {}, {})
+        self.assertEqual(1, misses)
+        self.assertIsNone(backfilled[1]["a@example.com"].affinity)
+
+
+class FillOpenSlotsTests(unittest.TestCase):
+    def test_target_uses_the_baseline_slate_size_not_reviewers_per_paper(self):
+        # A 6-reviewer paper (a surplus pick already placed) loses one
+        # reviewer; the target must be 1 (6 - 5 survivors), never
+        # DEFAULT_REVIEWERS_PER_PAPER (5) - 5 = 0, which would silently skip
+        # refilling a paper that still has an open slot.
+        baseline_pairs = {
+            1: {e: Pair() for e in [
+                "r1@example.com", "r2@example.com", "r3@example.com",
+                "r4@example.com", "r5@example.com", "removed@example.com",
+            ]},
+        }
+        reviewers_by_email = {
+            f"r{i}@example.com": reviewer_with_email(f"r{i}@example.com") for i in range(1, 6)
+        }
+        slates, target = fill_open_slots.seed_slates_and_targets(
+            baseline_pairs, [1], reviewers_by_email, "removed@example.com"
+        )
+        self.assertEqual(1, target[1])
+        self.assertEqual(5, len(slates[1]))
+        self.assertNotIn("removed@example.com", slates[1])
+
+    def test_a_survivor_no_longer_on_the_roster_also_opens_a_slot(self):
+        baseline_pairs = {1: {e: Pair() for e in ["stays@example.com", "gone@example.com"]}}
+        reviewers_by_email = {"stays@example.com": reviewer_with_email("stays@example.com")}
+        slates, target = fill_open_slots.seed_slates_and_targets(baseline_pairs, [1], reviewers_by_email, None)
+        self.assertEqual(["stays@example.com"], slates[1])
+        self.assertEqual(1, target[1])
+
+    def test_derive_orphaned_pids_splits_by_current_paper_selection(self):
+        baseline_pairs = {
+            1: {"removed@example.com": Pair()},
+            2: {"removed@example.com": Pair()},
+            3: {"other@example.com": Pair()},
+        }
+        orphaned, dropped = fill_open_slots.derive_orphaned_pids(
+            baseline_pairs, "removed@example.com", current_pids={1, 3}
+        )
+        self.assertEqual([1], orphaned)
+        self.assertEqual([2], dropped)
+
+    def test_seed_used_excludes_only_the_removed_reviewers_own_rows(self):
+        baseline_pairs = {
+            1: {"a@example.com": Pair(), "removed@example.com": Pair()},
+            2: {"a@example.com": Pair()},
+        }
+        used = fill_open_slots.seed_used(baseline_pairs, "removed@example.com", current_pids={1, 2})
+        self.assertEqual(2, used["a@example.com"])
+        self.assertNotIn("removed@example.com", used)
+
+    def test_seed_used_excludes_pairs_on_a_paper_no_longer_selected(self):
+        # A withdrawn/desk-rejected paper frees its reviewers' capacity --
+        # counting their obligation on a paper that no longer exists would
+        # hide exactly the free capacity its removal creates.
+        baseline_pairs = {
+            1: {"a@example.com": Pair()},
+            2: {"a@example.com": Pair()},  # pid 2 has since dropped out
+        }
+        used = fill_open_slots.seed_used(baseline_pairs, None, current_pids={1})
+        self.assertEqual(1, used["a@example.com"])
+
+    def test_still_on_roster_requires_force_to_proceed(self):
+        reviewers_by_email = {"present@example.com": reviewer_with_email("present@example.com")}
+        self.assertTrue(fill_open_slots.still_on_roster("present@example.com", reviewers_by_email, force=False))
+        self.assertFalse(fill_open_slots.still_on_roster("present@example.com", reviewers_by_email, force=True))
+        self.assertFalse(fill_open_slots.still_on_roster("absent@example.com", reviewers_by_email, force=False))
+
+    def test_check_pid_containment_flags_a_pid_outside_the_orphaned_set(self):
+        self.assertEqual([99], fill_open_slots.check_pid_containment([1, 99], orphaned_set={1, 2}))
+        self.assertEqual([], fill_open_slots.check_pid_containment([1, 2], orphaned_set={1, 2}))
+
+    def test_check_reviewer_caps_flags_only_reviewers_over_their_own_tier_cap(self):
+        reviewers_by_email = {
+            "light@example.com": reviewer_with_email("light@example.com"),
+            "full@example.com": reviewer_with_email("full@example.com"),
+        }
+        reviewers_by_email["light@example.com"].tier = "light"
+        reviewers_by_email["full@example.com"].tier = "full"
+        used = {"light@example.com": 8, "full@example.com": 8}
+        over = fill_open_slots.check_reviewer_caps(used, reviewers_by_email, light_cap=7, full_cap=15, reserve_cap=6)
+        self.assertEqual(["light@example.com"], over)
+
+    def test_check_hard_class_caps_flags_a_paper_over_its_country_cap(self):
+        cn = frozenset({"a@example.com", "b@example.com"})
+        capped = [(cn, {1: 1})]
+        slates = {1: ["a@example.com", "b@example.com"]}
+        violations = fill_open_slots.check_hard_class_caps(slates, [1], capped)
+        self.assertEqual({1: [0]}, violations)
+
+    def test_a_candidate_already_at_cap_elsewhere_is_never_picked_despite_scoring_highest(self):
+        # seed_used correctly reflects a candidate's baseline load on OTHER
+        # papers, so assignment_phase must respect it even though this run
+        # only ever scores the one orphaned paper.
+        baseline_pairs = {
+            2: {"maxed@example.com": Pair()},
+            3: {"maxed@example.com": Pair()},
+        }
+        used = fill_open_slots.seed_used(baseline_pairs, None, current_pids={2, 3})
+        reviewer_cap = {"maxed@example.com": 2, "fresh@example.com": 5}
+        score_lookup = {("maxed@example.com", 1): 0.99, ("fresh@example.com", 1): 0.10}
+        prefs = {1: ["maxed@example.com", "fresh@example.com"]}
+        held, _, _ = assign_reviewers.assignment_phase(
+            [1], prefs, {1: 1}, {1: []}, used, reviewer_cap, score_lookup, set(reviewer_cap),
+        )
+        self.assertEqual(["fresh@example.com"], held[1])
+
+    def test_a_paper_whose_survivors_already_hold_the_junior_cap_skips_a_top_scoring_junior(self):
+        baseline_pairs = {1: {"survivor-jr@example.com": Pair(), "removed@example.com": Pair()}}
+        reviewers_by_email = {"survivor-jr@example.com": reviewer_with_email("survivor-jr@example.com")}
+        slates, target = fill_open_slots.seed_slates_and_targets(
+            baseline_pairs, [1], reviewers_by_email, "removed@example.com"
+        )
+        self.assertEqual(1, target[1])
+        juniors = frozenset({"survivor-jr@example.com", "new-jr@example.com"})
+        reviewer_cap = {"new-jr@example.com": 5, "senior@example.com": 5}
+        score_lookup = {("new-jr@example.com", 1): 0.95, ("senior@example.com", 1): 0.10}
+        prefs = {1: ["new-jr@example.com", "senior@example.com"]}
+        used = fill_open_slots.seed_used({}, None, current_pids=set())
+        held, _, _ = assign_reviewers.assignment_phase(
+            [1], prefs, {1: target[1]}, slates, used, reviewer_cap, score_lookup, set(reviewer_cap),
+            [(juniors, 1)],
+        )
+        self.assertEqual(["senior@example.com"], held[1])
+
+    def test_write_merged_hotcrp_csv_copies_non_orphaned_rows_verbatim(self):
+        baseline_pairs = {
+            1: {"x@example.com": Pair()},
+            2: {"survivor@example.com": Pair()},
+        }
+        slates = {2: ["survivor@example.com", "new@example.com"]}
+        reviewers_by_email = {
+            "survivor@example.com": reviewer_with_email("survivor@example.com"),
+            "new@example.com": reviewer_with_email("new@example.com", hotcrp_email="real-new@other.edu"),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "merged.csv"
+            fill_open_slots.write_merged_hotcrp_csv(str(path), baseline_pairs, {2}, slates, reviewers_by_email)
+            fmt, pairs = assignment_io.load_assignment_pairs(str(path))
+        self.assertEqual({"x@example.com"}, set(pairs[1]))
+        self.assertEqual({"survivor@example.com", "real-new@other.edu"}, set(pairs[2]))
+
+    def test_removed_email_still_on_roster_is_refused_without_force(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            baseline = Path(tmp) / "baseline.csv"
+            with baseline.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(list(assignment_io.HOTCRP_CSV_HEADER))
+                writer.writerow(["all", "clearreview", "all", "R1"])
+                writer.writerow([1, "primaryreview", "still-here@example.com", "R1"])
+            data = Path(tmp) / "data.json"
+            data.write_text(json.dumps([
+                {"pid": 1, "title": "T", "abstract": "one two three. four five six.",
+                 "authors": [], "status": "submitted", "topics": []},
+            ]), encoding="utf-8")
+            form = Path(tmp) / "form.csv"
+            with form.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "Timestamp", "Please confirm your HotCRP email address", "PC membership",
+                    "First Name", "Last Name", "Enter your DBLP Link",
+                    "institutional affiliation", "primary area", "secondary area",
+                    "tertiary area", "keywords", "Override paper assignment number",
+                ])
+                writer.writerow([
+                    "07/01/2026 10:00:00", "still-here@example.com",
+                    "Yes, I accept as a full PC member", "Ada", "Lovelace", "none",
+                    "Example", "Memory", "", "", "", "",
+                ])
+            with (
+                mock.patch.object(sys, "argv", [
+                    "fill_open_slots.py", "--baseline", str(baseline), "--data", str(data),
+                    "--csv", str(form), "--no-pc-check", "--paper-policy", "submitted",
+                    "--removed-email", "still-here@example.com",
+                    "--no-seniority", "--no-area-chair-exclusion",
+                ]),
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                fill_open_slots.main()
+            self.assertEqual(2, raised.exception.code)
 
 
 class ClassificationTests(unittest.TestCase):
@@ -5284,14 +5645,14 @@ class ClearUploadTests(unittest.TestCase):
         rows = self.run_generator([pc_account("a@x.edu")],
                                   extra_argv=["--track-clear-ceiling", "3"])["paper"]
         self.assertEqual([["paper", "action", "email", "tag", "round"],
-                          ["all", "cleartag", "", "~~paper_track_0", ""],
-                          ["all", "cleartag", "", "~~paper_track_1", ""],
-                          ["all", "cleartag", "", "~~paper_track_2", ""]], rows)
+                          ["all", "cleartag", "", "~~track_0", ""],
+                          ["all", "cleartag", "", "~~track_1", ""],
+                          ["all", "cleartag", "", "~~track_2", ""]], rows)
 
     def test_a_hand_made_track_tag_outside_the_range_is_cleared_too(self):
         # `track1` is live on a past export, left behind by setting the
-        # track mechanism up by hand; clearing only `~~paper_track_N` would
-        # strand it.
+        # track mechanism up by hand; clearing only the canonical `~~track_N`
+        # range would strand it.
         rows = self.run_generator(
             [pc_account("a@x.edu")],
             papers=[{"pid": 1, "tags": ["track1#0"]}],
@@ -5300,9 +5661,11 @@ class ClearUploadTests(unittest.TestCase):
         self.assertIn(["all", "cleartag", "", "track1", ""], rows)
 
     def test_an_out_of_range_paper_track_tag_is_cleared_too(self):
-        # A chair-roster shrink can leave a paper carrying a track number
-        # above the current ceiling; it must still be recognized and swept,
-        # the same way a hand-made spelling is.
+        # `~~paper_track_N` was this repo's own paper-tag spelling before the
+        # paper and account namespaces were unified onto `~~track_N`; a
+        # paper tagged that way by an older run must still be recognized and
+        # swept, the same way an out-of-range number or a hand-made spelling
+        # is.
         rows = self.run_generator(
             [pc_account("a@x.edu")],
             papers=[{"pid": 1, "tags": ["~~paper_track_47#0"]}],
@@ -5373,13 +5736,10 @@ class ClearUploadTests(unittest.TestCase):
         )["account"]
         self.assertNotIn("~~area-chairs", rows[1][1])
 
-    def test_the_tag_spellings_come_from_the_installing_script(self):
+    def test_the_tag_spelling_comes_from_the_installing_script(self):
         # One definition, or a clearing file silently misses the tag it is
         # meant to remove.
-        self.assertIs(generate_clear_uploads.paper_track_tag,
-                      assign_area_chairs.paper_track_tag)
-        self.assertIs(generate_clear_uploads.account_track_tag,
-                      assign_area_chairs.account_track_tag)
+        self.assertIs(generate_clear_uploads.track_tag, assign_area_chairs.track_tag)
 
 
 if __name__ == "__main__":
