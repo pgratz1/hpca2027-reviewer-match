@@ -13,10 +13,10 @@ dblp_overrides.csv for the PC.
 
 A DBLP link that belongs to the wrong person is worse than no link at all: it
 silently fingerprints a stranger and matches papers to them. So a row is only
-written to the roster if it survives every check below; anything doubtful goes
-to `reserve_reviewer_unresolved.csv` with the reason, which is the to-do list
-for hand resolution. Both files are sorted by email, so re-running against a
-grown HotCRP export produces a readable diff.
+written to the roster with a real DBLP link if it survives every check below;
+anything doubtful goes to `reserve_reviewer_unresolved.csv` with the reason,
+which is the to-do list for hand resolution. Both files are sorted by email,
+so re-running against a grown HotCRP export produces a readable diff.
 
   no_dblp_url    the workbook's dblp_url cell is empty
   not_in_vetting the uploaded email has no row in the workbook at all
@@ -30,6 +30,22 @@ grown HotCRP export produces a readable diff.
                  person holds two HotCRP accounts and would draw double the
                  reviews. Both claimants are held back; which it is, is a call
                  for the chair, not for this script
+
+`withheld` (override cell "none"/"-"/"n/a"/"unknown") is different from the
+rest: it is not pending work, it is the chair's own conclusion that no DBLP
+page can be trusted for this person right now -- most often a name too common
+to disambiguate (DBLP not yet having split their real papers out from a
+same-named cluster, so every candidate PID either drags in a stranger's work
+or contains none of theirs). Punishing that conclusion by dropping a sitting
+reserve reviewer mid-cycle costs more than it protects, so a withheld row
+still reaches the roster, with a blank `dblp` cell instead of a link.
+`load_reserve_reviewers` reads that as no PID, and `build_fingerprints.py`'s
+existing area-only fallback takes over -- weaker than a real publication
+history, but not a stranger's, and not nothing: `reserve_area_overrides.csv`
+can supply a hand-corrected primary/secondary/tertiary to fingerprint from
+instead of whatever their own papers' topics derive. Every other unresolved
+reason still means genuinely absent from the roster -- those are open
+questions, not settled ones.
 
     python -m scripts.build_reserve_reviewer_info
     python -m scripts.build_reserve_reviewer_info --verify     # check PIDs against DBLP
@@ -50,6 +66,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from reviewer_match.dblp import name_tokens, parse_pid
+from reviewer_match.reserve_reviewers import DEFAULT_AREA_OVERRIDES
 
 DEFAULT_UPLOAD = input_path("reserve_reviewer_upload.csv")
 DEFAULT_VETTING = input_path("reserve_reviewers_vetting_final.xlsx")
@@ -482,6 +499,11 @@ def main() -> int:
             roster.append(
                 {"email": email, "name": row["name"], "dblp": pid_url(row["pid"])}
             )
+        elif row["problem"] == "withheld":
+            # A settled "no trustworthy DBLP page" conclusion, not open work --
+            # stays on the roster with a blank link so build_fingerprints.py's
+            # area-only fallback covers them instead of dropping them entirely.
+            roster.append({"email": email, "name": row["name"], "dblp": ""})
         else:
             unresolved.append({
                 "email": email, "name": row["name"], "dblp_url": row["raw"],
@@ -491,7 +513,17 @@ def main() -> int:
     write_csv(args.out, ROSTER_FIELDS, roster)
     write_csv(args.unresolved, UNRESOLVED_FIELDS, unresolved)
 
+    withheld_kept = [r for r in roster if not r["dblp"]]
     print(f"\n{len(roster)} resolved -> {args.out}", file=sys.stderr)
+    if withheld_kept:
+        one = len(withheld_kept) == 1
+        print(
+            f"    {len(withheld_kept)} of those {'has' if one else 'have'} no DBLP link "
+            f"(withheld by hand) and {'is' if one else 'are'} matched by declared area "
+            f"only, not publications; a {DEFAULT_AREA_OVERRIDES} row can improve on the "
+            f"derived areas: {', '.join(sorted(r['email'] for r in withheld_kept))}",
+            file=sys.stderr,
+        )
     if unresolved:
         # "excluded" is a decision already made, so it is not outstanding work
         # and must not be counted as such -- otherwise the report never reaches

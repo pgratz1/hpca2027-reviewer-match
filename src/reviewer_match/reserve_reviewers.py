@@ -38,10 +38,24 @@ import json
 
 from . import pc_membership
 from .dblp import parse_pid
-from .reviewers import DEFAULT_CAP_OVERRIDES, Reviewer, load_cap_overrides
+from .reviewers import DEFAULT_CAP_OVERRIDES, Reviewer, load_area_overrides, load_cap_overrides
 
 DEFAULT_INFO = report_path("reserve_reviewer_info.csv")
 DEFAULT_DATA = input_path("hpca2027-data.json")
+
+# Hand-maintained area override for a reserve whose derived areas (see
+# index_topics/top_areas below) misrepresent them -- HotCRP's topic list has
+# no entry for some specialties (fully homomorphic encryption, for one), so a
+# reserve who works in one of those gets folded into whatever topic their own
+# papers were tagged with instead, which can be too broad (a crypto-adjacent
+# "Security" tag pulling in unrelated side-channel-attack papers) or drop a
+# real area entirely (a frequency tie-break losing "GPUs"). Unlike the PC's
+# pc_area_overrides.csv, this is not "no HotCRP topic interest set" -- a
+# reserve never has topic interests to fall back on at all, and the row here
+# is a correction, not a first source. Same file shape reviewers.py already
+# reads (email,primary,secondary,tertiary,note), reused rather than
+# reimplemented.
+DEFAULT_AREA_OVERRIDES = curated_path("reserve_area_overrides.csv")
 
 # Areas kept per reserve. The gate reads primary and secondary only; the third
 # still reaches the fingerprint's area document, which is why it is collected.
@@ -114,6 +128,7 @@ def load_reserve_reviewers(
     max_areas: int = DEFAULT_MAX_AREAS,
     pcinfo_path: str | None = pc_membership.DEFAULT_PCINFO,
     cap_overrides_path: str = DEFAULT_CAP_OVERRIDES,
+    area_overrides_path: str = DEFAULT_AREA_OVERRIDES,
 ) -> list[Reviewer]:
     """Load the reserve roster, deriving each one's areas from their papers.
 
@@ -123,6 +138,11 @@ def load_reserve_reviewers(
     withdrawn or still-draft paper says just as much about their expertise, and
     filtering by policy left three of them with no areas at all and so gated out
     of everything.
+
+    A `reserve_area_overrides.csv` row for the email wins over the derived
+    topics entirely (a hand decision always outranks a derived guess, the
+    same precedence `dblp_overrides.csv` has over the form's own DBLP
+    column) -- see DEFAULT_AREA_OVERRIDES for when that is needed.
 
     Reserves are checked against the HotCRP user export the same way PC members
     are, and it matters more here: a recruit who is later stood down keeps the
@@ -149,6 +169,7 @@ def load_reserve_reviewers(
         rows = list(csv.DictReader(f))
     index = pc_membership.load_pc_accounts(pcinfo_path) if pcinfo_path else None
     cap_overrides = load_cap_overrides(cap_overrides_path)
+    area_overrides = load_area_overrides(area_overrides_path)
 
     reserves = []
     dropped: list[str] = []
@@ -178,8 +199,12 @@ def load_reserve_reviewers(
                 else:
                     tier = acct.pc_tier
                     promoted.append((email, tier))
-        topics = authored.get(email) or nominated.get(email) or Counter()
-        areas = top_areas(topics, max_areas)
+        override = area_overrides.get(email)
+        if override:
+            areas = list(override)
+        else:
+            topics = authored.get(email) or nominated.get(email) or Counter()
+            areas = top_areas(topics, max_areas)
         areas += [""] * (3 - len(areas))
         affiliation = affiliations.get(email)
         dblp_url = (row.get("dblp") or "").strip()
