@@ -133,6 +133,21 @@ AREA_CHAIR_ACCOUNT_TAGS = $(ASSIGNMENT_DIR)/area_chair_account_tags.csv
 AREA_CHAIR_PAPER_TAGS = $(ASSIGNMENT_DIR)/area_chair_paper_tags.csv
 AREA_CHAIR_ACCOUNT_TAGS_COMPLETE = $(ASSIGNMENT_DIR)/area_chair_account_tags-complete.csv
 AREA_CHAIR_PAPER_TAGS_COMPLETE = $(ASSIGNMENT_DIR)/area_chair_paper_tags-complete.csv
+# The live assignment replayed out of HotCRP's action log, and the incremental
+# rerun built on top of it. Kept apart from $(ASSIGNMENT_CSV): that file is
+# what the pipeline last proposed, this one is what HotCRP actually holds, and
+# collapsing the two would lose the diff that is the whole point.
+LOG = data/inputs/hpca2027-log.csv
+CURRENT_ASSIGNMENT_CSV = $(ASSIGNMENT_DIR)/current_assignment.csv
+REVIEWER_ACTIVITY = $(REPORT_DIR)/reviewer_activity.csv
+PINNED_REVIEWERS = $(REPORT_DIR)/reviewers_pinned.txt
+RERUN_ASSIGNMENT = $(ASSIGNMENT_DIR)/assignment-rerun.txt
+RERUN_ASSIGNMENT_CSV = $(ASSIGNMENT_DIR)/assignment-rerun.csv
+# Which activity proxy decides who is left alone. `any` is the safer default:
+# it errs towards pinning, and a pin costs match quality where a wrong release
+# costs somebody the work they already started.
+ACTIVITY_SIGNAL ?= any
+
 CLEAR_ASSIGNMENT = $(ASSIGNMENT_DIR)/clear_assignment.csv
 CLEAR_PAPER_TAGS = $(ASSIGNMENT_DIR)/clear_paper_tags.csv
 CLEAR_ACCOUNT_TAGS = $(ASSIGNMENT_DIR)/clear_account_tags.csv
@@ -176,7 +191,8 @@ ASSIGN_DEPS = scripts/assign_reviewers.py src/reviewer_match/paper_matching.py \
 .DELETE_ON_ERROR:
 .PHONY: all enrich area-chairs reserve-need reserve-info reserve-pids reserves trc \
 	dblp-snapshot coauthor-coi collaborator-coi affiliation-countries pc-roster duplicates \
-	complete-papers area-chairs-complete clear-uploads baselines clean clean-fingerprints
+	complete-papers area-chairs-complete clear-uploads baselines clean clean-fingerprints \
+	log-assignments reviewer-activity rerun
 
 all: $(SENIORITY) enrich $(FINGERPRINTS)
 	$(RUN) scripts.build_fingerprints --csv "$(CSV)" --fingerprint-cache $(FINGERPRINTS)
@@ -333,6 +349,45 @@ $(ASSIGNMENT) $(ASSIGNMENT_CSV) &: $(ASSIGN_DEPS)
 		--hotcrp-csv $(ASSIGNMENT_CSV) \
 		$(RESERVE_FLAG) $(PC_CHECK) $(AREA_CHAIR_CHECK) $(REGION_FLAG) $(JUNIOR_FLAG) $(COAUTHOR_COI) $(COLLABORATOR_COI) $(EXCLUDE_FLAG) \
 		> $(ASSIGNMENT)
+
+# --- Incremental rerun ------------------------------------------------------
+# What HotCRP actually holds, replayed from its action log — manual UI edits
+# included, which no artifact under $(ASSIGNMENT_DIR) knows about. Offline,
+# instant, read-only. Prefer HotCRP's own "Download → Review assignments"
+# export when you have it; this is the reconstruction, and diffing the two
+# checks both.
+log-assignments:
+	@test -f $(LOG) || { echo "ERROR: $(LOG) not found; download the action log from HotCRP" >&2; exit 1; }
+	$(RUN) scripts.extract_log_assignments --log $(LOG) --out $(CURRENT_ASSIGNMENT_CSV)
+
+# Who has not touched their assignment since it landed. Writes the address
+# list `rerun` pins on. Note HotCRP logs no login event: this is a proxy.
+reviewer-activity:
+	@test -f $(LOG) || { echo "ERROR: $(LOG) not found; download the action log from HotCRP" >&2; exit 1; }
+	$(RUN) scripts.audit_reviewer_activity --log $(LOG) $(PC_CHECK) \
+		--signal $(ACTIVITY_SIGNAL) --out $(REVIEWER_ACTIVITY) \
+		--pinned-out $(PINNED_REVIEWERS)
+
+# Re-solve around the reviewers who have already started work: their current
+# pairs are frozen and they get nothing new, every other pair is released and
+# rematched. Writes to assignment-rerun.* and never over $(ASSIGNMENT_CSV), so
+# `make diff` against the live state stays possible. Nothing is uploaded here —
+# read the churn in the diff first.
+rerun: $(ASSIGN_DEPS) scripts/extract_log_assignments.py scripts/audit_reviewer_activity.py \
+		src/reviewer_match/hotcrp_log.py src/reviewer_match/assignment_io.py
+	$(MAKE) log-assignments reviewer-activity
+	$(RUN) scripts.assign_reviewers --paper-policy $(PAPER_POLICY) --csv "$(CSV)" \
+		--area-chair-csv "$(AREA_CHAIR_CSV)" \
+		--pin-csv $(CURRENT_ASSIGNMENT_CSV) --pin-emails $(PINNED_REVIEWERS) \
+		--hotcrp-csv $(RERUN_ASSIGNMENT_CSV) \
+		$(RESERVE_FLAG) $(PC_CHECK) $(AREA_CHAIR_CHECK) $(REGION_FLAG) $(JUNIOR_FLAG) $(COAUTHOR_COI) $(COLLABORATOR_COI) $(EXCLUDE_FLAG) \
+		> $(RERUN_ASSIGNMENT)
+	@echo "" >&2
+	@echo "Churn this rerun would cause, against what HotCRP holds today:" >&2
+	@echo "Read the goodness delta before uploading: churn that buys nothing is churn." >&2
+	@echo "Every address in $(PINNED_REVIEWERS) must show a load delta of 0 and no lineup change." >&2
+	$(RUN) scripts.diff_assignments $(CURRENT_ASSIGNMENT_CSV) $(RERUN_ASSIGNMENT_CSV) \
+		--old-label live --new-label rerun --score-affinity >&2
 
 $(COMPLETE_ASSIGNMENT) $(COMPLETE_ASSIGNMENT_CSV) &: $(ASSIGN_DEPS)
 	$(RUN) scripts.assign_reviewers --paper-policy complete --csv "$(CSV)" \

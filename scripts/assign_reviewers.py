@@ -135,6 +135,7 @@ from pathlib import Path
 import numpy as np
 
 from reviewer_match import affiliation_country
+from reviewer_match import assignment_io
 from reviewer_match import coauthor_coi
 from reviewer_match import collaborator_coi
 from reviewer_match import fingerprint as fp
@@ -511,6 +512,137 @@ def split_promoted_reserves(reserves, reviewers_by_email) -> tuple[list, list[st
 
 
 @dataclass(frozen=True)
+class Pins:
+    """A baseline assignment held fixed across this run -- see `load_pins`."""
+
+    slates: dict[int, list[str]]  # {pid: [pinned email]}, roster-email keyed
+    emails: frozenset[str]  # reviewers frozen at exactly their pinned load
+    used: dict[str, int]  # {email: pinned pairs on currently-selected papers}
+    off_paper: list[tuple[int, str]]  # pinned pairs whose paper is no longer selected
+    off_pool: list[tuple[int, str]]  # pinned pairs whose reviewer is not a candidate
+
+
+def load_pins(
+    pin_csv: str,
+    pin_emails_path: str | None,
+    reviewers_by_email: Mapping[str, object],
+    pids: Sequence[int],
+    pool: set[str],
+) -> Pins:
+    """Read a baseline assignment and decide which of its pairs this run may not move.
+
+    `pin_csv` is either assignment CSV shape; a hotcrp-shaped one is keyed on
+    `hotcrp_email` and is remapped back onto the roster address space every
+    decision here is keyed on. `pin_emails_path` is one address per line -- the
+    reviewers whose pairs are pinned -- matched against both key spaces so the
+    file `audit_reviewer_activity.py` writes (HotCRP addresses, because the log
+    speaks that way) works without a translation step. Omitting it pins every
+    pair in the file.
+
+    Anyone NOT named is released: their baseline pairs are dropped and their
+    full cap is available again, which is what lets a rerun re-seat them.
+
+    Two kinds of pinned pair cannot be honoured and are dropped and reported,
+    never silently kept: one on a paper today's selection no longer contains
+    (withdrawn, desk-rejected, or excluded), and one whose reviewer is not a
+    candidate (off the roster, an area chair, or unfingerprinted). The second
+    is the dangerous one -- their review exists in HotCRP and this run cannot
+    see it, so an upload built from the result would delete it.
+
+    A pinned reviewer with no surviving pair is still frozen, at zero. "Pinned"
+    means their slate is not this run's business; someone whose papers were all
+    withdrawn should not silently be handed a fresh full load.
+
+    `pool` is the set of reviewers this run actually scored -- the keys of
+    `PairScores.reviewer_cap`, not `candidate_emails`, which is a superset: a
+    candidate conflicted with every single paper never reaches the cap table,
+    and pinning them would put a reviewer into the phases' candidate set that
+    no phase has a preference list for.
+    """
+    _, pairs = assignment_io.load_assignment_pairs(pin_csv)
+    hotcrp_to_roster = {
+        hotcrp: roster
+        for roster, hotcrp in assignment_io.hotcrp_email_map(reviewers_by_email).items()
+    }
+    pairs = assignment_io.remap_pairs(pairs, hotcrp_to_roster)
+
+    named: set[str] | None = None
+    if pin_emails_path is not None:
+        named = set()
+        with open(pin_emails_path, encoding="utf-8") as f:
+            for line in f:
+                email = line.strip().lower()
+                if email and not email.startswith("#"):
+                    named.add(hotcrp_to_roster.get(email, email))
+
+    selected = set(pids)
+    slates: dict[int, list[str]] = {pid: [] for pid in pids}
+    used: dict[str, int] = defaultdict(int)
+    off_paper: list[tuple[int, str]] = []
+    off_pool: list[tuple[int, str]] = []
+    pinned_emails: set[str] = set(named & pool) if named is not None else set()
+
+    for pid in sorted(pairs):
+        for email in sorted(pairs[pid]):
+            if named is not None and email not in named:
+                continue
+            if pid not in selected:
+                off_paper.append((pid, email))
+                continue
+            if email not in pool:
+                off_pool.append((pid, email))
+                continue
+            slates[pid].append(email)
+            used[email] += 1
+            pinned_emails.add(email)
+
+    return Pins(
+        slates=slates,
+        emails=frozenset(pinned_emails),
+        used=dict(used),
+        off_paper=off_paper,
+        off_pool=off_pool,
+    )
+
+
+def score_pinned_pairs(
+    pins: Pins,
+    affinity: dict[tuple[str, int], float],
+    paper_cache: Mapping[str, dict],
+    candidate_emails: Sequence[str],
+    candidate_matrix: np.ndarray,
+) -> list[tuple[int, str]]:
+    """Give every pinned pair an affinity, and return the ones COI excludes.
+
+    `build_pair_scores` only scores pairs `eligible_scores` returns, and that
+    function is where COI is applied -- so a pinned pair missing from the table
+    is missing for exactly one reason: some COI layer excludes it. It is a real
+    review that exists in HotCRP today, placed by hand or before a layer was
+    added, and dropping it would delete somebody's work; keeping it unscored
+    would crash every report that averages a slate. So it is scored here, with
+    the same cosine `eligible_scores` would have computed, and returned so the
+    caller can name it.
+
+    Adding a key cannot make the pair selectable: candidacy comes from the
+    `eligible`/`released` preference lists, which this does not touch. Under
+    `--score-mode specter2` `rank` IS this dict, and a pinned pair having a
+    rank it is never ranked by is harmless; pins are refused under the other
+    modes, where the two dicts differ.
+    """
+    index = {email: i for i, email in enumerate(candidate_emails)}
+    conflicted: list[tuple[int, str]] = []
+    for pid, slate in pins.slates.items():
+        missing = [e for e in slate if (e, pid) not in affinity]
+        if not missing:
+            continue
+        paper_vec = np.array(paper_cache[str(pid)]["vector"], dtype=np.float32)
+        for email in missing:
+            affinity[(email, pid)] = float(candidate_matrix[index[email]] @ paper_vec)
+            conflicted.append((pid, email))
+    return conflicted
+
+
+@dataclass(frozen=True)
 class SeniorityPools:
     seniors: frozenset[str]
     almost_seniors: frozenset[str]  # typical-class, window_total >= threshold
@@ -653,9 +785,15 @@ def distribute_surplus(
         return added, rounds
 
     candidates = set(reviewer_cap)
+    # The upper bound is the same ceiling the loop below enforces after each
+    # round, applied once up front as well. Without pins nothing reaches this
+    # stage already at the ceiling, so it changes no production run; with them
+    # a paper whose pinned slate is already `base + surplus` would otherwise be
+    # offered one more slot before the post-round check could discard it.
     eligible = {
         pid for pid in pids
-        if base_target[pid] > 0 and len(slates[pid]) >= base_target[pid]
+        if base_target[pid] > 0
+        and base_target[pid] <= len(slates[pid]) < base_target[pid] + surplus_per_paper
     }
     while eligible:
         spare = spare_capacity(reviewer_cap, used)
@@ -887,7 +1025,10 @@ def match_goodness_report(
             print(f"    n/a  [{p['pid']}] {p['title']}")
 
 
-UNRELAXED_PHASES = frozenset({"senior anchor", "fill"})
+# "pinned" belongs here: a pair carried in from --pin-csv was not relaxed by
+# this run, and whatever the run that placed it had to relax is that run's
+# report to make. Leaving it out would file every pinned pair as a relaxation.
+UNRELAXED_PHASES = frozenset({"senior anchor", "fill", "pinned"})
 
 # Surplus picks get their own report, so the relaxation report stays a list of
 # papers that struggled. "surplus (area released)" really is an area release,
@@ -1779,6 +1920,21 @@ def main() -> int:
              "is written even when the slate is short"
     )
     parser.add_argument(
+        "--pin-csv", metavar="PATH",
+        help="an existing assignment (--hotcrp-csv or --pairs-csv shape) to hold "
+             "fixed: the pairs it records for the reviewers named by --pin-emails "
+             "survive this run untouched, and those reviewers receive nothing new. "
+             "Every other pair in it is released and re-solved. Use with "
+             "scripts/extract_log_assignments.py to rerun around the reviewers who "
+             "have already started work"
+    )
+    parser.add_argument(
+        "--pin-emails", metavar="PATH",
+        help="one address per line: the reviewers whose --pin-csv pairs are pinned "
+             "(default: all of them). scripts/audit_reviewer_activity.py writes this "
+             "file"
+    )
+    parser.add_argument(
         "--seniority", default=DEFAULT_SENIORITY,
         help="reviewer seniority CSV from classify_reviewers.py (default: %(default)s)"
     )
@@ -1928,6 +2084,18 @@ def main() -> int:
     if args.score_mode == "specter2" and args.score_seed != DEFAULT_SCORE_SEED:
         print("Warning: --score-seed has no effect under --score-mode specter2",
               file=sys.stderr)
+    if args.pin_emails and not args.pin_csv:
+        parser.error("--pin-emails names who to pin; --pin-csv says what they hold")
+    if args.pin_csv and args.score_mode != "specter2":
+        parser.error(
+            f"--score-mode {args.score_mode} is a measurement baseline; pinning a real "
+            f"assignment into one mixes a live slate with noise and measures neither"
+        )
+    if args.pin_csv and args.no_seniority:
+        parser.error(
+            "--pin-csv needs the seniority phases: --no-seniority solves in one "
+            "unseeded pass and has nowhere to hold a pinned slate"
+        )
 
     seniority: dict[str, dict] | None = None
     if not args.no_seniority:
@@ -2262,6 +2430,53 @@ def main() -> int:
     # A surplus slot rides on top of it and is never folded in.
     paper_target = {pid: args.reviewers_per_paper for pid in pids}
     slate_ceiling = args.reviewers_per_paper + args.surplus_per_paper
+
+    # An incremental rerun: hold a baseline's pairs fixed and re-solve around
+    # them. The freeze is `reviewer_cap = used`, so `assignment_phase` computes
+    # a remaining capacity of zero for a pinned reviewer and never offers them
+    # again -- no phase needs a new code path, and the pinned slates simply
+    # seed the ones every phase already accumulates into.
+    pins: Pins | None = None
+    if args.pin_csv:
+        try:
+            pins = load_pins(args.pin_csv, args.pin_emails, reviewers_by_email,
+                             pids, set(reviewer_cap))
+        except (OSError, ValueError) as exc:
+            print(f"ERROR: cannot read the pinned assignment: {exc}", file=sys.stderr)
+            return 1
+        pinned_conflicts = score_pinned_pairs(
+            pins, affinity_lookup, paper_cache, candidate_emails, candidate_matrix
+        )
+        pinned_pairs = sum(len(v) for v in pins.slates.values())
+        print(
+            f"Pinned {pinned_pairs} pair(s) held by {len(pins.emails)} reviewer(s) from "
+            f"{args.pin_csv}; they are frozen at their current load and this run "
+            f"re-solves everything else.",
+            file=sys.stderr,
+        )
+        if pins.off_paper:
+            print(f"    {len(pins.off_paper)} pinned pair(s) dropped: their paper is not in "
+                  f"today's selection (withdrawn, excluded, or out of policy)", file=sys.stderr)
+        if pins.off_pool:
+            # Loud, and itemized: these reviews exist in HotCRP, this run cannot
+            # see them, and an upload built from the result would delete them.
+            print(f"    WARNING: {len(pins.off_pool)} pinned pair(s) name a reviewer who is "
+                  f"not a candidate in this run — their review will NOT appear in the "
+                  f"output and an upload would remove it:", file=sys.stderr)
+            for pid, email in pins.off_pool:
+                print(f"        [{pid}] {email}", file=sys.stderr)
+        if pinned_conflicts:
+            # eligible_scores is the only place COI is applied, so a pinned pair
+            # it never scored is a pair some COI layer excludes -- and it is
+            # live in HotCRP right now. Kept (pinned means pinned) and named, so
+            # the chair decides. Most will be the derived co-author or
+            # collaborator layers, which HotCRP itself cannot see; a *declared*
+            # conflict here would have been refused at upload, so its presence
+            # would mean the declaration arrived after the assignment did.
+            print(f"    WARNING: {len(pinned_conflicts)} pinned pair(s) are excluded by a COI "
+                  f"layer and are being carried through anyway:", file=sys.stderr)
+            for pid, email in pinned_conflicts:
+                print(f"        [{pid}] {email}", file=sys.stderr)
     paper_prefs = {
         pid: [email for email, _ in sorted(eligible_by_pid[pid], key=lambda es: -es[1])] for pid in pids
     }
@@ -2313,6 +2528,14 @@ def main() -> int:
             )
         slates: dict[int, list[str]] = {pid: [] for pid in pids}
         used: dict[str, int] = defaultdict(int)
+        if pins is not None:
+            slates = {pid: list(pins.slates.get(pid, ())) for pid in pids}
+            used.update(pins.used)
+            for email in pins.emails:
+                reviewer_cap[email] = used[email]
+            for pid, slate in slates.items():
+                for e in slate:
+                    assigned_via[(pid, e)] = "pinned"
 
         def run_phase(label, prefs, target, candidates, capped=()):
             held, phase_prefs, phase_cap = assignment_phase(
@@ -2326,7 +2549,14 @@ def main() -> int:
         # Region caps ride along in every phase, including the anchors and the
         # cap-relaxed fill: a paper under-fills rather than exceed one.
         # A1: anchor each paper's best eligible in-area senior(s) — frozen afterwards.
-        anchor_target = {pid: min(args.min_seniors, args.reviewers_per_paper) for pid in pids}
+        # A pinned senior already satisfies the anchor, so it is discounted the
+        # same way A2 and A3 discount what the phase before them placed;
+        # without pins every slate is empty here and this is `min(...)` exactly.
+        anchor_ceiling = min(args.min_seniors, args.reviewers_per_paper)
+        anchor_target = {
+            pid: max(0, anchor_ceiling - sum(1 for e in slates[pid] if e in pools.seniors))
+            for pid in pids
+        }
         run_phase("senior anchor", paper_prefs, anchor_target, pools.seniors, country_capped)
         # A2: papers short a senior try area-released true seniors (area is
         # released before the senior requirement is relaxed).
@@ -2343,15 +2573,19 @@ def main() -> int:
                   (pools.out_of_area, args.max_out_of_area), *country_capped]
         # What the anchors froze, so the F1 self-check judges F1 in F1's terms.
         f1_seed = class_counts_of(slates, pids, capped)
-        fill_target = {pid: args.reviewers_per_paper - len(slates[pid]) for pid in pids}
+        # max(0, ...) throughout: without pins a slate cannot exceed the target
+        # before F1, so these clamps are inert — but a pinned paper carrying a
+        # surplus reviewer arrives here already over it, and a negative target
+        # is not a thing deferred acceptance has an answer for.
+        fill_target = {pid: max(0, args.reviewers_per_paper - len(slates[pid])) for pid in pids}
         held2, prefs2, cap2 = run_phase("fill", paper_prefs, fill_target, set(reviewer_cap), capped)
         # F2: under-filled papers fill from the area-released pool; the caps
         # keep counting what earlier phases assigned.
-        f2_target = {pid: args.reviewers_per_paper - len(slates[pid]) for pid in pids}
+        f2_target = {pid: max(0, args.reviewers_per_paper - len(slates[pid])) for pid in pids}
         run_phase("fill (area released)", released_prefs, f2_target, set(reviewer_cap), capped)
         # F3: papers still under-filled may exceed the junior and out-of-area
         # caps with extra almost-nots. The same-country cap is not relaxed here.
-        f3_target = {pid: args.reviewers_per_paper - len(slates[pid]) for pid in pids}
+        f3_target = {pid: max(0, args.reviewers_per_paper - len(slates[pid])) for pid in pids}
         run_phase(
             "fill (cap relaxed)", released_prefs, f3_target,
             pools.almost_not_juniors | pools.almost_not_out_of_area, country_capped,
@@ -2425,9 +2659,18 @@ def main() -> int:
     # check doesn't know about would otherwise be exempt from it, which is
     # exactly how a reserve reviewer could quietly draw a full PC load.
     over_by_tier: Counter = Counter()
+    # A pinned reviewer's load is whatever the baseline gave them, and this run
+    # was told not to touch it. Counting a cap the baseline broke against this
+    # run's self-check would report a violation it did not cause and cannot
+    # fix; it is split out and reported separately instead of hidden.
+    inherited_over: list[str] = []
     for e, n in reviewer_load.items():
         r = reviewers_by_email[e]
-        if n > reviewer_paper_cap(r, args.light_cap, args.full_cap, args.reserve_cap):
+        if n <= reviewer_paper_cap(r, args.light_cap, args.full_cap, args.reserve_cap):
+            continue
+        if pins is not None and e in pins.emails:
+            inherited_over.append(e)
+        else:
             over_by_tier[r.tier] += 1
     light_over = over_by_tier["light"]
     full_over = over_by_tier["full"]
@@ -2466,6 +2709,18 @@ def main() -> int:
     # the ceiling it must respect has to be checked on both too.
     over_ceiling = sum(1 for pid in pids if len(paper_held[pid]) > slate_ceiling)
 
+    # Papers whose PINNED slate alone already breaks a cap: this run inherited
+    # the violation and, having been told not to move those pairs, cannot fix
+    # it. Reported separately from the counts below rather than folded into
+    # them, so "should always be 0" keeps meaning "this run is correct".
+    inherited_country_over = 0
+    if pins is not None and not args.no_same_country_cap:
+        pinned_by_pid = {pid: set(slate) for pid, slate in pins.slates.items()}
+        for cap in countries:
+            for pid, limit in cap.papers.items():
+                if len(pinned_by_pid.get(pid, ()) & cap.members) > limit:
+                    inherited_country_over += 1
+
     country_summary = ""
     if not args.no_same_country_cap:
         country_over = country_cap_report(
@@ -2476,7 +2731,9 @@ def main() -> int:
             min_resolved=args.region_min_resolved,
         )
         country_summary = (
-            f"{country_over} papers over the same-country cap — should always be 0; "
+            f"{country_over - inherited_country_over} papers over the same-country cap — "
+            f"should always be 0"
+            f"{f' ({inherited_country_over} more inherited from --pin-csv)' if inherited_country_over else ''}; "
             f"{capped_blocking} F1 blocking pairs among capped papers "
             f"(a country class crosses the seniority classes, so a stable matching "
             f"is not guaranteed there — see README); "
@@ -2484,12 +2741,25 @@ def main() -> int:
 
     # Cheap, and the only thing that would catch the layer being computed and
     # then not actually threaded into the preference lists.
-    coauthor_violations = sum(
-        1 for pid, slate in paper_held.items() for email in slate
-        if email in derived.get(pid, ())
+    # A pinned pair is exempt for the same reason as above: it is a review that
+    # already exists, this run was told to keep it, and it is named in full by
+    # the pinned-COI warning at the top of the run.
+    pinned_pairs_set = (
+        {(pid, e) for pid, slate in pins.slates.items() for e in slate} if pins is not None else set()
     )
+    coauthor_violations = 0
+    inherited_coauthor = 0
+    for pid, slate in paper_held.items():
+        for email in slate:
+            if email not in derived.get(pid, ()):
+                continue
+            if (pid, email) in pinned_pairs_set:
+                inherited_coauthor += 1
+            else:
+                coauthor_violations += 1
     coauthor_summary = "" if args.no_coauthor_coi else (
-        f"{coauthor_violations} co-authored assignments — should always be 0; "
+        f"{coauthor_violations} co-authored assignments — should always be 0"
+        f"{f' ({inherited_coauthor} more inherited from --pin-csv)' if inherited_coauthor else ''}; "
     )
     chairs_assigned = sum(1 for email in reviewer_load if email in set(area_chairs_dropped))
     area_chair_summary = "" if args.no_area_chair_exclusion else (
@@ -2533,6 +2803,19 @@ def main() -> int:
         papers, reviewer_papers, reviewers_by_email, affinity_lookup, seniority,
     )
 
+    pin_summary = ""
+    if pins is not None:
+        kept = sum(1 for (pid, e) in assigned_via if assigned_via[(pid, e)] == "pinned")
+        moved = sorted(e for e in pins.emails if reviewer_load[e] != pins.used.get(e, 0))
+        pin_summary = (
+            f"{kept} pinned pair(s) carried through untouched, "
+            f"{len(moved)} pinned reviewer(s) whose load changed — should always be 0"
+            f"{' (' + ', '.join(moved) + ')' if moved else ''}; "
+            f"{len(pins.off_pool)} pinned pair(s) dropped as non-candidates — see above; "
+            f"{len(inherited_over)} pinned reviewer(s) over cap in the baseline "
+            f"(inherited, not caused by this run); "
+        )
+
     print(
         f"\nDone. {total_pairs} reviewer-paper pairs assigned across {len(papers)} papers, "
         f"{len(reviewer_load)} distinct reviewers used "
@@ -2542,6 +2825,7 @@ def main() -> int:
         f"{' (' + ', '.join(f'{n} {t}' for t, n in sorted(over_by_tier.items())) + ')' if over_by_tier else ''}"
         f" — should always be 0; "
         f"{blocking} {blocking_label} — should always be 0; "
+        f"{pin_summary}"
         f"{seniority_summary}"
         f"{country_summary}"
         f"{coauthor_summary}"

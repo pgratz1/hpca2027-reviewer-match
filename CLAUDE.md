@@ -53,7 +53,13 @@ contains spaces and parentheses — always quote it in shell commands).
   when the PID itself spells a name, and verifying the rest against DBLP caught
   40 links naming the wrong person out of 243 (roster 225 → 186). A plain run
   overwrites that verified roster with the weaker offline result. The profile
-  cache is warm, so a verified re-run costs 0 fetches.
+  cache is warm, so a verified re-run costs 0 fetches. **`withheld` is the one
+  unresolved reason that still reaches the roster** (blank `dblp` cell): an
+  override cell reading `none`/`-`/`n/a`/`unknown` is the chair's settled
+  conclusion that no page can be trusted — typically a name DBLP has not split
+  out of a same-named cluster — not open work, and dropping a sitting reserve
+  over it costs more than it protects. `build_fingerprints.py`'s area-only
+  fallback covers them; the run names them on stderr.
 - `make dblp-snapshot` is the **preferred source of publications**: it reads a
   local DBLP dump (`DBLP_SNAPSHOT`, default `data/inputs/dblp-2026-07-01.xml`, 5.2 GB,
   gitignored) and writes `data/cache/dblp_snapshot_cache.json` for every roster PID —
@@ -158,13 +164,26 @@ contains spaces and parentheses — always quote it in shell commands).
   is a **finding, not a build failure** — the recipe notes it and continues.
   Never point it at `outputs/assignments/`, and never give an arm
   `--hotcrp-csv`; `assign_reviewers.py` refuses that anyway.
+- **`make log-assignments` / `make reviewer-activity` / `make rerun` are the
+  incremental-rerun trio** (§4d), all reading `data/inputs/hpca2027-log.csv`,
+  HotCRP's action log. Offline, instant, read-only. `log-assignments` replays
+  `Review N assigned`/`unassigned` into `outputs/assignments/current_assignment.csv`
+  — **what HotCRP holds**, manual UI edits included, as against `assignment.csv`
+  which is what the pipeline last *proposed*; diffing the two is the point.
+  HotCRP's own Search → Download → "Review assignments" is authoritative where
+  this is a reconstruction, and the output is byte-compatible so either works.
+  `reviewer-activity` writes `outputs/reports/reviewer_activity.csv` and
+  `reviewers_pinned.txt`. `rerun` runs both, then `assign_reviewers.py
+  --pin-csv/--pin-emails`, into `assignment-rerun.*` — **never over
+  `assignment.csv`** — and prints the churn diff. Nothing is uploaded.
 - `make complete-papers` and `make area-chairs-complete` retain the former
   completeness filter in separate `*-complete.txt` artifacts.
 - Library modules (imported, never run): `src/reviewer_match/reviewers.py`, `src/reviewer_match/dblp.py`,
   `src/reviewer_match/paper_matching.py`, `src/reviewer_match/fingerprint.py`, `src/reviewer_match/specter2_model.py`,
   `src/reviewer_match/reserve_reviewers.py`, `src/reviewer_match/roster.py`, `src/reviewer_match/affiliation_country.py`,
   `src/reviewer_match/pc_membership.py`, `src/reviewer_match/coauthor_coi.py`,
-  `src/reviewer_match/collaborator_coi.py`. Runnable
+  `src/reviewer_match/collaborator_coi.py`, `src/reviewer_match/hotcrp_log.py`,
+  `src/reviewer_match/assignment_io.py`. Runnable
   scripts: `scripts/audit_pc_roster.py`, `scripts/find_duplicate_accounts.py`,
   `scripts/audit_coauthor_conflicts.py`, `scripts/audit_collaborator_conflicts.py`,
   `scripts/audit_reserve_identities.py`, `scripts/classify_reviewers.py`, `scripts/build_fingerprints.py`,
@@ -175,6 +194,8 @@ contains spaces and parentheses — always quote it in shell commands).
   `scripts/resolve_reserve_pids.py`, `scripts/build_dblp_snapshot_cache.py`,
   `scripts/build_affiliation_countries.py`, `scripts/generate_clear_uploads.py`,
   `scripts/resolve_trc_members.py`, `scripts/compare_baselines.py`,
+  `scripts/extract_log_assignments.py`, `scripts/audit_reviewer_activity.py`,
+  `scripts/diff_assignments.py`, `scripts/fill_open_slots.py`,
   `scripts/main.py`.
 
 ## Architecture (filter-then-rank, then constrained assignment)
@@ -187,7 +208,15 @@ contains spaces and parentheses — always quote it in shell commands).
    is a to-do marker, not a decision, and never masks the workbook).
    A filled `dblp` cell wins over the form's DBLP
    column. `scripts/classify_reviewers.py` auto-appends blank stub rows for reviewers
-   it can't resolve — the file doubles as the to-do list.
+   it can't resolve — the file doubles as the to-do list. Areas have the same
+   two-file shape: `data/curated/pc_area_overrides.csv` for a PC member who set no
+   HotCRP topic interests, and `data/curated/reserve_area_overrides.csv` — same
+   `email,primary,secondary,tertiary,note` columns, read by the same
+   `reviewers.load_area_overrides` — for a reserve whose *derived* areas
+   misrepresent them, which happens because HotCRP's topic list has no entry for
+   some specialties. A reserve has no topic interests to fall back on at all, so
+   that file is a **correction, never a first source**, and it wins over the
+   derived topics outright.
 1b. **Membership** is a *separate* authority from identity: `data/curated/dblp_overrides.csv`
    says which DBLP page a person is, `data/inputs/hpca2027-pcinfo.csv` (the HotCRP user
    export) says whether they are still on the committee. Accepting an
@@ -368,6 +397,39 @@ contains spaces and parentheses — always quote it in shell commands).
    The draw is a pure function of `(seed, email, pid)`, never a stream (each
    paper is scored twice, gated and released, and both must agree) and never
    `hash()` (salted per process). `--hotcrp-csv` is refused under a random mode.
+4d. **Incremental rerun** (`--pin-csv PATH`, `--pin-emails PATH`; absent by
+   default). Once assignments are notified a rerun is no longer free — someone
+   who has opened their papers must not have them swapped underneath them. So:
+   pin a baseline, and re-solve around it. A pinned reviewer keeps every pair
+   **and receives nothing new**; everyone else's pairs are released, every paper
+   aims for `--reviewers-per-paper` again, and the surplus stage spends what is
+   left exactly as usual. The freeze is one line — `reviewer_cap[email] =
+   used[email]`, so `assignment_phase` computes no remaining capacity and never
+   offers them — which is why **no phase needed a new code path**; the pinned
+   slates just seed the ones every phase already accumulates into.
+   **The no-pin path is byte-identical** to before the flag existed (verified
+   against the committed `assignment.{txt,csv}`), the same guarantee
+   `--surplus-per-paper 0` gives, and the three guards are provably inert in a
+   fresh solve: `anchor_target` discounts pinned seniors (nothing is seated at
+   A1), the F1/F2/F3 targets take `max(0, …)` (no slate exceeds the target
+   before F1), and `distribute_surplus` eligibility gained an upper bound
+   (nothing reaches that stage at the ceiling). Two things reported loudly, not
+   absorbed: a pinned pair whose **reviewer is not a candidate** is dropped and
+   itemized (their review is live in HotCRP and an upload would delete it), and
+   a pinned pair some **COI layer excludes** is *kept* and itemized —
+   `eligible_scores` is the only place COI is applied, so a pinned pair it never
+   scored is a conflicted one, and `score_pinned_pairs` gives it the cosine the
+   matcher would have used so the reports still average a full slate. Violations
+   the pins carry in (over-cap reviewer, broken country cap, conflicted pair)
+   are counted **separately** from this run's own self-checks — `(N more
+   inherited from --pin-csv)` — so "should always be 0" keeps meaning "this run
+   is correct". Refused under a randomized `--score-mode` and under
+   `--no-seniority` (that branch solves in one unseeded pass with nowhere to
+   hold a pinned slate). The `--pin-emails` list is matched in **both** address
+   spaces, since `audit_reviewer_activity.py` writes HotCRP addresses and
+   everything here keys on the roster email. Distinct from
+   `fill_open_slots.py`, which is the *smaller* tool: that one only tops up open
+   slots on named papers and never re-levels or re-solves anything.
 4a. **Surplus distribution** (`--surplus-per-paper N`, **on by default at 1**;
    `0` is the off switch): `--reviewers-per-paper` is what every paper is
    *guaranteed*, and whatever capacity the six phases leave unspent then goes,
@@ -458,6 +520,17 @@ assignment, and a mismatch fails loudly rather than silently.
 - `data/curated/affiliation_countries.csv` is the hand-maintained affiliation → ISO country
   layer for the region cap, and `data/cache/dblp_affiliations.json` the DBLP notes under
   it; both are gitignored, both derive from real identities.
+- `data/inputs/hpca2027-log.csv` is the HotCRP **action log** — an IP address and
+  a timestamp for every action every PC member and author has ever taken, so
+  the most sensitive file in the repo, and gitignored by name as well as by
+  location, along with the three artifacts derived from it. Read only through
+  `src/reviewer_match/hotcrp_log.py`: the export is **newest-first** (a replay
+  read in file order is simply wrong) and **preserves HotCRP's display casing of
+  addresses** while every roster key here is lower-cased, so `load_log` reverses
+  and case-folds once, centrally. Skipping the fold reads as ~110 phantom
+  assignment changes against an identical file. There is **no login event and no
+  "paper viewed" event** in a HotCRP log — `audit_reviewer_activity.py`'s output
+  is a proxy and every caller has to say so.
 - `data/inputs/hpca2027-pcinfo.csv` is the HotCRP **user** export — names, emails, ORCIDs,
   affiliations and declared collaborators, so among the most sensitive files
   here — and, like `data/inputs/hpca2027-data.json`, a moving snapshot. It and the three

@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 import zipfile
+import collections
 from collections import Counter
 from pathlib import Path
 from unittest import mock
@@ -54,6 +55,8 @@ from reviewer_match import assignment_io
 from reviewer_match.assignment_io import Pair
 from scripts import diff_assignments
 from scripts import fill_open_slots
+from reviewer_match import hotcrp_log
+from scripts import extract_log_assignments
 
 PCINFO_FIELDS = [
     "given_name", "family_name", "email", "affiliation", "orcid", "country",
@@ -3932,9 +3935,13 @@ class ReserveRosterTests(unittest.TestCase):
                          [(r["email"], r["problem"]) for r in unresolved])
 
     def test_excluded_is_a_finished_decision_not_outstanding_work(self):
-        # Both keep someone off the roster, but they mean different things: one
-        # is a job still to do, the other is a job done. If they were the same
-        # value the report could never reach zero.
+        # Both are finished decisions, not open work, but they mean different
+        # things: "excluded" says this is not a reserve reviewer at all and
+        # stays off the roster entirely; "withheld" says no DBLP page can be
+        # trusted, but the person still reviews -- on the roster with a blank
+        # dblp cell, matched by declared area only (build_fingerprints.py's
+        # area-only fallback), not dropped like open (non-excluded, non-
+        # withheld) unresolved work would be.
         roster, unresolved = self.build(
             [("gone@x.edu", "Not A Reviewer"), ("todo@x.edu", "Needs A Link"),
              ("ok@x.edu", "Ada Lovelace")],
@@ -3943,23 +3950,31 @@ class ReserveRosterTests(unittest.TestCase):
              ["Ada Lovelace", "ok@x.edu", "https://dblp.org/pid/3/C"]],
             overrides=[("gone@x.edu", "excluded"), ("todo@x.edu", "none")],
         )
-        self.assertEqual(["ok@x.edu"], [r["email"] for r in roster])
-        self.assertEqual({"gone@x.edu": "excluded", "todo@x.edu": "withheld"},
+        self.assertEqual(
+            {"todo@x.edu": "", "ok@x.edu": "https://dblp.org/pid/3/C.html"},
+            {r["email"]: r["dblp"] for r in roster},
+        )
+        self.assertEqual({"gone@x.edu": "excluded"},
                          {r["email"]: r["problem"] for r in unresolved})
 
     def test_withheld_override_stops_a_wrong_link_competing(self):
         # "none" means the workbook's link is known wrong with no replacement.
         # It has to differ from an empty cell: left in place, the wrong link goes
         # on claiming w/LinZhao3 and holds back the Univ-A Lin Zhao who owns it.
+        # The withheld claimant still ends up on the roster (blank dblp), just
+        # no longer competing for a PID that was never actually theirs.
         roster, unresolved = self.build(
             [("lzhao@univ-a.edu.cn", "Lin Zhao"), ("zhaolin@lab-b.com.cn", "Lin Zhao")],
             [["Lin Zhao", "lzhao@univ-a.edu.cn", "https://dblp.org/pid/w/LinZhao3"],
              ["Lin Zhao", "zhaolin@lab-b.com.cn", "https://dblp.org/pid/w/LinZhao3"]],
             overrides=[("zhaolin@lab-b.com.cn", "none")],
         )
-        self.assertEqual(["lzhao@univ-a.edu.cn"], [r["email"] for r in roster])
-        self.assertEqual([("zhaolin@lab-b.com.cn", "withheld")],
-                         [(r["email"], r["problem"]) for r in unresolved])
+        self.assertEqual(
+            {"lzhao@univ-a.edu.cn": "https://dblp.org/pid/w/LinZhao3.html",
+             "zhaolin@lab-b.com.cn": ""},
+            {r["email"]: r["dblp"] for r in roster},
+        )
+        self.assertEqual([], unresolved)
 
     def test_a_hand_entered_override_beats_the_workbook(self):
         # The workbook's link for the first reviewer named the second; once the
@@ -5740,6 +5755,395 @@ class ClearUploadTests(unittest.TestCase):
         # One definition, or a clearing file silently misses the tag it is
         # meant to remove.
         self.assertIs(generate_clear_uploads.track_tag, assign_area_chairs.track_tag)
+
+
+def log_row(date, action, email="", affected="", paper="", roles="pc"):
+    return {
+        "date": date, "ipaddr": "127.0.0.1", "email": email, "roles": roles,
+        "affected_email": affected, "via": "", "paper": paper, "action": action,
+    }
+
+
+def write_log(path, rows):
+    """A HotCRP log export: newest first, which is the order HotCRP writes."""
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(hotcrp_log.LOG_HEADER))
+        writer.writeheader()
+        writer.writerows(reversed(rows))
+    return path
+
+
+class HotcrpLogTests(unittest.TestCase):
+    """reviewer_match.hotcrp_log: replaying the action log."""
+
+    def replay(self, rows):
+        tmp = Path(tempfile.mkdtemp())
+        path = write_log(tmp / "log.csv", rows)
+        return hotcrp_log.replay_assignments(hotcrp_log.load_log(str(path)))
+
+    def test_the_file_is_read_newest_first_and_returned_oldest_first(self):
+        tmp = Path(tempfile.mkdtemp())
+        path = write_log(tmp / "log.csv", [
+            log_row("2026-08-01 09:00:00 -0400", "Paper saved draft"),
+            log_row("2026-08-02 09:00:00 -0400", "Paper saved draft"),
+        ])
+        rows = hotcrp_log.load_log(str(path))
+        self.assertEqual(["2026-08-01 09:00:00 -0400", "2026-08-02 09:00:00 -0400"],
+                         [r["date"] for r in rows])
+
+    def test_an_unexpected_header_fails_loudly(self):
+        tmp = Path(tempfile.mkdtemp())
+        path = tmp / "log.csv"
+        path.write_text("date,action\n2026-08-01,x\n", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            hotcrp_log.load_log(str(path))
+
+    def test_an_unassign_removes_the_review_it_names(self):
+        live, anomalies = self.replay([
+            log_row("2026-08-01 09:00:00 -0400", "Review 7 assigned: primary, round R1",
+                    email="chair@x.edu", affected="a@x.edu", paper="1"),
+            log_row("2026-08-02 09:00:00 -0400", "Review 7 unassigned",
+                    email="chair@x.edu", affected="a@x.edu", paper="1"),
+        ])
+        self.assertEqual({}, live)
+        self.assertEqual([], anomalies)
+
+    def test_a_review_id_reassigned_after_an_unassign_is_live_again(self):
+        # The clearreview/re-upload cycle every bulk assignment performs.
+        live, anomalies = self.replay([
+            log_row("2026-08-01 09:00:00 -0400", "Review 7 assigned: primary, round R1",
+                    email="chair@x.edu", affected="a@x.edu", paper="1"),
+            log_row("2026-08-02 09:00:00 -0400", "Review 7 unassigned",
+                    email="chair@x.edu", affected="a@x.edu", paper="1"),
+            log_row("2026-08-03 09:00:00 -0400", "Review 7 assigned: primary, round R1",
+                    email="chair@x.edu", affected="b@x.edu", paper="1"),
+        ])
+        self.assertEqual({1: {"b@x.edu"}}, hotcrp_log.live_pairs(live))
+        self.assertEqual([], anomalies)
+
+    def test_replaying_backwards_would_be_wrong(self):
+        # Guards the reversal in load_log: same events, opposite order, and the
+        # answer flips from "nobody holds it" to "somebody does".
+        rows = [
+            log_row("2026-08-01 09:00:00 -0400", "Review 7 assigned: primary, round R1",
+                    email="chair@x.edu", affected="a@x.edu", paper="1"),
+            log_row("2026-08-02 09:00:00 -0400", "Review 7 unassigned",
+                    email="chair@x.edu", affected="a@x.edu", paper="1"),
+        ]
+        forwards, _ = hotcrp_log.replay_assignments(rows)
+        backwards, _ = hotcrp_log.replay_assignments(list(reversed(rows)))
+        self.assertEqual({}, forwards)
+        self.assertEqual({1: {"a@x.edu"}}, hotcrp_log.live_pairs(backwards))
+
+    def test_an_unassign_of_an_unknown_review_is_an_anomaly_not_an_error(self):
+        live, anomalies = self.replay([
+            log_row("2026-08-02 09:00:00 -0400", "Review 99 unassigned",
+                    email="chair@x.edu", affected="a@x.edu", paper="1"),
+        ])
+        self.assertEqual({}, live)
+        self.assertEqual(1, len(anomalies))
+        self.assertIn("never assigned", anomalies[0][0])
+
+    def test_addresses_are_case_folded_so_one_person_is_one_person(self):
+        live, _ = self.replay([
+            log_row("2026-08-01 09:00:00 -0400", "Review 7 assigned: primary, round R1",
+                    email="Chair@X.edu", affected="Given.Family@UNI.edu", paper="1"),
+        ])
+        self.assertEqual({1: {"given.family@uni.edu"}}, hotcrp_log.live_pairs(live))
+
+    def test_kind_and_round_select_which_reviews_are_live(self):
+        live, _ = self.replay([
+            log_row("2026-08-01 09:00:00 -0400", "Review 7 assigned: primary, round R1",
+                    email="chair@x.edu", affected="a@x.edu", paper="1"),
+            log_row("2026-08-01 09:00:01 -0400", "Review 8 assigned: external, round TRC",
+                    email="chair@x.edu", affected="b@x.edu", paper="1"),
+        ])
+        self.assertEqual({1: {"a@x.edu"}}, hotcrp_log.live_pairs(live))
+        self.assertEqual({1: {"b@x.edu"}},
+                         hotcrp_log.live_pairs(live, kind="external", round="TRC"))
+        self.assertEqual({1: {"a@x.edu", "b@x.edu"}},
+                         hotcrp_log.live_pairs(live, kind="all", round="all"))
+
+    def test_the_cutoff_is_the_earliest_assignment_not_the_latest(self):
+        # Someone who read their papers on Monday and was handed one more on
+        # Tuesday has looked at their assignment. Keying on the latest would
+        # move the cutoff past the very activity that answers the question.
+        live, _ = self.replay([
+            log_row("2026-08-01 09:00:00 -0400", "Review 7 assigned: primary, round R1",
+                    email="chair@x.edu", affected="a@x.edu", paper="1"),
+            log_row("2026-08-03 09:00:00 -0400", "Review 8 assigned: primary, round R1",
+                    email="chair@x.edu", affected="a@x.edu", paper="2"),
+        ])
+        self.assertEqual({"a@x.edu": "2026-08-01 09:00:00 -0400"},
+                         hotcrp_log.first_assigned_at(live))
+
+    def test_activity_is_credited_to_the_actor_never_the_affected_account(self):
+        # A chair assigning somebody a paper writes that person's address into
+        # affected_email. Counting it would mark every reviewer active the
+        # instant they were assigned -- the exact opposite of the question.
+        tmp = Path(tempfile.mkdtemp())
+        path = write_log(tmp / "log.csv", [
+            log_row("2026-08-01 09:00:00 -0400", "Review 7 assigned: primary, round R1",
+                    email="chair@x.edu", affected="a@x.edu", paper="1", roles="chair"),
+        ])
+        seen = hotcrp_log.last_activity(hotcrp_log.load_log(str(path)))
+        self.assertIn("chair@x.edu", seen)
+        self.assertNotIn("a@x.edu", seen)
+
+    def test_a_global_cutoff_and_a_per_email_cutoff_both_apply(self):
+        tmp = Path(tempfile.mkdtemp())
+        path = write_log(tmp / "log.csv", [
+            log_row("2026-08-01 09:00:00 -0400", "Download submission", email="a@x.edu", paper="1"),
+            log_row("2026-08-05 09:00:00 -0400", "Download submission", email="b@x.edu", paper="1"),
+        ])
+        rows = hotcrp_log.load_log(str(path))
+        self.assertEqual({"b@x.edu"}, set(hotcrp_log.last_activity(rows, since="2026-08-03")))
+        per_email = {"a@x.edu": "2026-07-01", "b@x.edu": "2026-08-09"}
+        self.assertEqual({"a@x.edu"}, set(hotcrp_log.last_activity(rows, since=per_email)))
+
+    def test_engagement_is_narrower_than_activity(self):
+        tmp = Path(tempfile.mkdtemp())
+        path = write_log(tmp / "log.csv", [
+            log_row("2026-08-01 09:00:00 -0400", "Download submission", email="reader@x.edu", paper="1"),
+            log_row("2026-08-01 09:00:00 -0400", "Account edited: password", email="resetter@x.edu"),
+            log_row("2026-08-01 09:00:00 -0400", "Review 7 accepted", email="accepter@x.edu", paper="1"),
+        ])
+        rows = hotcrp_log.load_log(str(path))
+        self.assertEqual({"reader@x.edu", "resetter@x.edu", "accepter@x.edu"},
+                         set(hotcrp_log.last_activity(rows)))
+        self.assertEqual({"reader@x.edu", "accepter@x.edu"},
+                         set(hotcrp_log.engagement_actions(rows)))
+
+
+class ExtractLogAssignmentsTests(unittest.TestCase):
+    """extract_log_assignments.py: the log replay as a HotCRP upload file."""
+
+    def run_extract(self, rows, extra_argv=()):
+        tmp = Path(tempfile.mkdtemp())
+        log = write_log(tmp / "log.csv", rows)
+        out = tmp / "current.csv"
+        argv = ["extract_log_assignments.py", "--log", str(log), "--out", str(out), *extra_argv]
+        with mock.patch.object(sys, "argv", argv), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            code = extract_log_assignments.main()
+        return code, out
+
+    ASSIGNED = [
+        log_row("2026-08-01 09:00:00 -0400", "Review 7 assigned: primary, round R1",
+                email="chair@x.edu", affected="B@x.edu", paper="2"),
+        log_row("2026-08-01 09:00:01 -0400", "Review 8 assigned: primary, round R1",
+                email="chair@x.edu", affected="a@x.edu", paper="1"),
+        log_row("2026-08-01 09:00:02 -0400", "Review 9 assigned: external, round TRC",
+                email="chair@x.edu", affected="t@x.edu", paper="1"),
+    ]
+
+    def test_the_output_opens_with_the_clearreview_row_every_upload_opens_with(self):
+        code, out = self.run_extract(self.ASSIGNED)
+        self.assertEqual(0, code)
+        with out.open(newline="", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
+        self.assertEqual(list(assignment_io.HOTCRP_CSV_HEADER), rows[0])
+        self.assertEqual(["all", "clearreview", "all", "R1"], rows[1])
+
+    def test_the_output_round_trips_through_the_shared_parser(self):
+        _, out = self.run_extract(self.ASSIGNED)
+        fmt, pairs = assignment_io.load_assignment_pairs(str(out))
+        self.assertEqual("hotcrp", fmt)
+        self.assertEqual({1: {"a@x.edu"}, 2: {"b@x.edu"}},
+                         {pid: set(v) for pid, v in pairs.items()})
+
+    def test_the_trc_externals_stay_out_of_the_r1_file(self):
+        # Their rows would ride in under a `clearreview ... R1` header that
+        # does not cover them, and the upload would propose deleting them.
+        _, out = self.run_extract(self.ASSIGNED)
+        self.assertNotIn("t@x.edu", out.read_text(encoding="utf-8"))
+        _, trc = self.run_extract(self.ASSIGNED, ["--kind", "external", "--round", "TRC"])
+        self.assertIn("t@x.edu", trc.read_text(encoding="utf-8"))
+        self.assertIn("review", trc.read_text(encoding="utf-8"))
+
+    def test_a_mixed_file_is_refused_rather_than_written(self):
+        code, _ = self.run_extract(self.ASSIGNED, ["--round", "all"])
+        self.assertEqual(1, code)
+
+    def test_rerunning_is_byte_identical(self):
+        _, out = self.run_extract(self.ASSIGNED)
+        first = out.read_bytes()
+        argv = ["extract_log_assignments.py", "--log",
+                str(write_log(out.parent / "log.csv", self.ASSIGNED)), "--out", str(out)]
+        with mock.patch.object(sys, "argv", argv), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            extract_log_assignments.main()
+        self.assertEqual(first, out.read_bytes())
+
+
+class PinnedAssignmentTests(unittest.TestCase):
+    """assign_reviewers.load_pins: holding a baseline fixed across a rerun."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.reviewers = {
+            "keep@x.edu": reviewer_with_email("keep@x.edu", hotcrp_email="Keep@X.edu"),
+            "move@x.edu": reviewer_with_email("move@x.edu", hotcrp_email="move@x.edu"),
+            "gone@x.edu": reviewer_with_email("gone@x.edu", hotcrp_email="gone@x.edu"),
+        }
+
+    def write_pin_csv(self, rows, name="pins.csv"):
+        path = self.tmp / name
+        with path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(list(assignment_io.HOTCRP_CSV_HEADER))
+            writer.writerow(["all", "clearreview", "all", "R1"])
+            for pid, email in rows:
+                writer.writerow([pid, "primaryreview", email, "R1"])
+        return str(path)
+
+    def write_emails(self, emails, name="pinned.txt"):
+        path = self.tmp / name
+        path.write_text("".join(f"{e}\n" for e in emails), encoding="utf-8")
+        return str(path)
+
+    def test_only_the_named_reviewers_pairs_are_pinned(self):
+        pin_csv = self.write_pin_csv([(1, "Keep@X.edu"), (1, "move@x.edu")])
+        pins = assign_reviewers.load_pins(
+            pin_csv, self.write_emails(["keep@x.edu"]), self.reviewers, [1],
+            {"keep@x.edu", "move@x.edu"},
+        )
+        self.assertEqual(["keep@x.edu"], pins.slates[1])
+        self.assertEqual(frozenset({"keep@x.edu"}), pins.emails)
+        self.assertEqual({"keep@x.edu": 1}, pins.used)
+
+    def test_a_hotcrp_shaped_file_is_remapped_onto_the_roster_address(self):
+        # `keep` holds their account under a different address than the roster
+        # key; treating the two key spaces as one loses the pin entirely.
+        pin_csv = self.write_pin_csv([(1, "Keep@X.edu")])
+        pins = assign_reviewers.load_pins(pin_csv, None, self.reviewers, [1], {"keep@x.edu"})
+        self.assertEqual(["keep@x.edu"], pins.slates[1])
+
+    def test_the_email_list_is_accepted_in_either_address_space(self):
+        # audit_reviewer_activity.py writes HotCRP addresses, because that is
+        # what the log records; the roster key is what everything here uses.
+        pin_csv = self.write_pin_csv([(1, "Keep@X.edu")])
+        for spelling in ("Keep@X.edu", "keep@x.edu"):
+            pins = assign_reviewers.load_pins(
+                pin_csv, self.write_emails([spelling], f"{spelling}.txt"),
+                self.reviewers, [1], {"keep@x.edu"},
+            )
+            self.assertEqual(["keep@x.edu"], pins.slates[1], spelling)
+
+    def test_omitting_the_email_list_pins_every_pair(self):
+        pin_csv = self.write_pin_csv([(1, "Keep@X.edu"), (1, "move@x.edu")])
+        pins = assign_reviewers.load_pins(
+            pin_csv, None, self.reviewers, [1], {"keep@x.edu", "move@x.edu"},
+        )
+        self.assertEqual({"keep@x.edu", "move@x.edu"}, set(pins.slates[1]))
+
+    def test_a_pair_on_an_unselected_paper_is_dropped_and_reported(self):
+        pin_csv = self.write_pin_csv([(1, "Keep@X.edu"), (2, "Keep@X.edu")])
+        pins = assign_reviewers.load_pins(pin_csv, None, self.reviewers, [1], {"keep@x.edu"})
+        self.assertEqual([(2, "keep@x.edu")], pins.off_paper)
+        self.assertEqual({"keep@x.edu": 1}, pins.used)
+
+    def test_a_pair_whose_reviewer_is_not_a_candidate_is_dropped_and_reported(self):
+        pin_csv = self.write_pin_csv([(1, "Keep@X.edu"), (1, "gone@x.edu")])
+        pins = assign_reviewers.load_pins(pin_csv, None, self.reviewers, [1], {"keep@x.edu"})
+        self.assertEqual([(1, "gone@x.edu")], pins.off_pool)
+        self.assertEqual(["keep@x.edu"], pins.slates[1])
+
+    def test_a_pinned_reviewer_with_no_surviving_pair_is_still_frozen(self):
+        # Frozen at zero, not released: somebody whose papers were all
+        # withdrawn should not silently be handed a fresh full load.
+        pin_csv = self.write_pin_csv([(2, "Keep@X.edu")])
+        pins = assign_reviewers.load_pins(
+            pin_csv, self.write_emails(["keep@x.edu"]), self.reviewers, [1], {"keep@x.edu"},
+        )
+        self.assertIn("keep@x.edu", pins.emails)
+        self.assertEqual({}, pins.used)
+
+    def test_the_freeze_is_a_zero_remaining_capacity(self):
+        # The whole mechanism: reviewer_cap == used means assignment_phase
+        # computes no remaining capacity and never offers them again.
+        slates = {1: ["keep@x.edu"]}
+        used = collections.defaultdict(int, {"keep@x.edu": 1})
+        reviewer_cap = {"keep@x.edu": 1, "move@x.edu": 5}
+        held, prefs, cap = assign_reviewers.assignment_phase(
+            [1], {1: ["keep@x.edu", "move@x.edu"]}, {1: 1}, slates, used, reviewer_cap,
+            {("keep@x.edu", 1): 0.9, ("move@x.edu", 1): 0.5}, {"keep@x.edu", "move@x.edu"},
+        )
+        self.assertNotIn("keep@x.edu", cap)
+        self.assertEqual(["keep@x.edu", "move@x.edu"], slates[1])
+
+    def test_a_pinned_pair_is_not_reported_as_a_relaxation(self):
+        # It was not relaxed by this run; whatever the run that placed it had
+        # to relax is that run's report to make.
+        self.assertIn("pinned", assign_reviewers.UNRELAXED_PHASES)
+
+    def test_the_surplus_stage_will_not_push_a_pinned_paper_past_the_ceiling(self):
+        # A paper arriving at base+surplus must not be offered one more slot.
+        slates = {1: [f"r{i}@x.edu" for i in range(6)]}
+        used = collections.defaultdict(int, {f"r{i}@x.edu": 1 for i in range(6)})
+        cap = {"spare@x.edu": 5}
+        scores = {("spare@x.edu", 1): 0.9, **{(f"r{i}@x.edu", 1): 0.5 for i in range(6)}}
+        added, rounds = assign_reviewers.distribute_surplus(
+            [1], {1: ["spare@x.edu"]}, {1: ["spare@x.edu"]}, slates, used, cap,
+            scores, {}, base_target={1: 5}, surplus_per_paper=1,
+        )
+        self.assertEqual({}, added)
+        self.assertEqual(0, rounds)
+        self.assertEqual(6, len(slates[1]))
+
+    def test_a_paper_one_short_of_the_ceiling_still_takes_a_surplus_slot(self):
+        # The guard above must not turn the surplus stage off entirely.
+        slates = {1: [f"r{i}@x.edu" for i in range(5)]}
+        used = collections.defaultdict(int, {f"r{i}@x.edu": 1 for i in range(5)})
+        cap = {"spare@x.edu": 5}
+        scores = {("spare@x.edu", 1): 0.9, **{(f"r{i}@x.edu", 1): 0.5 for i in range(5)}}
+        added, _ = assign_reviewers.distribute_surplus(
+            [1], {1: ["spare@x.edu"]}, {1: ["spare@x.edu"]}, slates, used, cap,
+            scores, {}, base_target={1: 5}, surplus_per_paper=1,
+        )
+        self.assertEqual({1: ["spare@x.edu"]}, added)
+
+    def test_pins_are_refused_under_a_randomized_score_mode(self):
+        argv = ["assign_reviewers.py", "--pin-csv", "x.csv", "--score-mode", "random"]
+        with mock.patch.object(sys, "argv", argv), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            assign_reviewers.main()
+
+    def test_pin_emails_without_pin_csv_is_refused(self):
+        argv = ["assign_reviewers.py", "--pin-emails", "x.txt"]
+        with mock.patch.object(sys, "argv", argv), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            assign_reviewers.main()
+
+    def test_a_pinned_pair_a_coi_layer_excludes_is_scored_and_reported(self):
+        # It is a live review placed by hand; dropping it would delete somebody's
+        # work, and leaving it unscored crashes every report averaging a slate.
+        pins = assign_reviewers.Pins(
+            slates={1: ["keep@x.edu"]}, emails=frozenset({"keep@x.edu"}),
+            used={"keep@x.edu": 1}, off_paper=[], off_pool=[],
+        )
+        affinity: dict = {}
+        conflicted = assign_reviewers.score_pinned_pairs(
+            pins, affinity, {"1": {"vector": [1.0, 0.0]}}, ["keep@x.edu"],
+            np.array([[0.6, 0.8]], dtype=np.float32),
+        )
+        self.assertEqual([(1, "keep@x.edu")], conflicted)
+        self.assertAlmostEqual(0.6, affinity[("keep@x.edu", 1)], places=5)
+
+    def test_an_already_scored_pinned_pair_is_left_alone(self):
+        pins = assign_reviewers.Pins(
+            slates={1: ["keep@x.edu"]}, emails=frozenset({"keep@x.edu"}),
+            used={"keep@x.edu": 1}, off_paper=[], off_pool=[],
+        )
+        affinity = {("keep@x.edu", 1): 0.42}
+        conflicted = assign_reviewers.score_pinned_pairs(
+            pins, affinity, {"1": {"vector": [1.0, 0.0]}}, ["keep@x.edu"],
+            np.array([[0.6, 0.8]], dtype=np.float32),
+        )
+        self.assertEqual([], conflicted)
+        self.assertEqual(0.42, affinity[("keep@x.edu", 1)])
 
 
 if __name__ == "__main__":

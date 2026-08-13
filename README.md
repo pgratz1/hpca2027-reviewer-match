@@ -155,7 +155,14 @@ its paper set against the reviewer assignment and fails loudly on a mismatch.
    appended blank stub rows for them to `data/curated/dblp_overrides.csv` — fill in their
    `dblp` cells and `make` again. Unknowns caused by transient DBLP fetch
    failures are retried and do not create identity stubs.
-6. **Ad-hoc follow-ups**: `scripts/score_papers.py --pid N` for one paper's full
+6. **After the assignment is uploaded and notified**, a plain `make` is no
+   longer the right rerun: reviewers who have started work must not have their
+   papers swapped underneath them. Drop a fresh `data/inputs/hpca2027-log.csv`
+   in place and use **`make rerun`** instead — it reads what HotCRP actually
+   holds, pins everyone who has shown activity, re-solves only around them, and
+   writes `assignment-rerun.*` rather than over `assignment.csv`. See
+   [Incremental rerun](#incremental-rerun--rematch-around-the-reviewers-already-working).
+7. **Ad-hoc follow-ups**: `scripts/score_papers.py --pid N` for one paper's full
    ranking, `scripts/nearest_neighbors.py --email X` to eyeball a reviewer's profile.
 
 The equivalent manual commands, in dependency order:
@@ -901,6 +908,19 @@ PID — either one is wrong, or one person holds two HotCRP accounts and would
 draw double the reviews). Both files are sorted by email, so re-running against
 a grown HotCRP export gives a readable diff.
 
+**`withheld` is the one reason that still reaches the roster**, with a blank
+`dblp` cell rather than a link. Writing `none`/`-`/`n/a`/`unknown` in the
+override's `dblp` cell is not pending work — it is the chair's conclusion that
+*no* DBLP page can be trusted for this person, most often a name too common to
+disambiguate, where DBLP has not split their papers out of a same-named cluster
+and every candidate PID either drags in a stranger's work or contains none of
+theirs. Dropping a sitting reserve mid-cycle over that costs more than it
+protects, so the row stays and `build_fingerprints.py`'s existing area-only
+fallback takes over: weaker than a real publication history, but not a
+stranger's, and not nothing. Every *other* unresolved reason still means absent
+from the roster — those are open questions, this one is a settled one. The
+run names the withheld reserves on stderr so they never go unnoticed.
+
 Offline, `name_mismatch` can only be checked for the named PID form
 (`z/HaoZhang2`); a numeric PID (`26/1737`) carries no name, and numeric is what
 most of them are. **`--verify` is what makes the roster trustworthy**: it reads
@@ -1036,6 +1056,22 @@ topic list, so they are already in the gate's vocabulary, with none of the
 free-text drift the acceptance form's areas need `build_canonical_area_map` for.
 In practice this gives reserves the same reach as the PC: a median of 421
 gate-eligible papers against the PC's 450, with nobody reaching zero.
+
+`data/curated/reserve_area_overrides.csv` corrects the derived areas where they
+misrepresent someone, and wins over them outright — a hand decision outranking a
+derived guess, the same precedence `dblp_overrides.csv` has over the form's DBLP
+column. It is needed because HotCRP's topic list has no entry for some
+specialties (fully homomorphic encryption, for one), so a reserve working in one
+gets folded into whatever topic their own papers were tagged with instead: too
+broad in one direction (a crypto-adjacent "Security" tag pulling in unrelated
+side-channel work) or dropping a real area in the other (a frequency tie-break
+losing "GPUs"). It is the same `email,primary,secondary,tertiary,note` shape
+`reviewers.py` already reads, deliberately reused rather than reimplemented, but
+it answers a different question from the PC's `pc_area_overrides.csv`: that one
+covers a member who set no HotCRP topic interests, whereas a reserve has no
+topic interests to fall back on at all, so this file is a *correction*, never a
+first source. It also carries the withheld reserves above, whose fingerprint is
+built from these areas alone.
 
 Records come back as real `Reviewer` objects carrying `tier="reserve"`, so
 `scripts/enrich_publications.py`, `scripts/build_fingerprints.py` and `scripts/classify_reviewers.py`
@@ -1432,6 +1468,147 @@ The tag spellings and the clear ceiling are imported from
 differently from the file that installed it would report success and leave the
 tag in place.
 
+### Incremental rerun — rematch around the reviewers already working
+
+Once assignments are notified, a rerun stops being free: a reviewer who has
+opened their papers should not have them swapped underneath them. Three tools
+read HotCRP's action log (`data/inputs/hpca2027-log.csv`, the **Log** page's
+CSV download) and turn a global re-solve into a targeted one.
+
+#### `scripts/extract_log_assignments.py` — what HotCRP actually holds
+
+**`make log-assignments`** replays `Review N assigned` / `Review N unassigned`
+in chronological order (the export is newest-first) and writes
+`outputs/assignments/current_assignment.csv` in the same
+`paper,action,email,round` shape `--hotcrp-csv` writes. Offline, instant,
+read-only.
+
+This is not the same file as `outputs/assignments/assignment.csv`, and the
+difference is the point: that one is what the pipeline last *proposed*, this
+one is what HotCRP holds after every manual add and remove through the UI.
+Diffing them is how you see the hand edits:
+
+```bash
+make log-assignments
+python -m scripts.diff_assignments outputs/assignments/assignment.csv \
+    outputs/assignments/current_assignment.csv
+```
+
+Two things to know. **HotCRP can export the live assignment directly** —
+Search → select all → Download → "Review assignments", or the Assignments
+page's own download link — and that export is authoritative where this is a
+reconstruction; prefer it when you have it, and diff the two when you want to
+check both. And the log **preserves HotCRP's display casing of addresses**
+while every roster key here is lower-cased, so `hotcrp_log.load_log` folds
+case at parse time; skipping that reads as ~110 phantom assignment changes
+against an identical file.
+
+`--kind`/`--round` default to the R1 primary reviews the matcher owns. The TRC
+externals are `assign_trc_reviews.py`'s business and are deliberately left out:
+their rows would ride in under a `clearreview … R1` header that does not cover
+them, and the upload would propose deleting them. Asking for `all` is refused
+for the same reason — one file cannot be a complete statement of two rounds.
+
+#### `scripts/audit_reviewer_activity.py` — who has not looked yet
+
+**`make reviewer-activity`** reports, per assigned reviewer, their most recent
+action since their own assignment, and writes
+`outputs/reports/reviewer_activity.csv` plus
+`outputs/reports/reviewers_pinned.txt` — the address list `--pin-emails`
+consumes.
+
+**A HotCRP action log records no login event and no "paper viewed" event.**
+Nothing here can tell you who signed in. Two proxies are reported side by side,
+and both are floors rather than proof of the negative:
+
+- `any_activity` — the account did anything the log records: opened a paper,
+  reset a password, edited its topic interests. The default gate
+  (`ACTIVITY_SIGNAL=any`), and the safer one, because it errs towards pinning:
+  a needless pin costs a little match quality, where a wrong release costs
+  somebody work they had already started.
+- `engaged` — the account did something that can only follow from opening a
+  paper or a review form. Stronger evidence, but it misses a reviewer who read
+  the abstracts on their review list and downloaded nothing.
+
+Activity is credited to the account that *performed* an action, never to
+`affected_email`: a chair assigning somebody a paper writes that person's
+address into the log, and counting it would mark every reviewer active the
+instant they were assigned. The cutoff is per-reviewer — each address is judged
+from the **earliest** of its own live assignments, so someone who read their
+papers on Monday afternoon and was handed one more on Monday evening still
+counts as having looked. `--since` replaces that with one global timestamp.
+
+#### `assign_reviewers.py --pin-csv` — the rerun itself
+
+**`make rerun`** runs both tools above and then re-solves with the engaged
+reviewers' pairs pinned:
+
+```bash
+make rerun          # -> outputs/assignments/assignment-rerun.{txt,csv}, plus the churn diff
+```
+
+`--pin-csv` names a baseline (either assignment CSV shape) and `--pin-emails`
+names whose pairs in it are pinned; omitting the second pins all of them. A
+pinned reviewer keeps every pair and **receives nothing new**. Everyone else's
+pairs are released and rematched, every paper aims for `--reviewers-per-paper`
+again, and the surplus stage then spends whatever capacity is left on the
+worst-matched papers exactly as in a normal run.
+
+The freeze is one line: `reviewer_cap[email] = used[email]`, so
+`assignment_phase` computes no remaining capacity for a pinned reviewer and
+never offers them again. No phase needs a new code path, and the pinned slates
+simply seed the ones every phase already accumulates into. Three guards make
+that safe, each of them a **provable no-op without pins** — in a fresh solve no
+slate exceeds the target before F1 and no paper reaches the surplus stage at
+the ceiling:
+
+| Site | Fresh solve | Under pins |
+|---|---|---|
+| `anchor_target` | `min(--min-seniors, --reviewers-per-paper)` | minus the pinned seniors, clamped at 0 — a pinned senior already satisfies the anchor |
+| `fill_target`/`f2`/`f3` | `rpp - len(slate)` | `max(0, …)`; a pinned 6-slate makes this −1 |
+| `distribute_surplus` eligibility | `len(slate) >= base_target` | also `< base_target + surplus`, or a pinned 6-paper is offered a 7th |
+
+The regression check worth keeping: **with no `--pin-csv` the output is
+byte-identical to before the flag existed**, the same guarantee
+`--surplus-per-paper 0` gives.
+
+Two things the run reports loudly rather than absorbing. A pinned pair whose
+**reviewer is not a candidate** (off the roster, an area chair, unfingerprinted)
+is dropped and itemized — their review exists in HotCRP and an upload built
+from the result would delete it. And a pinned pair some **COI layer excludes**
+is *kept* (pinned means pinned) and itemized: `eligible_scores` is the only
+place COI is applied, so a pinned pair it never scored is a conflicted one,
+usually caught by the derived co-author or collaborator layers HotCRP itself
+cannot see. Both are scored with the same cosine the matcher would have used,
+so every report still averages a full slate.
+
+Violations the pins carry in — an over-cap reviewer, a country cap already
+broken, a conflicted pair — are counted **separately** from this run's own
+self-checks, which keep meaning "this run is correct". They appear in the
+`Done.` line as `(N more inherited from --pin-csv)`.
+
+`make rerun` writes to `assignment-rerun.*` and never over `assignment.csv`, and
+finishes by printing the churn against the live state, affinity-scored. Nothing
+is uploaded: read the diff first. Two things to read in it —
+
+- The acceptance test: **every address in `reviewers_pinned.txt` shows a load
+  delta of 0 and no lineup change.** (An address on no roster is exempt and is
+  named by `make reviewer-activity`; so is anyone holding only an
+  `EXCLUDE_PIDS` paper, which the run does not contain.)
+- The **goodness delta**. Churn that buys nothing is churn.
+
+On the 2026-08-12 state that second point bites: every submitted paper already
+held ≥5 reviewers, so the rerun had no gaps to fill and swapped 566 of 6,301
+pairs among the 379 unengaged reviewers for a mean goodness delta of −0.000.
+The tool earns its keep on the *next* round of declines and withdrawals, when
+there are genuinely open slots; run it, read the diff, and upload only when the
+diff justifies it.
+
+One carry-over from the normal pipeline: the upload opens with
+`all,clearreview,all,R1`, so it is a complete statement of R1 and removes any
+review on a paper the run excluded — today, the chair's two test reviews on the
+`EXCLUDE_PIDS` paper.
+
 ## Publication exclusions
 
 `data/curated/publication_exclusions.csv` is an optional hand-maintained file with columns
@@ -1506,7 +1683,15 @@ override application) · `src/reviewer_match/pc_membership.py` (the HotCRP accou
 comparison, and the "is this person still on the PC" predicate every roster
 loader applies) · `src/reviewer_match/dblp.py` (DBLP fetch, caching, rate limiting) ·
 `src/reviewer_match/paper_matching.py` (paper selection, fingerprinting, and eligibility) ·
-`src/reviewer_match/fingerprint.py` / `src/reviewer_match/specter2_model.py` (embedding plumbing).
+`src/reviewer_match/fingerprint.py` / `src/reviewer_match/specter2_model.py` (embedding plumbing) ·
+`src/reviewer_match/roster.py` (role → loader, so every script sees one roster) ·
+`src/reviewer_match/reserve_reviewers.py` (the reserve roster as `Reviewer` records) ·
+`src/reviewer_match/coauthor_coi.py` / `src/reviewer_match/collaborator_coi.py` (the two
+derived COI layers) · `src/reviewer_match/affiliation_country.py` (affiliation → ISO
+country for the same-country cap) · `src/reviewer_match/assignment_io.py` (reading and
+writing both assignment-CSV shapes) · `src/reviewer_match/hotcrp_log.py` (the single
+parse point for the HotCRP action log — it reverses the export's newest-first
+order and case-folds addresses, and nothing else may read that file directly).
 
 ## Data files
 
@@ -1525,6 +1710,11 @@ back into, so it is also hand-maintained. `data/inputs/reserve_reviewer_upload.c
 HotCRP reserve-reviewer upload) and `data/inputs/reserve_reviewers_vetting_final.xlsx` (the
 recruiting workbook holding their DBLP links) are the inputs to
 `scripts/build_reserve_reviewer_info.py` — also sensitive.
+`data/inputs/hpca2027-log.csv` is the HotCRP **action log** (Log → download), and
+is the most sensitive file in the repo: it records an IP address and a timestamp
+for every action every PC member and author has ever taken. It is gitignored by
+name as well as by location, as are the three artifacts derived from it. Read it
+only through `src/reviewer_match/hotcrp_log.py`.
 
 **Hand-maintained:** `data/curated/dblp_overrides.csv`, `data/curated/publication_exclusions.csv`, and
 `data/curated/reserve_dblp_overrides.csv`, and
@@ -1547,7 +1737,10 @@ targets over deleting this directory.
 `outputs/reports/reviewer_seniority.csv`, `outputs/assignments/assignment.txt`, `outputs/assignments/area_chair_assignment.txt`,
 `outputs/reports/reserve_reviewer_info.csv`, `outputs/reports/reserve_reviewer_unresolved.csv`,
 `outputs/reports/pc_roster_pruned.csv`, `outputs/reports/pc_roster_missing.csv`, and
-`outputs/reports/duplicate_accounts.csv`.
+`outputs/reports/duplicate_accounts.csv`. The three log-derived artifacts —
+`outputs/assignments/current_assignment.csv`, `outputs/reports/reviewer_activity.csv`
+and `outputs/reports/reviewers_pinned.txt` — are regenerable too, but they carry
+per-person activity timestamps and are gitignored by name as well.
 
 **Retired** (left over from the removed lookup chain; kept only as
 historical reference, nothing reads them):

@@ -31,6 +31,13 @@ archive/historical-snapshots/*
 hpca2027-pcinfo.csv
 hpca2027-data*.json
 hpca2027-trc*.csv
+# The action log is the most sensitive file here: it carries an IP address and
+# a timestamp for every action every PC member and author has ever taken.
+hpca2027-log*.csv
+reviewer_activity.csv
+reviewers_pinned.txt
+current_assignment*.csv
+assignment-rerun*.csv
 trc_dblp_overrides.csv
 PCDB_with_emails.csv
 dblp-*.xml
@@ -41,6 +48,7 @@ dblp_affiliations.json
 dblp_overrides.csv
 pc_area_overrides.csv
 reserve_dblp_overrides.csv
+reserve_area_overrides.csv
 reserve_reviewer*.csv
 reserve_reviewer*.xlsx
 affiliation_countries.csv
@@ -75,8 +83,7 @@ nonchina_faculty.xlsx
 .env.*
 restart.txt
 codex_resume.txt
-resume_claude.txt
-resume_codex.txt
+resume_*.txt
 newresume.txt
 prompt_*.txt
 .claude/
