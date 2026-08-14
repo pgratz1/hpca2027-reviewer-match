@@ -37,6 +37,7 @@ import requests
 import torch
 
 from reviewer_match import fingerprint as fp
+from reviewer_match import paper_matching as pm
 from reviewer_match import specter2_model
 from reviewer_match.reserve_reviewers import DEFAULT_DATA
 from reviewer_match.roster import load_roster, role_label
@@ -53,7 +54,9 @@ DEFAULT_FINGERPRINT_CACHE = cache_path("fingerprints.json")
 DEFAULT_METADATA_CACHE = cache_path("reviewer_publications.json")
 DEFAULT_ABSTRACT_CACHE = cache_path("publication_abstracts.json")
 DEFAULT_PUBLICATION_EXCLUSIONS = curated_path("publication_exclusions.csv")
+DEFAULT_FINGERPRINT_SOURCE_OVERRIDES = curated_path("fingerprint_source_overrides.csv")
 FINGERPRINT_SCHEMA_VERSION = 3
+FINGERPRINT_SOURCES = ("own-papers", "area-only")
 
 # Always spot-checked if present in the current run; falls back to the first
 # few reviewers processed when empty.
@@ -100,8 +103,57 @@ def apply_publication_exclusions(
     return [pub for pub in publications if pub[2] not in excluded_dois], matched
 
 
-def fingerprint_key(r, publications, *, years, max_titles, area_weight) -> str:
-    """Content and policy key for a reviewer fingerprint."""
+def load_fingerprint_source_overrides(path: str) -> dict[str, str]:
+    """Load the hand-maintained email -> {own-papers, area-only} override.
+
+    A reviewer whose DBLP page is a merged/wrong identity (see
+    outputs/reports/dblp_identity_audit.md) has no trustworthy DBLP
+    publication list at all -- unlike publication_exclusions.csv, which
+    prunes specific bad DOIs from an otherwise-kept page, this forces the
+    reviewer's normal DBLP-derived titles out of their fingerprint entirely,
+    in favor of either their own submitted-paper abstracts (`own-papers`,
+    see paper_matching.authored_paper_documents) or the plain area-profile
+    fallback that already exists for a reviewer with no DBLP page at all
+    (`area-only`). Missing file is not an error -- most runs have nobody to
+    override.
+    """
+    try:
+        f = open(path, newline="", encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    overrides: dict[str, str] = {}
+    with f:
+        reader = csv.DictReader(f)
+        required = {"email", "source"}
+        missing = required - set(reader.fieldnames or [])
+        if missing:
+            raise ValueError(f"{path}: missing required column(s): {', '.join(sorted(missing))}")
+        for line_number, row in enumerate(reader, 2):
+            email = (row.get("email") or "").strip().lower()
+            source = (row.get("source") or "").strip().lower()
+            if not email and not source and not (row.get("note") or "").strip():
+                continue
+            if not email or not source:
+                raise ValueError(f"{path}:{line_number}: email and source are required")
+            if source not in FINGERPRINT_SOURCES:
+                raise ValueError(
+                    f"{path}:{line_number}: source must be one of {FINGERPRINT_SOURCES}, got {source!r}"
+                )
+            overrides[email] = source
+    return overrides
+
+
+def fingerprint_key(r, publications, *, years, max_titles, area_weight, source="dblp") -> str:
+    """Content and policy key for a reviewer fingerprint.
+
+    `source` is omitted from the payload for the (overwhelming majority)
+    default "dblp" case, so a plain full run's keys -- and therefore its
+    cache -- stay byte-identical to before this parameter existed. It's only
+    included for an overridden reviewer, both because `publications` itself
+    already differs for them in the ordinary case and to correctly force a
+    rebuild in the edge case where an area-only override happens to produce
+    the same (empty) publications list DBLP already would have.
+    """
     payload = {
         "schema_version": FINGERPRINT_SCHEMA_VERSION,
         "model": specter2_model.BASE_MODEL,
@@ -117,6 +169,8 @@ def fingerprint_key(r, publications, *, years, max_titles, area_weight) -> str:
         "area_weight": area_weight,
         "publications": publications,
     }
+    if source != "dblp":
+        payload["fingerprint_source"] = source
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -159,6 +213,18 @@ def main() -> int:
         help="optional CSV of per-email publication DOIs to exclude"
     )
     parser.add_argument(
+        "--fingerprint-source-overrides", default=DEFAULT_FINGERPRINT_SOURCE_OVERRIDES,
+        help="optional CSV forcing specific reviewers off DBLP entirely, onto their own "
+             "submitted-paper abstracts or an area-only fingerprint (see "
+             "load_fingerprint_source_overrides)"
+    )
+    parser.add_argument(
+        "--emails", default=None, metavar="PATH",
+        help="restrict to one address per line (# comments allowed) instead of the whole "
+             "roster; addresses not present in the current --role's roster are skipped. "
+             "For cheaply re-embedding a handful of reviewers instead of the whole pool."
+    )
+    parser.add_argument(
         "--no-abstracts", action="store_true",
         help="build a reproducible title-only baseline even if abstracts are cached"
     )
@@ -199,12 +265,29 @@ def main() -> int:
     role = role_label(args.role)
     if args.limit is not None:
         reviewers = reviewers[: args.limit]
+    if args.emails is not None:
+        with open(args.emails, encoding="utf-8") as f:
+            wanted = {
+                line.strip().lower() for line in f
+                if line.strip() and not line.strip().startswith("#")
+            }
+        reviewers = [r for r in reviewers if r.email in wanted]
+        missing = wanted - {r.email for r in reviewers}
+        if missing:
+            print(
+                f"  {len(missing)} --emails address(es) not in this {role} roster, skipped: "
+                f"{', '.join(sorted(missing))}",
+                file=sys.stderr,
+            )
 
     fp_cache = fp.load_fingerprint_cache(args.fingerprint_cache)
     publication_metadata = fp.load_fingerprint_cache(args.publication_metadata_cache)
     abstract_cache = fp.load_fingerprint_cache(args.abstract_cache)
     try:
         publication_exclusions = load_publication_exclusions(args.publication_exclusions)
+        fingerprint_source_overrides = load_fingerprint_source_overrides(
+            args.fingerprint_source_overrides
+        )
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -257,6 +340,32 @@ def main() -> int:
         for r in reviewers
     }
 
+    active_emails = {r.email for r in reviewers}
+    active_overrides = {
+        email: source for email, source in fingerprint_source_overrides.items()
+        if email in active_emails
+    }
+    # area-only bypasses DBLP outright, even for a reviewer whose PID still
+    # resolves to real titles -- their DBLP page is the thing distrusted, not
+    # just its absence. Forcing the input empty here reuses the existing
+    # no-titles fallback below rather than adding a second code path.
+    for email, source in active_overrides.items():
+        if source == "area-only":
+            selected_by_email[email] = []
+
+    own_paper_emails = {e for e, source in active_overrides.items() if source == "own-papers"}
+    own_paper_docs: dict[str, list[tuple[int, str, str, str, str]]] = {}
+    if own_paper_emails:
+        with open(args.data, encoding="utf-8") as f:
+            papers = json.load(f)
+        own_paper_docs = pm.authored_paper_documents(papers, own_paper_emails)
+        for email in sorted(own_paper_emails - set(own_paper_docs)):
+            print(
+                f"  WARN: {email} is overridden to own-papers but authored no submission "
+                f"with an abstract; falling back to area-only",
+                file=sys.stderr,
+            )
+
     def title_key(year: int, title: str) -> tuple[int, str]:
         return int(year), title.lower().rstrip(". ")
 
@@ -271,20 +380,22 @@ def main() -> int:
     publications_by_email: dict[str, list[tuple[int, str, str, str, str]]] = {}
     matched_exclusions: dict[str, set[str]] = {}
     for r in reviewers:
-        publications = []
-        for year, title in selected_by_email[r.email]:
-            doi = doi_by_pid_title.get(r.pid, {}).get(title_key(year, title), "")
-            entry = abstract_cache.get(doi, {}) if doi and not args.no_abstracts else {}
-            abstract = entry.get("abstract", "") if entry.get("status") == "found" else ""
-            source = entry.get("source", "") if abstract else ""
-            publications.append((year, title, doi, abstract, source))
+        if r.email in own_paper_emails:
+            publications = list(own_paper_docs.get(r.email, []))
+        else:
+            publications = []
+            for year, title in selected_by_email[r.email]:
+                doi = doi_by_pid_title.get(r.pid, {}).get(title_key(year, title), "")
+                entry = abstract_cache.get(doi, {}) if doi and not args.no_abstracts else {}
+                abstract = entry.get("abstract", "") if entry.get("status") == "found" else ""
+                source = entry.get("source", "") if abstract else ""
+                publications.append((year, title, doi, abstract, source))
         publications, matched = apply_publication_exclusions(
             r.email, publications, publication_exclusions
         )
         publications_by_email[r.email] = publications
         matched_exclusions[r.email] = matched
 
-    active_emails = {r.email for r in reviewers}
     for email in sorted(active_emails & set(publication_exclusions)):
         for doi in sorted(publication_exclusions[email] - matched_exclusions[email]):
             print(
@@ -296,6 +407,7 @@ def main() -> int:
         r.email: fingerprint_key(
             r, publications_by_email[r.email], years=args.years,
             max_titles=args.max_titles, area_weight=args.area_weight,
+            source=active_overrides.get(r.email, "dblp"),
         )
         for r in reviewers
     }
@@ -383,6 +495,7 @@ def main() -> int:
                 "fingerprint_key": keys[r.email],
                 "schema_version": FINGERPRINT_SCHEMA_VERSION,
                 "dblp_fetch_complete": not bool(r.pid and r.pid in failed_pids),
+                "fingerprint_source": active_overrides.get(r.email, "dblp"),
             }
 
         fp.save_fingerprint_cache(fp_cache, args.fingerprint_cache)

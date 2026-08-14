@@ -57,6 +57,7 @@ from scripts import diff_assignments
 from scripts import fill_open_slots
 from reviewer_match import hotcrp_log
 from scripts import extract_log_assignments
+from scripts import build_targeted_rerun_pins
 
 PCINFO_FIELDS = [
     "given_name", "family_name", "email", "affiliation", "orcid", "country",
@@ -718,6 +719,137 @@ class FingerprintCacheTests(unittest.TestCase):
             retained = json.loads(cache.read_text(encoding="utf-8"))[r.email]
             self.assertEqual(original["vector"], retained["vector"])
             self.assertFalse(retained["dblp_fetch_complete"])
+
+
+class FingerprintSourceOverrideTests(unittest.TestCase):
+    """build_fingerprints.py: forcing a reviewer off DBLP onto own-papers/area-only."""
+
+    def test_loader_parses_email_and_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "fingerprint_source_overrides.csv"
+            path.write_text(
+                "email,source,note\n"
+                "PERSON@EXAMPLE.COM,own-papers,merged DBLP page\n",
+                encoding="utf-8",
+            )
+            overrides = build_fingerprints.load_fingerprint_source_overrides(str(path))
+        self.assertEqual({"person@example.com": "own-papers"}, overrides)
+
+    def test_an_unknown_source_value_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "fingerprint_source_overrides.csv"
+            path.write_text("email,source\nperson@example.com,dblp\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "source must be one of"):
+                build_fingerprints.load_fingerprint_source_overrides(str(path))
+
+    def test_a_missing_file_is_not_an_error(self):
+        self.assertEqual({}, build_fingerprints.load_fingerprint_source_overrides("/no/such/file.csv"))
+
+    def test_the_default_source_is_omitted_from_the_key_so_a_plain_run_is_unaffected(self):
+        r = reviewer()
+        pubs = [(2026, "A title", "10.1109/a", "", "")]
+        self.assertEqual(
+            build_fingerprints.fingerprint_key(r, pubs, years=4, max_titles=None, area_weight=1.0),
+            build_fingerprints.fingerprint_key(r, pubs, years=4, max_titles=None, area_weight=1.0, source="dblp"),
+        )
+
+    def test_a_non_default_source_changes_the_key(self):
+        r = reviewer()
+        pubs = [(2026, "A title", "", "An abstract.", "own-submission")]
+        dblp_key = build_fingerprints.fingerprint_key(r, pubs, years=4, max_titles=None, area_weight=1.0)
+        own_papers_key = build_fingerprints.fingerprint_key(
+            r, pubs, years=4, max_titles=None, area_weight=1.0, source="own-papers"
+        )
+        self.assertNotEqual(dblp_key, own_papers_key)
+
+    def _run_main(self, argv):
+        def encode(texts, tokenizer, model):
+            return np.ones((len(texts), 768), dtype=np.float32)
+
+        with (
+            mock.patch.object(build_fingerprints, "load_cache", return_value={}),
+            mock.patch.object(build_fingerprints, "load_colleague_cache", return_value={}),
+            mock.patch.object(
+                build_fingerprints.specter2_model, "load_model",
+                return_value=(FakeTokenizer(), object()),
+            ),
+            mock.patch.object(build_fingerprints.specter2_model, "encode_texts", side_effect=encode),
+            mock.patch.object(sys, "argv", argv),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(0, build_fingerprints.main())
+
+    def test_own_papers_override_replaces_dblp_titles_with_authored_abstracts(self):
+        r = reviewer(pid="1/Test")
+        with tempfile.TemporaryDirectory() as td:
+            cache = str(Path(td) / "fingerprints.json")
+            data = Path(td) / "data.json"
+            data.write_text(json.dumps([{
+                "pid": 1, "title": "Their Own Submission", "abstract": "A real abstract.",
+                "authors": [{"email": r.email}], "submitted_at": 1785582984,
+            }]), encoding="utf-8")
+            overrides = Path(td) / "overrides.csv"
+            overrides.write_text(f"email,source,note\n{r.email},own-papers,test\n", encoding="utf-8")
+
+            def fetch_dblp_titles(pids, **kwargs):
+                # DBLP would offer a title here; the override must win anyway.
+                kwargs["on_result"](pids[0], [(2026, "Untrustworthy DBLP title")], "cache")
+                return {}
+
+            with mock.patch.object(build_fingerprints, "load_roster", return_value=[r]):
+                with mock.patch.object(build_fingerprints, "fetch_titles_for_pids", side_effect=fetch_dblp_titles):
+                    self._run_main([
+                        "build_fingerprints.py", "--fingerprint-cache", cache, "--device", "cpu",
+                        "--data", str(data), "--fingerprint-source-overrides", str(overrides),
+                    ])
+            entry = json.loads(Path(cache).read_text())[r.email]
+            self.assertEqual(1, entry["n_titles"])
+            self.assertEqual(1, entry["n_abstracts"])
+            self.assertEqual("own-papers", entry["fingerprint_source"])
+
+    def test_area_only_override_bypasses_dblp_even_when_the_pid_resolves(self):
+        r = reviewer(pid="1/Test")
+        with tempfile.TemporaryDirectory() as td:
+            cache = str(Path(td) / "fingerprints.json")
+            overrides = Path(td) / "overrides.csv"
+            overrides.write_text(f"email,source,note\n{r.email},area-only,test\n", encoding="utf-8")
+
+            def fetch_dblp_titles(pids, **kwargs):
+                kwargs["on_result"](pids[0], [(2026, "A DBLP title that must be ignored")], "cache")
+                return {}
+
+            with mock.patch.object(build_fingerprints, "load_roster", return_value=[r]):
+                with mock.patch.object(build_fingerprints, "fetch_titles_for_pids", side_effect=fetch_dblp_titles):
+                    self._run_main([
+                        "build_fingerprints.py", "--fingerprint-cache", cache, "--device", "cpu",
+                        "--fingerprint-source-overrides", str(overrides),
+                    ])
+            entry = json.loads(Path(cache).read_text())[r.email]
+            self.assertEqual(0, entry["n_titles"])
+            self.assertTrue(entry["has_pid"])
+            self.assertEqual("area-only", entry["fingerprint_source"])
+
+    def test_emails_flag_restricts_the_processed_roster(self):
+        kept = reviewer()
+        skipped = Reviewer(
+            email="other@example.com", first="Other", last="Person", dblp_url="",
+            pid=None, affiliation="Example", primary="Memory", secondary="", tertiary="",
+            keywords="caches", tier="full", override_cap=None,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            cache = str(Path(td) / "fingerprints.json")
+            emails = Path(td) / "emails.txt"
+            emails.write_text(f"# comment\n{kept.email}\n", encoding="utf-8")
+            with mock.patch.object(build_fingerprints, "load_roster", return_value=[kept, skipped]):
+                with mock.patch.object(build_fingerprints, "fetch_titles_for_pids", return_value={}):
+                    self._run_main([
+                        "build_fingerprints.py", "--fingerprint-cache", cache, "--device", "cpu",
+                        "--emails", str(emails),
+                    ])
+            written = json.loads(Path(cache).read_text())
+            self.assertIn(kept.email, written)
+            self.assertNotIn(skipped.email, written)
 
 
 class PaperCacheTests(unittest.TestCase):
@@ -3358,6 +3490,64 @@ class OwnPaperConflictTests(unittest.TestCase):
         self.assertEqual([], paper_matching.eligible_scores(
             p, *args, area_gate=False, extra_conflicts={r.email.upper()}
         ))
+
+
+class AuthoredPaperDocumentsTests(unittest.TestCase):
+    """paper_matching.authored_paper_documents: the own-papers fingerprint source."""
+
+    def paper(self, **kwargs):
+        base = {"pid": 1, "title": "A Paper", "abstract": "An abstract.",
+                "authors": [], "submitted_at": 1785582984}
+        base.update(kwargs)
+        return base
+
+    def test_an_authored_paper_with_an_abstract_is_returned(self):
+        p = self.paper(authors=[{"email": "Author@Dept.Edu"}])
+        docs = paper_matching.authored_paper_documents([p], {"author@dept.edu"})
+        self.assertEqual(1, len(docs["author@dept.edu"]))
+        year, title, doi, abstract, source = docs["author@dept.edu"][0]
+        self.assertEqual("A Paper", title)
+        self.assertEqual("An abstract.", abstract)
+        self.assertEqual("", doi)
+        self.assertEqual("own-submission", source)
+        self.assertEqual(2026, year)
+
+    def test_a_paper_with_no_abstract_contributes_nothing(self):
+        p = self.paper(authors=[{"email": "author@dept.edu"}], abstract="")
+        docs = paper_matching.authored_paper_documents([p], {"author@dept.edu"})
+        self.assertEqual({}, docs)
+
+    def test_matching_is_email_only_never_by_name(self):
+        p = self.paper(authors=[{"email": "author@dept.edu", "given_name": "Someone", "family_name": "Else"}])
+        docs = paper_matching.authored_paper_documents([p], {"someone.else@dept.edu"})
+        self.assertEqual({}, docs)
+
+    def test_contacts_and_nominations_are_not_authorship(self):
+        # Being named on a paper is not the same as having written it -- only
+        # `authors` counts, unlike own_paper_conflicts which also treats
+        # contacts and reserve_reviewer nominations as conflicted.
+        p = self.paper(reserve_reviewer="Ada Lovelace / Somewhere / ada@x.edu")
+        p["contacts"] = [{"email": "contact@x.edu"}]
+        docs = paper_matching.authored_paper_documents([p], {"ada@x.edu", "contact@x.edu"})
+        self.assertEqual({}, docs)
+
+    def test_a_paper_regardless_of_status_still_counts(self):
+        # Same precedent as reserve_reviewers.index_topics: a draft or
+        # withdrawn submission says just as much about someone's expertise.
+        p = self.paper(authors=[{"email": "author@dept.edu"}], status="withdrawn")
+        docs = paper_matching.authored_paper_documents([p], {"author@dept.edu"})
+        self.assertEqual(1, len(docs["author@dept.edu"]))
+
+    def test_multiple_authored_papers_all_contribute(self):
+        p1 = self.paper(pid=1, title="First", authors=[{"email": "author@dept.edu"}])
+        p2 = self.paper(pid=2, title="Second", authors=[{"email": "author@dept.edu"}])
+        docs = paper_matching.authored_paper_documents([p1, p2], {"author@dept.edu"})
+        self.assertEqual(["First", "Second"], [d[1] for d in docs["author@dept.edu"]])
+
+    def test_only_targeted_emails_are_indexed(self):
+        p = self.paper(authors=[{"email": "author@dept.edu"}, {"email": "coauthor@dept.edu"}])
+        docs = paper_matching.authored_paper_documents([p], {"author@dept.edu"})
+        self.assertEqual({"author@dept.edu"}, set(docs))
 
 
 class CoauthorNameMatchTests(unittest.TestCase):
@@ -6144,6 +6334,115 @@ class PinnedAssignmentTests(unittest.TestCase):
         )
         self.assertEqual([], conflicted)
         self.assertEqual(0.42, affinity[("keep@x.edu", 1)])
+
+
+class TargetedRerunPinsTests(unittest.TestCase):
+    """build_targeted_rerun_pins.py: (activity ∪ manual-edit) − force-release,
+    with a manual edit always winning over a named force-release."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def write_pairs_csv(self, rows, name):
+        path = self.tmp / name
+        with path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(list(assignment_io.HOTCRP_CSV_HEADER))
+            writer.writerow(["all", "clearreview", "all", "R1"])
+            for pid, email in rows:
+                writer.writerow([pid, "primaryreview", email, "R1"])
+        return str(path)
+
+    def write_list(self, emails, name):
+        path = self.tmp / name
+        path.write_text("".join(f"{e}\n" for e in emails), encoding="utf-8")
+        return str(path)
+
+    def test_load_email_list_lowercases_and_skips_blanks_and_comments(self):
+        path = self.write_list(["  A@X.EDU  ", "", "# a comment", "b@x.edu"], "list.txt")
+        self.assertEqual({"a@x.edu", "b@x.edu"}, build_targeted_rerun_pins.load_email_list(path))
+
+    def test_manually_modified_finds_both_removed_and_added_pairs(self):
+        baseline = {1: {"a@x.edu": Pair()}}
+        current = {1: {"b@x.edu": Pair()}}
+        touched = build_targeted_rerun_pins.manually_modified(baseline, current)
+        self.assertEqual([(1, "removed")], touched["a@x.edu"])
+        self.assertEqual([(1, "added")], touched["b@x.edu"])
+
+    def test_manually_modified_is_empty_when_nothing_deviates(self):
+        pairs = {1: {"a@x.edu": Pair()}}
+        self.assertEqual({}, build_targeted_rerun_pins.manually_modified(pairs, pairs))
+
+    def run_main(self, baseline_rows, current_rows, activity, force_release):
+        baseline_csv = self.write_pairs_csv(baseline_rows, "baseline.csv")
+        current_csv = self.write_pairs_csv(current_rows, "current.csv")
+        activity_path = self.write_list(activity, "activity.txt")
+        force_path = self.write_list(force_release, "force.txt")
+        out_path = str(self.tmp / "out.txt")
+        with (
+            mock.patch.object(sys, "argv", [
+                "build_targeted_rerun_pins.py",
+                "--activity-pinned", activity_path,
+                "--baseline-csv", baseline_csv, "--current-csv", current_csv,
+                "--force-release", force_path, "--out", out_path,
+                "--no-normalize",
+            ]),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(0, build_targeted_rerun_pins.main())
+        with open(out_path, encoding="utf-8") as f:
+            return {line.strip() for line in f if line.strip() and not line.startswith("#")}
+
+    def test_activity_pinned_reviewers_stay_pinned_by_default(self):
+        pinned = self.run_main(
+            baseline_rows=[(1, "keep@x.edu")], current_rows=[(1, "keep@x.edu")],
+            activity=["keep@x.edu"], force_release=[],
+        )
+        self.assertEqual({"keep@x.edu"}, pinned)
+
+    def test_a_named_reviewer_is_released_even_if_activity_pinned_them(self):
+        # The whole point: naming someone releases them regardless of login.
+        pinned = self.run_main(
+            baseline_rows=[(1, "target@x.edu")], current_rows=[(1, "target@x.edu")],
+            activity=["target@x.edu"], force_release=["target@x.edu"],
+        )
+        self.assertEqual(set(), pinned)
+
+    def test_a_manually_edited_reviewer_is_pinned_even_without_activity(self):
+        # A chair swapped this pair by hand; the reviewer never personally
+        # logged in, so the activity signal alone would miss it entirely.
+        pinned = self.run_main(
+            baseline_rows=[(1, "old@x.edu")], current_rows=[(1, "new@x.edu")],
+            activity=[], force_release=[],
+        )
+        self.assertEqual({"old@x.edu", "new@x.edu"}, pinned)
+
+    def test_a_manual_edit_always_wins_even_when_the_reviewer_is_named(self):
+        # A force-released reviewer who also has a manually-edited pair is
+        # held back entirely, not partially released -- naming them for an
+        # unrelated fix must never silently undo a chair's deliberate edit.
+        pinned = self.run_main(
+            baseline_rows=[(1, "target@x.edu")], current_rows=[(2, "target@x.edu")],
+            activity=[], force_release=["target@x.edu"],
+        )
+        self.assertEqual({"target@x.edu"}, pinned)
+
+    def test_an_untouched_unnamed_unpinned_reviewer_stays_released(self):
+        pinned = self.run_main(
+            baseline_rows=[(1, "keep@x.edu"), (2, "loose@x.edu")],
+            current_rows=[(1, "keep@x.edu"), (2, "loose@x.edu")],
+            activity=["keep@x.edu"], force_release=[],
+        )
+        self.assertNotIn("loose@x.edu", pinned)
+
+    def test_force_release_is_required(self):
+        with (
+            mock.patch.object(sys, "argv", ["build_targeted_rerun_pins.py"]),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            with self.assertRaises(SystemExit):
+                build_targeted_rerun_pins.main()
 
 
 if __name__ == "__main__":

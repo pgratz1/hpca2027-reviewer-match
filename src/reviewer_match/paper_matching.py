@@ -11,6 +11,7 @@ import hashlib
 import json
 import re
 import sys
+from datetime import datetime, timezone
 
 import numpy as np
 
@@ -260,6 +261,41 @@ def own_paper_conflicts(paper: dict) -> set[str]:
         if len(parts) >= 3 and "@" in parts[-1]:
             conflicted.add(parts[-1].lower())
     return conflicted
+
+
+def authored_paper_documents(
+    papers: list[dict], emails: set[str]
+) -> dict[str, list[tuple[int, str, str, str, str]]]:
+    """{email: [(year, title, doi, abstract, source), ...]} for their own submissions.
+
+    A fingerprint source of last resort for a reviewer whose DBLP page is
+    unusable: their own submitted work is real signal even when no clean DBLP
+    identity exists for them. Matching is email-only against `authors`, the
+    same authorship reading `own_paper_conflicts` and
+    `reserve_reviewers.index_topics` use -- never name-based, and never the
+    `reserve_reviewer` nomination field (naming someone is not their work).
+    Papers are read regardless of paper-policy, same precedent as
+    `index_topics`: a draft or withdrawn submission says just as much about a
+    person's expertise as a submitted one. A paper with no abstract
+    contributes nothing -- there is no title-only signal worth adding here
+    that DBLP wouldn't already have supplied better. `doi` is always `""`
+    (there is nothing to match against `publication_exclusions.csv`, and
+    nothing should) and `source` is always `"own-submission"`, so the
+    resulting tuples are otherwise identical in shape to a DBLP-derived
+    publication and need no special handling downstream.
+    """
+    out: dict[str, list[tuple[int, str, str, str, str]]] = {}
+    for paper in papers:
+        abstract = (paper.get("abstract") or "").strip()
+        if not abstract:
+            continue
+        title = paper.get("title") or ""
+        year = datetime.fromtimestamp(paper["submitted_at"], tz=timezone.utc).year
+        for author in paper.get("authors") or []:
+            email = (author.get("email") or "").strip().lower()
+            if email in emails:
+                out.setdefault(email, []).append((year, title, "", abstract, "own-submission"))
+    return out
 
 
 def eligible_scores(

@@ -148,6 +148,18 @@ RERUN_ASSIGNMENT_CSV = $(ASSIGNMENT_DIR)/assignment-rerun.csv
 # costs somebody the work they already started.
 ACTIVITY_SIGNAL ?= any
 
+# targeted-rerun: like `rerun`, but a named FORCE_RELEASE list of reviewers is
+# released regardless of their HotCRP activity -- for a reviewer whose
+# fingerprint was wrong (see dblp_identity_audit.md), not just one who hasn't
+# logged in yet. A pair a PC chair hand-edited still wins over the force
+# list; see build_targeted_rerun_pins.py. FORCE_RELEASE is required, so a
+# bare `make targeted-rerun` fails loudly rather than silently no-op'ing.
+FORCE_RELEASE ?=
+FP_SOURCE_OVERRIDES = $(CURATED_DIR)/fingerprint_source_overrides.csv
+TARGETED_PINNED_REVIEWERS = $(REPORT_DIR)/reviewers_pinned_targeted.txt
+TARGETED_ASSIGNMENT = $(ASSIGNMENT_DIR)/assignment-targeted-rerun.txt
+TARGETED_ASSIGNMENT_CSV = $(ASSIGNMENT_DIR)/assignment-targeted-rerun.csv
+
 CLEAR_ASSIGNMENT = $(ASSIGNMENT_DIR)/clear_assignment.csv
 CLEAR_PAPER_TAGS = $(ASSIGNMENT_DIR)/clear_paper_tags.csv
 CLEAR_ACCOUNT_TAGS = $(ASSIGNMENT_DIR)/clear_account_tags.csv
@@ -192,7 +204,7 @@ ASSIGN_DEPS = scripts/assign_reviewers.py src/reviewer_match/paper_matching.py \
 .PHONY: all enrich area-chairs reserve-need reserve-info reserve-pids reserves trc \
 	dblp-snapshot coauthor-coi collaborator-coi affiliation-countries pc-roster duplicates \
 	complete-papers area-chairs-complete clear-uploads baselines clean clean-fingerprints \
-	log-assignments reviewer-activity rerun
+	log-assignments reviewer-activity rerun targeted-rerun
 
 all: $(SENIORITY) enrich $(FINGERPRINTS)
 	$(RUN) scripts.build_fingerprints --csv "$(CSV)" --fingerprint-cache $(FINGERPRINTS)
@@ -388,6 +400,43 @@ rerun: $(ASSIGN_DEPS) scripts/extract_log_assignments.py scripts/audit_reviewer_
 	@echo "Every address in $(PINNED_REVIEWERS) must show a load delta of 0 and no lineup change." >&2
 	$(RUN) scripts.diff_assignments $(CURRENT_ASSIGNMENT_CSV) $(RERUN_ASSIGNMENT_CSV) \
 		--old-label live --new-label rerun --score-affinity >&2
+
+# Re-solve around everyone with HotCRP activity or a manually-edited pair,
+# EXCEPT the named FORCE_RELEASE reviewers, who are released regardless of
+# activity -- for fixing specific known-bad matches, not a general rerun.
+# Rebuilds fingerprints for just the FORCE_RELEASE set first (own submitted
+# abstracts or area-only, per fingerprint_source_overrides.csv -- see
+# outputs/reports/dblp_identity_audit.md), across both rosters since a
+# reviewer's fingerprint role and their assignment tier can differ (an
+# ~~ex-rr promoted to pc-light still fingerprints as a reserve). Writes to
+# assignment-targeted-rerun.* and never over $(ASSIGNMENT_CSV) or
+# $(RERUN_ASSIGNMENT_CSV). Nothing is uploaded here — read the churn in the
+# diff first.
+targeted-rerun: $(ASSIGN_DEPS) scripts/extract_log_assignments.py scripts/audit_reviewer_activity.py \
+		scripts/build_targeted_rerun_pins.py scripts/build_fingerprints.py \
+		src/reviewer_match/hotcrp_log.py src/reviewer_match/assignment_io.py
+	@test -n "$(FORCE_RELEASE)" || { echo "ERROR: make targeted-rerun FORCE_RELEASE=<path, one address per line>" >&2; exit 1; }
+	$(MAKE) log-assignments reviewer-activity
+	$(RUN) scripts.build_fingerprints --csv "$(CSV)" --fingerprint-cache $(FINGERPRINTS) \
+		--fingerprint-source-overrides $(FP_SOURCE_OVERRIDES) --emails $(FORCE_RELEASE)
+	$(RUN) scripts.build_fingerprints --role reserve --csv $(RESERVE_INFO) --data $(DATA) \
+		--fingerprint-cache $(RESERVE_FINGERPRINTS) \
+		--fingerprint-source-overrides $(FP_SOURCE_OVERRIDES) --emails $(FORCE_RELEASE)
+	$(RUN) scripts.build_targeted_rerun_pins \
+		--activity-pinned $(PINNED_REVIEWERS) \
+		--baseline-csv $(ASSIGNMENT_CSV) --current-csv $(CURRENT_ASSIGNMENT_CSV) \
+		--force-release $(FORCE_RELEASE) --out $(TARGETED_PINNED_REVIEWERS)
+	$(RUN) scripts.assign_reviewers --paper-policy $(PAPER_POLICY) --csv "$(CSV)" \
+		--area-chair-csv "$(AREA_CHAIR_CSV)" \
+		--pin-csv $(CURRENT_ASSIGNMENT_CSV) --pin-emails $(TARGETED_PINNED_REVIEWERS) \
+		--hotcrp-csv $(TARGETED_ASSIGNMENT_CSV) \
+		$(RESERVE_FLAG) $(PC_CHECK) $(AREA_CHAIR_CHECK) $(REGION_FLAG) $(JUNIOR_FLAG) $(COAUTHOR_COI) $(COLLABORATOR_COI) $(EXCLUDE_FLAG) \
+		> $(TARGETED_ASSIGNMENT)
+	@echo "" >&2
+	@echo "Churn this targeted rerun would cause, against what HotCRP holds today:" >&2
+	@echo "Read the goodness delta before uploading: churn that buys nothing is churn." >&2
+	$(RUN) scripts.diff_assignments $(CURRENT_ASSIGNMENT_CSV) $(TARGETED_ASSIGNMENT_CSV) \
+		--old-label live --new-label targeted-rerun --score-affinity >&2
 
 $(COMPLETE_ASSIGNMENT) $(COMPLETE_ASSIGNMENT_CSV) &: $(ASSIGN_DEPS)
 	$(RUN) scripts.assign_reviewers --paper-policy complete --csv "$(CSV)" \
