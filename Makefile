@@ -204,7 +204,7 @@ ASSIGN_DEPS = scripts/assign_reviewers.py src/reviewer_match/paper_matching.py \
 .PHONY: all enrich area-chairs reserve-need reserve-info reserve-pids reserves trc \
 	dblp-snapshot coauthor-coi collaborator-coi affiliation-countries pc-roster duplicates \
 	complete-papers area-chairs-complete clear-uploads baselines clean clean-fingerprints \
-	log-assignments reviewer-activity rerun targeted-rerun
+	log-assignments reviewer-activity rerun targeted-rerun swap-candidates
 
 all: $(SENIORITY) enrich $(FINGERPRINTS)
 	$(RUN) scripts.build_fingerprints --csv "$(CSV)" --fingerprint-cache $(FINGERPRINTS)
@@ -437,6 +437,35 @@ targeted-rerun: $(ASSIGN_DEPS) scripts/extract_log_assignments.py scripts/audit_
 	@echo "Read the goodness delta before uploading: churn that buys nothing is churn." >&2
 	$(RUN) scripts.diff_assignments $(CURRENT_ASSIGNMENT_CSV) $(TARGETED_ASSIGNMENT_CSV) \
 		--old-label live --new-label targeted-rerun --score-affinity >&2
+
+# A reviewer has left the committee entirely (or, with SWAP_PIDS set, just a
+# few named papers -- a late COI, an ability-to-review issue -- keeping the
+# rest of their load untouched) and needs no re-solve, just a proposal: for
+# each paper they leave short of the target slate size (the script's own
+# --reviewers-per-paper default, 5), which already-assigned reviewer on some
+# OTHER paper holding one more than that could move over without breaking any
+# standing rule (COI, area, country cap, the senior floor) and without having
+# already submitted the review they'd be leaving. Prints two ranked
+# candidates per short paper (primary + backup); nothing is solved globally
+# and nothing is uploaded -- see scripts/propose_reviewer_swaps.py.
+# DEPARTED_EMAIL is required, so a bare `make swap-candidates` fails loudly
+# rather than silently no-op'ing.
+DEPARTED_EMAIL ?=
+SWAP_PIDS ?=
+SWAP_PIDS_FLAG = $(if $(SWAP_PIDS),--departed-pids $(SWAP_PIDS),)
+SWAP_PAIRS_CSV = $(ASSIGNMENT_DIR)/proposed_swaps.csv
+
+swap-candidates: scripts/extract_log_assignments.py scripts/propose_reviewer_swaps.py \
+		src/reviewer_match/hotcrp_log.py src/reviewer_match/assignment_io.py \
+		src/reviewer_match/paper_matching.py $(SENIORITY) $(FINGERPRINTS) $(PAPER_FINGERPRINTS)
+	@test -n "$(DEPARTED_EMAIL)" || { echo "ERROR: make swap-candidates DEPARTED_EMAIL=<address>" >&2; exit 1; }
+	$(MAKE) log-assignments
+	$(RUN) scripts.propose_reviewer_swaps --departed-email "$(DEPARTED_EMAIL)" $(SWAP_PIDS_FLAG) \
+		--paper-policy $(PAPER_POLICY) --csv "$(CSV)" --area-chair-csv "$(AREA_CHAIR_CSV)" \
+		--current-csv $(CURRENT_ASSIGNMENT_CSV) --log $(LOG) \
+		--fingerprint-cache $(FINGERPRINTS) --paper-cache $(PAPER_FINGERPRINTS) \
+		--seniority $(SENIORITY) --pairs-csv $(SWAP_PAIRS_CSV) \
+		$(RESERVE_FLAG) $(PC_CHECK) $(AREA_CHAIR_CHECK) $(REGION_FLAG) $(JUNIOR_FLAG) $(COAUTHOR_COI) $(COLLABORATOR_COI) $(EXCLUDE_FLAG)
 
 $(COMPLETE_ASSIGNMENT) $(COMPLETE_ASSIGNMENT_CSV) &: $(ASSIGN_DEPS)
 	$(RUN) scripts.assign_reviewers --paper-policy complete --csv "$(CSV)" \

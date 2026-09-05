@@ -48,6 +48,14 @@ ENGAGEMENT_RE = re.compile(
     r"^(Download submission|Download reviews|Review \d+ (accepted|declined|edited))"
 )
 
+# "Review 18025 submitted: 1337 words" (first submission) / "Review 4861 edited,
+# submitted: ComAut, ..., 466 words" (a resubmission after edits) -- both
+# distinct from "Review N edited, updated draft: ..." / "Review N edited,
+# updated: ...", which are draft saves and do not mean submitted.
+SUBMIT_RE = re.compile(r"^Review (\d+) (?:submitted|edited, submitted):")
+# "Review 15 retracted" / "Review 726 deleted" -- either reverses a submission.
+UNSUBMIT_RE = re.compile(r"^Review (\d+) (?:retracted|deleted)$")
+
 
 @dataclass(frozen=True)
 class Review:
@@ -126,6 +134,30 @@ def replay_assignments(
             elif previous.pid != int(row["paper"]):
                 anomalies.append(("unassigned from a different paper", row))
     return live, anomalies
+
+
+def submitted_review_ids(rows: list[dict[str, str]]) -> set[int]:
+    """Review ids currently in "submitted" state, replayed chronologically.
+
+    Paired with `replay_assignments`'s `live` dict (`rid -> Review(pid,
+    email, ...)`), a caller builds `rid_by_pair = {(r.pid, r.email): rid for
+    rid, r in live.items()}` once, and `rid_by_pair.get((pid, email)) in
+    submitted_review_ids(rows)` answers "has this reviewer completed this
+    paper's review" for any live pair -- the question a reviewer-swap
+    proposal needs before offering to move someone off a review already
+    turned in. `rows` must be chronological -- see `load_log`.
+    """
+    submitted: dict[int, bool] = {}
+    for row in rows:
+        action = row["action"]
+        m = SUBMIT_RE.match(action)
+        if m:
+            submitted[int(m.group(1))] = True
+            continue
+        m = UNSUBMIT_RE.match(action)
+        if m:
+            submitted[int(m.group(1))] = False
+    return {rid for rid, state in submitted.items() if state}
 
 
 def live_pairs(live: dict[int, Review], kind: str = "primary", round: str = "R1") -> dict[int, set[str]]:

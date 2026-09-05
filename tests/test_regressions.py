@@ -58,6 +58,7 @@ from scripts import fill_open_slots
 from reviewer_match import hotcrp_log
 from scripts import extract_log_assignments
 from scripts import build_targeted_rerun_pins
+from scripts import propose_reviewer_swaps
 
 PCINFO_FIELDS = [
     "given_name", "family_name", "email", "affiliation", "orcid", "country",
@@ -6104,6 +6105,57 @@ class HotcrpLogTests(unittest.TestCase):
         self.assertEqual({"reader@x.edu", "accepter@x.edu"},
                          set(hotcrp_log.engagement_actions(rows)))
 
+    def submitted(self, rows):
+        tmp = Path(tempfile.mkdtemp())
+        path = write_log(tmp / "log.csv", rows)
+        return hotcrp_log.submitted_review_ids(hotcrp_log.load_log(str(path)))
+
+    def test_a_first_submission_counts_as_submitted(self):
+        self.assertEqual(
+            {7},
+            self.submitted([log_row("2026-08-01 09:00:00 -0400", "Review 7 submitted: 500 words", email="a@x.edu")]),
+        )
+
+    def test_an_edited_resubmission_counts_as_submitted(self):
+        self.assertEqual(
+            {7},
+            self.submitted([log_row(
+                "2026-08-01 09:00:00 -0400",
+                "Review 7 edited, submitted: ComAut, QueRevReb, 466 words", email="a@x.edu",
+            )]),
+        )
+
+    def test_a_draft_save_does_not_count_as_submitted(self):
+        self.assertEqual(set(), self.submitted([
+            log_row("2026-08-01 09:00:00 -0400", "Review 7 edited, updated draft: PapSum, N words", email="a@x.edu"),
+            log_row("2026-08-02 09:00:00 -0400", "Review 7 edited, updated: PapSum, N words", email="a@x.edu"),
+        ]))
+
+    def test_a_retraction_reverses_a_submission(self):
+        self.assertEqual(set(), self.submitted([
+            log_row("2026-08-01 09:00:00 -0400", "Review 7 submitted: 500 words", email="a@x.edu"),
+            log_row("2026-08-02 09:00:00 -0400", "Review 7 retracted", email="a@x.edu"),
+        ]))
+
+    def test_a_deletion_reverses_a_submission(self):
+        self.assertEqual(set(), self.submitted([
+            log_row("2026-08-01 09:00:00 -0400", "Review 7 submitted: 500 words", email="a@x.edu"),
+            log_row("2026-08-02 09:00:00 -0400", "Review 7 deleted", email="a@x.edu"),
+        ]))
+
+    def test_a_resubmission_after_retraction_counts_again(self):
+        self.assertEqual({7}, self.submitted([
+            log_row("2026-08-01 09:00:00 -0400", "Review 7 submitted: 500 words", email="a@x.edu"),
+            log_row("2026-08-02 09:00:00 -0400", "Review 7 retracted", email="a@x.edu"),
+            log_row("2026-08-03 09:00:00 -0400", "Review 7 edited, submitted: 520 words", email="a@x.edu"),
+        ]))
+
+    def test_ids_are_independent(self):
+        self.assertEqual({7}, self.submitted([
+            log_row("2026-08-01 09:00:00 -0400", "Review 7 submitted: 500 words", email="a@x.edu"),
+            log_row("2026-08-01 09:00:00 -0400", "Review 8 edited, updated draft: N words", email="b@x.edu"),
+        ]))
+
 
 class ExtractLogAssignmentsTests(unittest.TestCase):
     """extract_log_assignments.py: the log replay as a HotCRP upload file."""
@@ -6443,6 +6495,119 @@ class TargetedRerunPinsTests(unittest.TestCase):
         ):
             with self.assertRaises(SystemExit):
                 build_targeted_rerun_pins.main()
+
+
+class ProposeReviewerSwapsTests(unittest.TestCase):
+    """scripts.propose_reviewer_swaps: the pure helpers behind a swap proposal."""
+
+    def test_target_papers_splits_short_from_already_adequate(self):
+        pairs = {
+            1: {"dep@x.edu", "a@x.edu", "b@x.edu", "c@x.edu", "d@x.edu"},  # 5: short once dep leaves
+            2: {"dep@x.edu", "a@x.edu", "b@x.edu", "c@x.edu", "d@x.edu", "e@x.edu"},  # 6: fine
+            3: {"other@x.edu"},  # dep not on this one at all
+        }
+        short, fine = propose_reviewer_swaps.target_papers(pairs, "dep@x.edu", reviewers_per_paper=5)
+        self.assertEqual([1], short)
+        self.assertEqual([(2, 6)], fine)
+
+    def test_restrict_to_requested_pids_is_a_no_op_when_empty(self):
+        short, fine, ignored, not_held = propose_reviewer_swaps.restrict_to_requested_pids(
+            [1, 2], [(3, 6)], frozenset(),
+        )
+        self.assertEqual([1, 2], short)
+        self.assertEqual([(3, 6)], fine)
+        self.assertEqual([], ignored)
+        self.assertEqual([], not_held)
+
+    def test_restrict_to_requested_pids_keeps_only_named_papers_and_reports_the_rest(self):
+        # A partial departure: only pid 1 was actually asked for, so pid 2
+        # (also short) is left alone -- the reviewer keeps it -- and pid 3
+        # (also held, already fine) is dropped from the fine report too since
+        # it wasn't named either. pid 9 was named but isn't held at all.
+        short, fine, ignored, not_held = propose_reviewer_swaps.restrict_to_requested_pids(
+            [1, 2], [(3, 6)], frozenset({1, 9}),
+        )
+        self.assertEqual([1], short)
+        self.assertEqual([], fine)
+        self.assertEqual([2], ignored)
+        self.assertEqual([9], not_held)
+
+    def test_movable_source_pairs_only_takes_exact_donor_size_and_excludes_the_departed(self):
+        pairs = {
+            1: {"a@x.edu", "b@x.edu", "c@x.edu", "d@x.edu", "e@x.edu", "dep@x.edu"},  # 6: a donor
+            2: {"a@x.edu", "b@x.edu", "c@x.edu", "d@x.edu", "e@x.edu"},  # 5: not a donor
+        }
+        out = propose_reviewer_swaps.movable_source_pairs(pairs, "dep@x.edu", donor_size=6)
+        self.assertEqual(
+            {(1, "a@x.edu"), (1, "b@x.edu"), (1, "c@x.edu"), (1, "d@x.edu"), (1, "e@x.edu")},
+            set(out),
+        )
+
+    def test_unsubmitted_pairs_drops_submitted_and_unverifiable_pairs(self):
+        # b's review is already submitted; c has no matching review id in the
+        # log's own replay at all (unverifiable) -- both are dropped, not
+        # assumed safe. Only a survives.
+        reviewers_by_email = {
+            "a@x.edu": reviewer_with_email("a@x.edu"),
+            "b@x.edu": reviewer_with_email("b@x.edu"),
+        }
+        rid_by_pair = {(1, "a@x.edu"): 100, (1, "b@x.edu"): 200}
+        submitted = {200}
+        keep, dropped = propose_reviewer_swaps.unsubmitted_pairs(
+            [(1, "a@x.edu"), (1, "b@x.edu"), (1, "c@x.edu")],
+            reviewers_by_email, rid_by_pair, submitted,
+        )
+        self.assertEqual([(1, "a@x.edu")], keep)
+        self.assertEqual([(1, "b@x.edu"), (1, "c@x.edu")], dropped)
+
+    def test_unsubmitted_pairs_matches_on_the_hotcrp_email_not_the_roster_email(self):
+        # pc_membership can resolve someone under a second address; the log
+        # only ever knows their hotcrp_email, so matching has to go through it.
+        reviewers_by_email = {"roster@x.edu": reviewer_with_email("roster@x.edu", hotcrp_email="hotcrp@x.edu")}
+        rid_by_pair = {(1, "hotcrp@x.edu"): 100}
+        keep, dropped = propose_reviewer_swaps.unsubmitted_pairs(
+            [(1, "roster@x.edu")], reviewers_by_email, rid_by_pair, submitted=set(),
+        )
+        self.assertEqual([(1, "roster@x.edu")], keep)
+        self.assertEqual([], dropped)
+
+    def test_dedupe_by_email_keeps_the_better_gated_source_and_sorts_best_first(self):
+        candidates = [
+            propose_reviewer_swaps.Candidate("a@x.edu", source_pid=1, affinity=0.5, gated=False),
+            propose_reviewer_swaps.Candidate("a@x.edu", source_pid=2, affinity=0.9, gated=True),  # same person, better pick
+            propose_reviewer_swaps.Candidate("b@x.edu", source_pid=3, affinity=0.95, gated=False),  # higher affinity, not gated
+            propose_reviewer_swaps.Candidate("c@x.edu", source_pid=4, affinity=0.6, gated=True),
+        ]
+        deduped = propose_reviewer_swaps.dedupe_by_email(candidates)
+        # Gated candidates rank ahead of a higher-affinity ungated one; the
+        # duplicate "a" pick keeps its better (gated) source, not the first-seen one.
+        self.assertEqual(["a@x.edu", "c@x.edu", "b@x.edu"], [c.email for c in deduped])
+        self.assertEqual(2, deduped[0].source_pid)
+
+    def test_assign_unique_picks_never_names_the_same_reviewer_twice(self):
+        # "a" is every paper's best match, but can only ever be handed to one
+        # of them -- the others fall through to their own next-best distinct
+        # person instead of being denied a pick entirely.
+        feasible_by_pid = {
+            1: [propose_reviewer_swaps.Candidate("a@x.edu", 10, 0.99, True),
+                propose_reviewer_swaps.Candidate("b@x.edu", 11, 0.80, True)],
+            2: [propose_reviewer_swaps.Candidate("a@x.edu", 12, 0.98, True),
+                propose_reviewer_swaps.Candidate("c@x.edu", 13, 0.70, True)],
+        }
+        picks = propose_reviewer_swaps.assign_unique_picks(feasible_by_pid, top_n=2)
+        all_emails = [c.email for pid in picks for c in picks[pid]]
+        self.assertEqual(len(all_emails), len(set(all_emails)))
+        # Paper 1's affinity for "a" (0.99) beats paper 2's (0.98), so paper 1
+        # wins the contested pick and paper 2 falls back to "c".
+        self.assertEqual(["a@x.edu", "b@x.edu"], [c.email for c in picks[1]])
+        self.assertEqual(["c@x.edu"], [c.email for c in picks[2]])
+
+    def test_assign_unique_picks_caps_at_top_n_per_paper(self):
+        feasible_by_pid = {
+            1: [propose_reviewer_swaps.Candidate(f"r{i}@x.edu", i, i / 10, True) for i in range(5)],
+        }
+        picks = propose_reviewer_swaps.assign_unique_picks(feasible_by_pid, top_n=2)
+        self.assertEqual(["r4@x.edu", "r3@x.edu"], [c.email for c in picks[1]])
 
 
 if __name__ == "__main__":
