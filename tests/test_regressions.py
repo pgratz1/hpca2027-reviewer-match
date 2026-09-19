@@ -3,6 +3,7 @@ import contextlib
 import csv
 import io
 import json
+import math
 import os
 import random
 import subprocess
@@ -59,6 +60,9 @@ from reviewer_match import hotcrp_log
 from scripts import extract_log_assignments
 from scripts import build_targeted_rerun_pins
 from scripts import propose_reviewer_swaps
+from scripts import revision_cutoffs
+from scripts import assign_paper_leads
+from reviewer_match import review_scores
 
 PCINFO_FIELDS = [
     "given_name", "family_name", "email", "affiliation", "orcid", "country",
@@ -6608,6 +6612,222 @@ class ProposeReviewerSwapsTests(unittest.TestCase):
         }
         picks = propose_reviewer_swaps.assign_unique_picks(feasible_by_pid, top_n=2)
         self.assertEqual(["r4@x.edu", "r3@x.edu"], [c.email for c in picks[1]])
+
+
+class RevisionCutoffsTests(unittest.TestCase):
+    """review_scores + scripts.revision_cutoffs: which papers each net catches."""
+
+    NET = {key: condition for key, _, _, condition in review_scores.NETS}
+
+    def write_reviews(self, rows):
+        tmp = Path(tempfile.mkdtemp()) / "reviews.csv"
+        with open(tmp, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["paper", "title", "review", "email", review_scores.SCORE_FIELD])
+            writer.writerows(rows)
+        return str(tmp)
+
+    def test_an_average_exactly_on_the_cutoff_is_caught_by_le_only(self):
+        # 2,2,2,2 averages exactly 2.0: the case the two readings disagree on.
+        scores = [2, 2, 2, 2]
+        self.assertTrue(review_scores.caught(scores, 2.0, "le", self.NET["average"]))
+        self.assertFalse(review_scores.caught(scores, 2.0, "lt", self.NET["average"]))
+
+    def test_average_is_exact_not_floating_point(self):
+        # 15/6 is exactly 2.5; a float average must not tip it either way.
+        scores = [1, 2, 3, 3, 3, 3]
+        self.assertTrue(review_scores.caught(scores, 2.5, "le", self.NET["average"]))
+        self.assertFalse(review_scores.caught(scores, 2.5, "lt", self.NET["average"]))
+
+    def test_a_champion_spares_a_low_average_paper(self):
+        scores = [4, 1, 1, 1]  # average 1.75, one reviewer at 4
+        self.assertTrue(review_scores.caught(scores, 2.0, "le", self.NET["average"]))
+        self.assertFalse(review_scores.caught(scores, 2.0, "le", self.NET["no4"]))
+        self.assertTrue(review_scores.caught(scores, 2.0, "le", self.NET["one3"]))
+        self.assertFalse(review_scores.caught(scores, 2.0, "le", self.NET["no3"]))
+
+    def test_two_positive_reviewers_escape_the_at_most_one_net(self):
+        scores = [3, 3, 1, 1]  # average 2.0, no 4, but two 3s
+        self.assertTrue(review_scores.caught(scores, 2.0, "le", self.NET["no4"]))
+        self.assertFalse(review_scores.caught(scores, 2.0, "le", self.NET["one3"]))
+
+    def test_tabulate_counts_every_net_at_every_cutoff(self):
+        population = {1: [1, 1, 1, 1], 2: [2, 2, 2, 2], 3: [4, 1, 1, 1], 4: [3, 3, 3, 3]}
+        counts = revision_cutoffs.tabulate(population, [1.0, 2.0])
+        self.assertEqual([[1, 3], [1, 2], [1, 3], [1, 2]], counts["le"])
+        self.assertEqual([[0, 2], [0, 1], [0, 2], [0, 1]], counts["lt"])
+
+    def test_load_review_scores_skips_trc_pairs_case_insensitively(self):
+        path = self.write_reviews([
+            ["7", "T", "7A", "A@X.edu", "2"],
+            ["7", "T", "7B", "student@x.edu", "5"],
+            ["8", "U", "8A", "a@x.edu", "3"],
+        ])
+        scores, titles, skipped = review_scores.load_review_scores(
+            path, {(7, "student@x.edu")}
+        )
+        self.assertEqual({7: [2], 8: [3]}, scores)
+        self.assertEqual({(7, "student@x.edu")}, skipped)
+        self.assertEqual("T", titles[7])
+
+    def test_load_review_scores_refuses_a_review_without_a_score(self):
+        # Averaging over fewer scores than the paper has would move its average.
+        path = self.write_reviews([["7", "T", "7A", "a@x.edu", ""]])
+        with self.assertRaises(ValueError):
+            review_scores.load_review_scores(path)
+
+    def test_review_rounds_reads_trc_submissions_and_outstanding_r1(self):
+        def row(paper, email, action):
+            return {"date": "", "paper": str(paper), "email": "chair@x.edu",
+                    "affected_email": email, "action": action}
+        rows = [
+            row(7, "a@x.edu", "Review 1 assigned: primary, round R1"),
+            row(7, "b@x.edu", "Review 2 assigned: primary, round R1"),
+            row(7, "s@x.edu", "Review 3 assigned: external, round TRC"),
+            row(8, "t@x.edu", "Review 4 assigned: external, round TRC"),
+            row(7, "a@x.edu", "Review 1 submitted: 900 words"),
+            row(7, "s@x.edu", "Review 3 submitted: 400 words"),
+        ]
+        training, outstanding = review_scores.review_rounds(rows)
+        self.assertEqual({(7, "s@x.edu")}, training)  # t@x.edu never submitted
+        self.assertEqual({7: 1}, dict(outstanding))  # a TRC review is never "outstanding"
+
+    def test_eligible_pids_drops_desk_rejects_withdrawals_and_exclusions(self):
+        papers = [
+            {"pid": 1, "status": "submitted", "tags": []},
+            {"pid": 2, "status": "submitted", "tags": ["~~desk-reject#0"]},
+            {"pid": 3, "status": "withdrawn", "tags": []},
+            {"pid": 4, "status": "submitted", "tags": ["~~track_3#0"]},
+        ]
+        tmp = Path(tempfile.mkdtemp()) / "data.json"
+        tmp.write_text(json.dumps(papers), encoding="utf-8")
+        eligible, desk_rejected = review_scores.eligible_pids(str(tmp), frozenset({4}))
+        self.assertEqual({1}, eligible)
+        self.assertEqual({2}, desk_rejected)
+
+    def test_histogram_bins_are_upper_inclusive(self):
+        # "<= 2.0" gains exactly the (1.75, 2.0] bin over "<= 1.75".
+        population = {1: [1, 1, 1, 1], 2: [2, 2, 2, 2], 3: [2, 2, 2, 3]}
+        bins = revision_cutoffs.histogram(population, 0.25)
+        by_hi = {b["hi"]: b["n"] for b in bins}
+        self.assertEqual(1, by_hi[1.0])
+        self.assertEqual(1, by_hi[2.0])
+        self.assertEqual(1, by_hi[2.25])
+        self.assertEqual(3, sum(b["n"] for b in bins))
+
+    def test_parse_thresholds_rejects_a_cutoff_off_the_scale(self):
+        self.assertEqual([1.0, 2.0, 2.5], review_scores.parse_thresholds("2.5,1,2,2"))
+        with self.assertRaises(ValueError):
+            review_scores.parse_thresholds("0.5,2")
+
+
+class PaperLeadTests(unittest.TestCase):
+    """review_scores.Bar + scripts.assign_paper_leads: who leads which paper."""
+
+    def test_fewer_reviews_than_the_floor_always_advance(self):
+        bar = review_scores.Bar()
+        self.assertEqual(review_scores.FEW_REVIEWS, bar.advances([1, 1, 1]))
+        self.assertEqual(review_scores.FEW_REVIEWS, bar.advances([]))
+
+    def test_the_default_bar(self):
+        bar = review_scores.Bar()  # under: average <= 2.5 and at most one score >= 3
+        self.assertEqual(review_scores.OVER_BAR, bar.advances([3, 2, 2, 3]))  # two 3s
+        self.assertEqual(review_scores.OVER_BAR, bar.advances([3, 3, 3, 3]))  # average 3
+        self.assertIsNone(bar.advances([4, 2, 2, 2]))  # exactly 2.5, one score >= 3
+        self.assertIsNone(bar.advances([1, 2, 2, 2]))
+
+    def test_an_average_on_the_cutoff_advances_only_under_lt(self):
+        bar = review_scores.Bar(comparator="lt")
+        self.assertEqual(review_scores.OVER_BAR, bar.advances([4, 2, 2, 2]))
+
+    def test_bar_rejects_an_unknown_net(self):
+        with self.assertRaises(ValueError):
+            review_scores.Bar(net="nope")
+
+    def test_targets_are_proportional_and_sum_to_the_papers(self):
+        pool = ["full@x", "light@x"]
+        targets = assign_paper_leads.proportional_targets(
+            pool, {"full@x": 14, "light@x": 7}, {"full@x": 0, "light@x": 0},
+            {"full@x": 10, "light@x": 10}, 3,
+        )
+        self.assertEqual({"full@x": 2, "light@x": 1}, targets)
+
+    def test_targets_respect_the_cap_and_the_floor(self):
+        pool = ["a", "b", "c"]
+        weights = {"a": 10, "b": 10, "c": 10}
+        # a reviewed only one of the papers; c is the only possible lead on three.
+        targets = assign_paper_leads.proportional_targets(
+            pool, weights, {"a": 0, "b": 0, "c": 3}, {"a": 1, "b": 6, "c": 6}, 6,
+        )
+        self.assertEqual(1, targets["a"])
+        self.assertEqual(3, targets["c"])
+        self.assertEqual(6, sum(targets.values()))
+
+    def test_quotas_round_each_target_and_sum_exactly(self):
+        from fractions import Fraction
+        targets = {e: Fraction(7, 3) for e in "abc"} | {"d": Fraction(3, 1)}
+        for seed in range(20):
+            quotas = assign_paper_leads.systematic_quotas(targets, random.Random(seed))
+            self.assertEqual(10, sum(quotas.values()))
+            for e, t in targets.items():
+                self.assertIn(quotas[e], (math.floor(t), math.ceil(t)))
+
+    def test_every_staffed_paper_gets_one_eligible_lead(self):
+        candidates = {1: ["a", "b"], 2: ["b", "c"], 3: ["a", "c"], 4: []}
+        weights = {"a": 7, "b": 7, "c": 15}
+        draw = assign_paper_leads.assign_leads(candidates, weights, {}, random.Random(3))
+        self.assertEqual({1, 2, 3}, set(draw.leads))
+        for pid, email in draw.leads.items():
+            self.assertIn(email, candidates[pid])
+        self.assertEqual("unassignable", draw.status[4])
+
+    def test_augmenting_path_avoids_going_over_quota(self):
+        # Paper 1 can only be led by x; paper 2 by x or y. Whatever order the
+        # draw takes them in, 2 must end up with y so both fit the quotas.
+        candidates = {1: ["x"], 2: ["x", "y"]}
+        for seed in range(20):
+            draw = assign_paper_leads.assign_leads(candidates, {"x": 7, "y": 7}, {}, random.Random(seed))
+            self.assertEqual({1: "x", 2: "y"}, draw.leads)
+            self.assertEqual([], draw.over_quota)
+
+    def test_existing_leads_are_kept_cleared_or_redrawn(self):
+        candidates = {1: ["a", "b"], 2: ["b", "c"], 3: []}
+        existing = {1: "a", 2: "gone@x", 3: "b"}
+        draw = assign_paper_leads.assign_leads(
+            candidates, {"a": 7, "b": 7, "c": 7}, existing, random.Random(1)
+        )
+        self.assertEqual("kept", draw.status[1])
+        self.assertEqual("a", draw.leads[1])
+        self.assertEqual("redrawn", draw.status[2])
+        self.assertIn(draw.leads[2], ("b", "c"))
+        self.assertEqual([3], draw.clears)  # nobody eligible now: the old lead goes
+        rows = assign_paper_leads.upload_rows(draw, extra_clears=[9])
+        self.assertEqual([(3, "clearlead", ""), (9, "clearlead", ""), (2, "lead", draw.leads[2])], rows)
+
+    def test_the_same_seed_draws_the_same_leads(self):
+        candidates = {pid: ["a", "b", "c", "d"] for pid in range(12)}
+        weights = {"a": 14, "b": 14, "c": 7, "d": 7}
+        first = assign_paper_leads.assign_leads(candidates, weights, {}, random.Random(5))
+        again = assign_paper_leads.assign_leads(candidates, weights, {}, random.Random(5))
+        self.assertEqual(first.leads, again.leads)
+        # Loads follow the weights exactly when the shares are whole: 12 papers
+        # over weights 14/14/7/7 is 4/4/2/2, whatever the seed.
+        for seed in range(10):
+            draw = assign_paper_leads.assign_leads(candidates, weights, {}, random.Random(seed))
+            self.assertEqual({"a": 4, "b": 4, "c": 2, "d": 2}, dict(Counter(draw.leads.values())))
+
+    def test_load_leads_replays_lead_and_clearlead_rows(self):
+        tmp = Path(tempfile.mkdtemp()) / "pcassignments.csv"
+        tmp.write_text(
+            "paper,action,email,round,title\n"
+            "1,clearreview,#pc,any,T\n"
+            "1,primaryreview,a@x.edu,R1\n"
+            "1,lead,A@X.edu\n"
+            "2,lead,b@x.edu\n"
+            "2,clearlead,\n",
+            encoding="utf-8",
+        )
+        self.assertEqual({1: "a@x.edu"}, assignment_io.load_leads(str(tmp)))
 
 
 if __name__ == "__main__":

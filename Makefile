@@ -15,6 +15,8 @@
 #   make trc              enrich, fingerprint, and assign TRC (PhD student) reviews
 #   make clear-uploads    HotCRP CSVs that wipe R1 reviews and the track tags
 #   make baselines        randomized arms: how much of the match is SPECTER2?
+#   make revision-cutoffs share of reviewed papers each revision cutoff would catch
+#   make paper-leads      random, load-balanced leads for papers that advance
 #   make clean            remove assignment outputs only
 #   make clean-fingerprints  remove embedding caches, never DBLP caches
 
@@ -204,7 +206,8 @@ ASSIGN_DEPS = scripts/assign_reviewers.py src/reviewer_match/paper_matching.py \
 .PHONY: all enrich area-chairs reserve-need reserve-info reserve-pids reserves trc \
 	dblp-snapshot coauthor-coi collaborator-coi affiliation-countries pc-roster duplicates \
 	complete-papers area-chairs-complete clear-uploads baselines clean clean-fingerprints \
-	log-assignments reviewer-activity rerun targeted-rerun swap-candidates
+	log-assignments reviewer-activity rerun targeted-rerun swap-candidates \
+	revision-cutoffs paper-leads
 
 all: $(SENIORITY) enrich $(FINGERPRINTS)
 	$(RUN) scripts.build_fingerprints --csv "$(CSV)" --fingerprint-cache $(FINGERPRINTS)
@@ -516,6 +519,40 @@ baselines: $(ASSIGN_DEPS) scripts/compare_baselines.py
 	done
 	$(RUN) scripts.compare_baselines $(EVALUATION_DIR)/pairs-armA.csv \
 		$(EVALUATION_DIR)/pairs-armB-*.csv $(EVALUATION_DIR)/pairs-armC-*.csv
+
+# What share of the papers with REVISION_MIN_REVIEWS+ submitted reviews each
+# revision-eligibility net would catch, by average pre-rebuttal overall merit,
+# at "<=" and "<" alike. TRC reviews are left out (identified from the action
+# log, which also counts each paper's outstanding reviews). Offline, instant,
+# read-only apart from its two reports. REVISION_FLAGS passes more through,
+# e.g. REVISION_FLAGS=--complete-only or REVISION_FLAGS=--include-trc.
+REVIEWS = $(INPUT_DIR)/hpca2027-reviews.csv
+REVISION_MIN_REVIEWS ?= 4
+REVISION_FLAGS ?=
+revision-cutoffs: scripts/revision_cutoffs.py src/reviewer_match/review_scores.py src/reviewer_match/hotcrp_log.py
+	@test -f $(REVIEWS) || { echo "ERROR: $(REVIEWS) not found; download the reviews CSV from HotCRP" >&2; exit 1; }
+	@test -f $(LOG) || { echo "ERROR: $(LOG) not found; download the action log from HotCRP" >&2; exit 1; }
+	$(RUN) scripts.revision_cutoffs --reviews $(REVIEWS) --log $(LOG) --data $(DATA) \
+		--min-reviews $(REVISION_MIN_REVIEWS) $(EXCLUDE_FLAG) $(REVISION_FLAGS)
+
+# One discussion lead per paper that advances to revision: fewer than
+# REVISION_MIN_REVIEWS submitted PC reviews, or over the bar (default: not
+# "average <= 2.5 and at most one score of 3 or better"; LEAD_FLAGS="--bar-cutoff
+# 2.25 --bar-net no4" changes it). Drawn at random from the paper's own submitted
+# full/light PC reviewers, with lead load proportional to assigned review load.
+# Existing leads in the PC-assignments download are kept; the upload is a delta.
+# Nothing is uploaded. LEAD_SEED changes the draw.
+PCASSIGNMENTS = $(INPUT_DIR)/hpca2027-pcassignments.csv
+LEAD_SEED ?= 1
+LEAD_FLAGS ?=
+paper-leads: scripts/assign_paper_leads.py src/reviewer_match/review_scores.py \
+		src/reviewer_match/assignment_io.py src/reviewer_match/hotcrp_log.py
+	@for f in $(REVIEWS) $(LOG) $(PCASSIGNMENTS); do \
+	  test -f $$f || { echo "ERROR: $$f not found; download it from HotCRP" >&2; exit 1; }; \
+	done
+	$(RUN) scripts.assign_paper_leads --reviews $(REVIEWS) --log $(LOG) --data $(DATA) \
+		--pcassignments $(PCASSIGNMENTS) --min-reviews $(REVISION_MIN_REVIEWS) \
+		--seed $(LEAD_SEED) $(EXCLUDE_FLAG) $(LEAD_FLAGS)
 
 clean:
 	rm -f $(ASSIGNMENT) $(ASSIGNMENT_CSV) $(AREA_CHAIR_ASSIGNMENT) \

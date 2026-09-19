@@ -1609,6 +1609,120 @@ One carry-over from the normal pipeline: the upload opens with
 review on a paper the run excluded — today, the chair's two test reviews on the
 `EXCLUDE_PIDS` paper.
 
+### `scripts/revision_cutoffs.py` — how many papers a revision cutoff would catch
+
+`make revision-cutoffs` is decision support for the revision-eligibility cutoff:
+of the papers holding at least `REVISION_MIN_REVIEWS` (4) submitted reviews,
+what share would each *net* catch, by average pre-rebuttal overall merit. The
+nets start from the same average test and add a guard for papers that have
+someone arguing for them:
+
+| Net | Caught when the average is at/below the cutoff and... |
+|---|---|
+| average only | (nothing more) |
+| + no score of 4 or better | no reviewer scored it 4 or 5 |
+| + at most one score of 3 or better | no more than one reviewer scored it 3+ |
+| + no score of 3 or better | every reviewer scored it 1 or 2 |
+
+`NETS` in `src/reviewer_match/review_scores.py` is the one place to add another. Default cutoffs are 1,
+1.5, 2, 2.5 and 3 (`REVISION_FLAGS="--thresholds 1.5,1.75,2"` changes them).
+
+Inputs are `data/inputs/hpca2027-reviews.csv` (HotCRP's review CSV export,
+which carries submitted reviews only), the action log and the paper export.
+Three choices worth knowing:
+
+- **Every figure is reported at both "average ≤ cutoff" and "average <
+  cutoff".** Scores are integers and most papers have four to six, so many
+  averages land exactly on a cutoff: at 2.0 the two differ by about 18 points
+  of the population. The policy has to say which one it means.
+- **TRC reviews are left out** of both the count and the average
+  (`REVISION_FLAGS=--include-trc` counts them). The export does not name a
+  review's round, so they are found in the action log. It is the same replay
+  that counts each paper's **outstanding** R1 reviews. While reviews are still
+  arriving, most of the "4+ reviews" population has one more to come;
+  `REVISION_FLAGS=--complete-only` restricts to papers with none outstanding.
+- Desk-rejected (`~~desk-reject`) and `EXCLUDE_PIDS` papers are left out.
+
+Results go to stdout as two tables (≤ and <). `outputs/reports/revision_cutoffs.html`
+is a self-contained chart page (share caught vs cutoff per net, with a ≤/<
+switch, plus the distribution of paper averages), and
+`outputs/reports/revision_cutoffs_papers.csv` has one row per paper (scores,
+average, outstanding reviews), lowest average first. Both carry confidential
+review data and are gitignored. Offline, instant, read-only.
+
+### `scripts/assign_paper_leads.py` — a random, balanced lead for every paper that advances
+
+`make paper-leads` gives every paper that advances to revision one discussion
+lead and writes the HotCRP upload for it. It uploads nothing.
+
+**Which papers advance.** Every paper still under review that either has fewer
+than `REVISION_MIN_REVIEWS` (4) submitted PC reviews, or is over the bar. The
+bar is `review_scores.Bar`, the same definition `make revision-cutoffs`
+measures. By default a paper is **under** it when its average is ≤ 2.5 **and**
+at most one reviewer scored it 3 or better, so a paper averaging exactly 2.5
+with one 3+ does not advance. To change it:
+`make paper-leads LEAD_FLAGS="--bar-cutoff 2.25 --bar-net no4"`, where
+`--bar-comparator lt` lets an average on the cutoff through. TRC reviews count
+towards neither the floor nor the average.
+
+**Who can lead.** Only a full or light PC member who has submitted their review
+of *that* paper. The reserves promoted onto the PC (`~~ex-rr`) are light PC
+here, while other reserves, TRC students and anyone on no roster never lead. A
+paper with no such reviewer is listed as unassignable, with the reason, and
+needs a hand-picked lead or a rerun once a review arrives.
+
+**How many each.** Lead load is proportional to review load. The weight is the
+number of R1 reviews HotCRP's PC-assignments download
+(`data/inputs/hpca2027-pcassignments.csv`) gives each person, so a 15-review full
+member leads about twice as many papers as a 7-review light one. Each share is
+`L × weight ÷ total weight`, clipped between what the person is committed to
+(kept leads, and papers they are the *only* possible lead for) and how many of
+the papers they reviewed. It is then rounded up or down at random, keeping the
+expected value equal to the share and the total equal to L.
+
+**The draw.** Papers come in random order, and each takes a uniformly random
+eligible reviewer with quota left. If none has quota, earlier draws are
+shuffled along an augmenting path to free a slot. A paper is placed over quota
+only when no assignment within the quotas exists: when a small group of
+reviewers are the only possible leads for more papers than their quotas add up
+to. The report counts and names those papers. `LEAD_SEED` picks the draw; the
+same inputs and seed reproduce it byte for byte.
+
+**Reruns keep existing leads.** The `lead` rows of the PC-assignments download,
+or of `--existing-leads PATH`, are what HotCRP holds today:
+
+- a lead who is still an eligible reviewer of a paper that still advances is
+  **kept**, and counts towards their load;
+- a paper that no longer advances gets **`clearlead`**;
+- a lead who is no longer eligible is **replaced**.
+
+`LEAD_FLAGS=--no-keep-leads` draws everything afresh.
+
+Outputs:
+
+- `outputs/assignments/lead_upload.csv`: the HotCRP bulk-assignment **delta**
+  (`paper,action,email`; `clearlead` rows first, then `lead` rows for new and
+  replaced leads). Kept leads are not repeated, so a rerun with nothing to
+  change writes only the header.
+- `outputs/reports/paper_leads.csv`: one row per advancing paper, giving the
+  reason, reviews still outstanding, the scores, the number of candidates, the
+  lead and a status of kept, new, redrawn or unassignable.
+- `outputs/reports/lead_loads.csv`: one row per possible lead, giving weight,
+  papers reviewed, target, quota, leads and how far over quota.
+
+stdout carries the per-tier balance (mean reviews, mean leads, the full ÷
+light ratio of each) and four self-checks that must be 0. The script exits 1
+if any is not.
+
+Workflow:
+
+1. Download fresh reviews, log, paper and **PC-assignments** exports.
+2. Run `make paper-leads` and read the summary and the unassignable list.
+3. Upload `lead_upload.csv` through HotCRP's bulk assignment and check its
+   preview before saving.
+4. **Before any rerun, download the PC assignments again.** That download is how
+   the next run learns which leads to keep.
+
 ## Publication exclusions
 
 `data/curated/publication_exclusions.csv` is an optional hand-maintained file with columns
@@ -1710,6 +1824,9 @@ back into, so it is also hand-maintained. `data/inputs/reserve_reviewer_upload.c
 HotCRP reserve-reviewer upload) and `data/inputs/reserve_reviewers_vetting_final.xlsx` (the
 recruiting workbook holding their DBLP links) are the inputs to
 `scripts/build_reserve_reviewer_info.py` — also sensitive.
+`data/inputs/hpca2027-reviews.csv` is HotCRP's review CSV export (every submitted
+review with its scores and text — confidential), read only by
+`scripts/revision_cutoffs.py`.
 `data/inputs/hpca2027-log.csv` is the HotCRP **action log** (Log → download), and
 is the most sensitive file in the repo: it records an IP address and a timestamp
 for every action every PC member and author has ever taken. It is gitignored by

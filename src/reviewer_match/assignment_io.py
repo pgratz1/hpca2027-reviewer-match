@@ -7,7 +7,8 @@
 `phase`/`affinity` alongside. Both are `(pid, email)` pairs underneath, and
 `scripts/diff_assignments.py` and `scripts/fill_open_slots.py` both need to
 read either one -- this is the one place that parsing lives, so neither
-duplicates it.
+duplicates it. `load_leads` reads the discussion-lead rows of the same HotCRP
+shape, which `load_assignment_pairs` skips.
 """
 
 from __future__ import annotations
@@ -33,11 +34,13 @@ def sniff_format(path: str) -> str:
 
     Raises ValueError on anything else rather than guessing: a shape this
     doesn't recognise should fail loudly, not be silently misparsed as the
-    wrong one.
+    wrong one. The one tolerance is trailing columns after the HotCRP four:
+    HotCRP's own Search -> Download -> "Review assignments" export appends a
+    `title` column, and it is the authoritative record of what HotCRP holds.
     """
     with open(path, newline="", encoding="utf-8") as f:
         header = next(csv.reader(f), None)
-    if header == list(HOTCRP_CSV_HEADER):
+    if header is not None and header[:len(HOTCRP_CSV_HEADER)] == list(HOTCRP_CSV_HEADER):
         return "hotcrp"
     if header == list(PAIRS_CSV_HEADER):
         return "pairs"
@@ -52,7 +55,9 @@ def load_assignment_pairs(path: str) -> tuple[str, dict[int, dict[str, Pair]]]:
 
     A hotcrp-csv's `clearreview` bookkeeping row, and any row whose `action`
     isn't `primaryreview`, are skipped -- the housekeeping row this pipeline
-    always writes first is a no-op here rather than a phantom pid.
+    always writes first is a no-op here rather than a phantom pid. A
+    hotcrp-csv's emails are case-folded: HotCRP's own export preserves display
+    casing, while every roster key here is lower-case.
     """
     fmt = sniff_format(path)
     pairs: dict[int, dict[str, Pair]] = {}
@@ -63,7 +68,7 @@ def load_assignment_pairs(path: str) -> tuple[str, dict[int, dict[str, Pair]]]:
                 if row["action"] != "primaryreview":
                     continue
                 pid = int(row["paper"])
-                pairs.setdefault(pid, {})[row["email"]] = Pair()
+                pairs.setdefault(pid, {})[row["email"].strip().lower()] = Pair()
             else:
                 pid = int(row["pid"])
                 affinity = float(row["affinity"]) if row["affinity"] else None
@@ -99,3 +104,32 @@ def remap_pairs(
         pid: {email_map.get(email, email): pair for email, pair in emails.items()}
         for pid, emails in pairs.items()
     }
+
+
+LEAD_CSV_HEADER = ("paper", "action", "email")
+
+
+def load_leads(path: str) -> dict[int, str]:
+    """{pid: lead's HotCRP address} from the `lead` rows of an assignment CSV.
+
+    Reads anything whose header starts `paper,action,email`: HotCRP's own
+    PC-assignments download and `assign_paper_leads.py`'s upload alike. Rows
+    are replayed in order, so a `clearlead` (or its alias `nolead`) cancels an
+    earlier `lead` for the same paper; every other action is ignored. Emails
+    are case-folded, as in `load_assignment_pairs`.
+    """
+    leads: dict[int, str] = {}
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        header = next(reader, None)
+        if header is None or header[:len(LEAD_CSV_HEADER)] != list(LEAD_CSV_HEADER):
+            raise ValueError(f"{path}: unrecognised header {header!r}; expected it to start {LEAD_CSV_HEADER}")
+        for row in reader:
+            if len(row) < len(LEAD_CSV_HEADER):
+                continue
+            paper, action, email = row[0], row[1].strip().lower(), row[2]
+            if action == "lead":
+                leads[int(paper)] = email.strip().lower()
+            elif action in ("clearlead", "nolead"):
+                leads.pop(int(paper), None)
+    return leads

@@ -176,6 +176,42 @@ contains spaces and parentheses — always quote it in shell commands).
   `reviewers_pinned.txt`. `rerun` runs both, then `assign_reviewers.py
   --pin-csv/--pin-emails`, into `assignment-rerun.*` — **never over
   `assignment.csv`** — and prints the churn diff. Nothing is uploaded.
+- **`make revision-cutoffs`** is decision support for the revision cutoff: of
+  the papers with `REVISION_MIN_REVIEWS` (4) submitted reviews, what share each
+  net catches by average pre-rebuttal overall merit. The average test on its
+  own, then with "no score ≥4", "at most one score ≥3" or "no score ≥3" added
+  (`NETS` in `review_scores.py`). Reads `data/inputs/hpca2027-reviews.csv` (HotCRP's
+  review export, submitted reviews only), the log and the paper export.
+  **Always reports both ≤ and <**: integer scores put many averages exactly on
+  a cutoff, and at 2.0 the two differ by ~18 points. **TRC reviews are
+  excluded** from count and average (`REVISION_FLAGS=--include-trc`). The
+  export carries no round, so they come from the log, which also counts
+  outstanding R1 reviews (`REVISION_FLAGS=--complete-only`). Desk-rejected
+  papers are dropped. Writes `outputs/reports/revision_cutoffs.html` and
+  `revision_cutoffs_papers.csv`. Offline, instant, read-only.
+- **`make paper-leads`** gives every paper that advances one discussion lead
+  and writes `outputs/assignments/lead_upload.csv`, a HotCRP **delta**
+  (`clearlead`, then `lead` rows). A paper advances with fewer than
+  `REVISION_MIN_REVIEWS` submitted PC reviews, or when it is over
+  `review_scores.Bar`, the one bar definition `revision-cutoffs` also
+  measures. The default is "under: average ≤ 2.5 and ≤1 score ≥3", changed
+  via `LEAD_FLAGS="--bar-cutoff … --bar-net … --bar-comparator …"`.
+  - **Leads:** only a full/light PC member who **submitted their review of that
+    paper**. `~~ex-rr` promotions count as light PC; reserves, TRC and people
+    on no roster never lead.
+  - **Load:** proportional to the R1 reviews in `hpca2027-pcassignments.csv`.
+    Each share is clipped to [committed, papers reviewed], where committed is
+    kept leads plus sole-candidate papers; without that floor, sole-candidate
+    papers go over quota.
+  - **Draw:** each share is rounded at random (systematic sampling), then filled
+    by a random draw with Kuhn augmenting paths. Over-quota happens only when no
+    in-quota assignment exists, and it is counted, never hidden.
+  - **Reruns keep existing leads** (the `lead` rows of the PC-assignments
+    download), clear leads on papers that no longer advance, and redraw
+    ineligible ones. Kept leads are never moved.
+  - **Determinism:** everything is sorted before it is shuffled, and one
+    `random.Random(LEAD_SEED)` makes the output byte-identical per seed.
+  - **Self-checks** must be 0 (the script exits 1 otherwise).
 - `make complete-papers` and `make area-chairs-complete` retain the former
   completeness filter in separate `*-complete.txt` artifacts.
 - Library modules (imported, never run): `src/reviewer_match/reviewers.py`, `src/reviewer_match/dblp.py`,
@@ -183,7 +219,7 @@ contains spaces and parentheses — always quote it in shell commands).
   `src/reviewer_match/reserve_reviewers.py`, `src/reviewer_match/roster.py`, `src/reviewer_match/affiliation_country.py`,
   `src/reviewer_match/pc_membership.py`, `src/reviewer_match/coauthor_coi.py`,
   `src/reviewer_match/collaborator_coi.py`, `src/reviewer_match/hotcrp_log.py`,
-  `src/reviewer_match/assignment_io.py`. Runnable
+  `src/reviewer_match/assignment_io.py`, `src/reviewer_match/review_scores.py`. Runnable
   scripts: `scripts/audit_pc_roster.py`, `scripts/find_duplicate_accounts.py`,
   `scripts/audit_coauthor_conflicts.py`, `scripts/audit_collaborator_conflicts.py`,
   `scripts/audit_reserve_identities.py`, `scripts/classify_reviewers.py`, `scripts/build_fingerprints.py`,
@@ -196,6 +232,7 @@ contains spaces and parentheses — always quote it in shell commands).
   `scripts/resolve_trc_members.py`, `scripts/compare_baselines.py`,
   `scripts/extract_log_assignments.py`, `scripts/audit_reviewer_activity.py`,
   `scripts/diff_assignments.py`, `scripts/fill_open_slots.py`,
+  `scripts/revision_cutoffs.py`, `scripts/assign_paper_leads.py`,
   `scripts/main.py`.
 
 ## Architecture (filter-then-rank, then constrained assignment)
