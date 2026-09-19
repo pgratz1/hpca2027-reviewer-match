@@ -11,6 +11,14 @@
         --include-reserves --reserve-cap 6 --same-country-cap 1 --max-juniors 2 \\
         --exclude-pids 1152
 
+    # The chair already knows a proposed mover has started (or is already
+    # committed to a different paper's swap) before the log export reflects
+    # it -- --exclude-movers hard-drops them regardless of what the log says:
+    python -m scripts.propose_reviewer_swaps --departed-email person@example.edu \\
+        --departed-pids 1991 --exclude-movers /tmp/exclude.txt \\
+        --paper-policy submitted --include-reserves --reserve-cap 6 \\
+        --same-country-cap 1 --max-juniors 2 --exclude-pids 1152
+
 Unlike scripts.fill_open_slots, which only ever *adds* a reviewer with spare
 capacity, this proposes *moving* an already-assigned reviewer off a paper
 that currently holds `--reviewers-per-paper + 1` reviewers (the
@@ -71,6 +79,7 @@ from reviewer_match.reviewers import DEFAULT_CAP_OVERRIDES, load_reviewers
 from reviewer_match.roster import DEFAULT_AREA_CHAIR_CSV
 
 from scripts import assign_reviewers as ar
+from scripts.build_targeted_rerun_pins import load_email_list
 from scripts.classify_reviewers import DEFAULT_OUT as DEFAULT_SENIORITY, load_seniority
 
 DEFAULT_CURRENT_CSV = assignment_path("current_assignment.csv")
@@ -132,17 +141,21 @@ def restrict_to_requested_pids(
 
 
 def movable_source_pairs(
-    pairs: dict[int, dict], departed_email: str, donor_size: int
+    pairs: dict[int, dict], departed_email: str, donor_size: int, leaving: frozenset[int] = frozenset()
 ) -> list[tuple[int, str]]:
     """[(source pid, email)] for every reviewer on a paper holding exactly `donor_size`.
 
     Removing one of them leaves the donor paper at exactly `donor_size - 1`
     (== --reviewers-per-paper) -- never fewer, per the chair's own rule that a
-    move must leave 5 behind.
+    move must leave 5 behind. A paper in `leaving` (one the departed reviewer
+    is coming off) is sized without them: it already loses one seat to the
+    departure, so a 6-reviewer slate there is really a 5 and donating from it
+    would leave 4.
     """
     out = []
     for pid, emails in pairs.items():
-        if len(emails) != donor_size:
+        size = len(emails) - (1 if pid in leaving and departed_email in emails else 0)
+        if size != donor_size:
             continue
         for email in emails:
             if email != departed_email:
@@ -172,6 +185,21 @@ def unsubmitted_pairs(
         else:
             keep.append((pid, email))
     return keep, dropped
+
+
+def exclude_named_movers(
+    pairs: list[tuple[int, str]], excluded: set[str]
+) -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
+    """Split `pairs` into (kept, dropped) by a hand-maintained --exclude-movers list.
+
+    Same shape as `unsubmitted_pairs`'s split, for the same reason: a mover
+    the log has not caught up to yet (started a review after the log was
+    exported) or one already committed to another paper's swap outside this
+    run is not a safe donor even though the log itself sees nothing wrong.
+    """
+    kept = [(pid, email) for pid, email in pairs if email not in excluded]
+    dropped = [(pid, email) for pid, email in pairs if email in excluded]
+    return kept, dropped
 
 
 def dedupe_by_email(candidates: list[Candidate]) -> list[Candidate]:
@@ -221,6 +249,10 @@ def main() -> int:
     parser.add_argument("--departed-pids", type=parse_exclude_pids, default=frozenset(),
                          help="comma-separated paper IDs to reassign, restricting which of the departed "
                               "reviewer's papers are touched (default: every paper they hold, i.e. a full departure)")
+    parser.add_argument("--exclude-movers", metavar="PATH",
+                         help="hand-maintained file, one lowercased email per line, of reviewers to exclude from "
+                              "candidacy entirely -- e.g. someone known to have started a review the log has not "
+                              "caught up to yet, or already committed to another paper's swap outside this run")
     parser.add_argument("--current-csv", default=DEFAULT_CURRENT_CSV, help="what HotCRP currently holds (--hotcrp-csv or --pairs-csv shape)")
     parser.add_argument("--log", default=DEFAULT_LOG, help="HotCRP action log, for each candidate's submitted/not-submitted status")
     parser.add_argument("--pairs-csv", metavar="PATH", help="write the proposed picks (target_pid,rank,add_email,source_pid,remove_email,affinity)")
@@ -356,7 +388,8 @@ def main() -> int:
         return 0
     short_papers = [papers_by_pid[pid] for pid in short_pids]
 
-    raw_movable = movable_source_pairs(current_pairs, departed_email, donor_size)
+    leaving = frozenset(short_pids) | {pid for pid, _ in fine_pids}
+    raw_movable = movable_source_pairs(current_pairs, departed_email, donor_size, leaving)
     print(f"{len(raw_movable)} reviewer-paper pair(s) on a {donor_size}-reviewer paper are candidate donors "
           f"across {len({pid for pid, _ in raw_movable})} paper(s).", file=sys.stderr)
 
@@ -377,6 +410,12 @@ def main() -> int:
     if dropped_submitted:
         print(f"{len(dropped_submitted)} candidate donor pair(s) dropped: review already submitted or "
               f"not verifiable in the log.", file=sys.stderr)
+    if args.exclude_movers:
+        excluded = load_email_list(args.exclude_movers)
+        movable, dropped_excluded = exclude_named_movers(movable, excluded)
+        if dropped_excluded:
+            print(f"{len(dropped_excluded)} candidate donor pair(s) dropped: reviewer named in --exclude-movers.",
+                  file=sys.stderr)
     if not movable:
         print("No unsubmitted donor reviews available.", file=sys.stderr)
         return 0

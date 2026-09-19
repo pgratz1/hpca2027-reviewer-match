@@ -206,7 +206,7 @@ ASSIGN_DEPS = scripts/assign_reviewers.py src/reviewer_match/paper_matching.py \
 .PHONY: all enrich area-chairs reserve-need reserve-info reserve-pids reserves trc \
 	dblp-snapshot coauthor-coi collaborator-coi affiliation-countries pc-roster duplicates \
 	complete-papers area-chairs-complete clear-uploads baselines clean clean-fingerprints \
-	log-assignments reviewer-activity rerun targeted-rerun swap-candidates \
+	log-assignments reviewer-activity rerun targeted-rerun swap-candidates swap-upload \
 	revision-cutoffs paper-leads
 
 all: $(SENIORITY) enrich $(FINGERPRINTS)
@@ -456,6 +456,8 @@ targeted-rerun: $(ASSIGN_DEPS) scripts/extract_log_assignments.py scripts/audit_
 DEPARTED_EMAIL ?=
 SWAP_PIDS ?=
 SWAP_PIDS_FLAG = $(if $(SWAP_PIDS),--departed-pids $(SWAP_PIDS),)
+SWAP_EXCLUDE ?=
+SWAP_EXCLUDE_FLAG = $(if $(SWAP_EXCLUDE),--exclude-movers $(SWAP_EXCLUDE),)
 SWAP_PAIRS_CSV = $(ASSIGNMENT_DIR)/proposed_swaps.csv
 
 swap-candidates: scripts/extract_log_assignments.py scripts/propose_reviewer_swaps.py \
@@ -463,12 +465,37 @@ swap-candidates: scripts/extract_log_assignments.py scripts/propose_reviewer_swa
 		src/reviewer_match/paper_matching.py $(SENIORITY) $(FINGERPRINTS) $(PAPER_FINGERPRINTS)
 	@test -n "$(DEPARTED_EMAIL)" || { echo "ERROR: make swap-candidates DEPARTED_EMAIL=<address>" >&2; exit 1; }
 	$(MAKE) log-assignments
-	$(RUN) scripts.propose_reviewer_swaps --departed-email "$(DEPARTED_EMAIL)" $(SWAP_PIDS_FLAG) \
+	$(RUN) scripts.propose_reviewer_swaps --departed-email "$(DEPARTED_EMAIL)" $(SWAP_PIDS_FLAG) $(SWAP_EXCLUDE_FLAG) \
 		--paper-policy $(PAPER_POLICY) --csv "$(CSV)" --area-chair-csv "$(AREA_CHAIR_CSV)" \
 		--current-csv $(CURRENT_ASSIGNMENT_CSV) --log $(LOG) \
 		--fingerprint-cache $(FINGERPRINTS) --paper-cache $(PAPER_FINGERPRINTS) \
 		--seniority $(SENIORITY) --pairs-csv $(SWAP_PAIRS_CSV) \
 		$(RESERVE_FLAG) $(PC_CHECK) $(AREA_CHAIR_CHECK) $(REGION_FLAG) $(JUNIOR_FLAG) $(COAUTHOR_COI) $(COLLABORATOR_COI) $(EXCLUDE_FLAG)
+
+# Once the chair has actually asked around and knows who said yes, this turns
+# a hand-maintained CONFIRMED_SWAPS CSV (target_pid,add_email,source_pid,
+# remove_source -- see scripts/generate_swap_upload.py) into the small HotCRP
+# Assignments -> Bulk update delta that applies it: clear DEPARTED_EMAIL from
+# each target paper, add the confirmed mover, and (unless a row's own
+# remove_source says no -- an add, not a move, for a mover who is keeping the
+# paper they already started) clear the mover from their source paper too.
+# Deliberately NOT the all,clearreview,all,R1 shape swap-candidates and every
+# other bulk upload here open with -- this is a delta, not a replacement, so
+# only the named pairs are touched. Preview it in HotCRP before approving.
+CONFIRMED_SWAPS ?= data/curated/confirmed_swaps.csv
+SWAP_UPLOAD_OUT = $(ASSIGNMENT_DIR)/swap_upload.csv
+# The papers a departing reviewer holds that no confirmed swap backfills --
+# they still need the review cleared. Empty for a partial departure, where
+# the reviewer keeps everything the swaps do not move.
+SWAP_CLEAR_PIDS ?=
+SWAP_CLEAR_FLAG = $(if $(SWAP_CLEAR_PIDS),--clear-pids $(SWAP_CLEAR_PIDS),)
+
+swap-upload: scripts/generate_swap_upload.py src/reviewer_match/reviewers.py src/reviewer_match/reserve_reviewers.py
+	@test -n "$(DEPARTED_EMAIL)" || { echo "ERROR: make swap-upload DEPARTED_EMAIL=<address>" >&2; exit 1; }
+	@test -f "$(CONFIRMED_SWAPS)" || { echo "ERROR: $(CONFIRMED_SWAPS) not found -- see scripts/generate_swap_upload.py" >&2; exit 1; }
+	$(RUN) scripts.generate_swap_upload --departed-email "$(DEPARTED_EMAIL)" \
+		--confirmed-csv $(CONFIRMED_SWAPS) --out $(SWAP_UPLOAD_OUT) --csv "$(CSV)" \
+		$(SWAP_CLEAR_FLAG) $(PC_CHECK)
 
 $(COMPLETE_ASSIGNMENT) $(COMPLETE_ASSIGNMENT_CSV) &: $(ASSIGN_DEPS)
 	$(RUN) scripts.assign_reviewers --paper-policy complete --csv "$(CSV)" \

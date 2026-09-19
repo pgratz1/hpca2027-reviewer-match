@@ -60,6 +60,7 @@ from reviewer_match import hotcrp_log
 from scripts import extract_log_assignments
 from scripts import build_targeted_rerun_pins
 from scripts import propose_reviewer_swaps
+from scripts import generate_swap_upload
 from scripts import revision_cutoffs
 from scripts import assign_paper_leads
 from reviewer_match import review_scores
@@ -6554,6 +6555,16 @@ class ProposeReviewerSwapsTests(unittest.TestCase):
             set(out),
         )
 
+    def test_movable_source_pairs_sizes_a_paper_the_departed_is_leaving_without_them(self):
+        # dep is coming off paper 1, so its 6 is really 5: moving anyone off it
+        # would leave 4. Paper 3 holds 6 without dep and stays a donor.
+        pairs = {
+            1: {"a@x.edu", "b@x.edu", "c@x.edu", "d@x.edu", "e@x.edu", "dep@x.edu"},
+            3: {"a@x.edu", "b@x.edu", "c@x.edu", "d@x.edu", "e@x.edu", "f@x.edu"},
+        }
+        out = propose_reviewer_swaps.movable_source_pairs(pairs, "dep@x.edu", donor_size=6, leaving=frozenset({1}))
+        self.assertEqual({3}, {pid for pid, _ in out})
+
     def test_unsubmitted_pairs_drops_submitted_and_unverifiable_pairs(self):
         # b's review is already submitted; c has no matching review id in the
         # log's own replay at all (unverifiable) -- both are dropped, not
@@ -6581,6 +6592,13 @@ class ProposeReviewerSwapsTests(unittest.TestCase):
         )
         self.assertEqual([(1, "roster@x.edu")], keep)
         self.assertEqual([], dropped)
+
+    def test_exclude_named_movers_drops_only_the_named_emails(self):
+        kept, dropped = propose_reviewer_swaps.exclude_named_movers(
+            [(1, "a@x.edu"), (2, "b@x.edu"), (3, "c@x.edu")], {"b@x.edu"},
+        )
+        self.assertEqual([(1, "a@x.edu"), (3, "c@x.edu")], kept)
+        self.assertEqual([(2, "b@x.edu")], dropped)
 
     def test_dedupe_by_email_keeps_the_better_gated_source_and_sorts_best_first(self):
         candidates = [
@@ -6619,6 +6637,143 @@ class ProposeReviewerSwapsTests(unittest.TestCase):
         }
         picks = propose_reviewer_swaps.assign_unique_picks(feasible_by_pid, top_n=2)
         self.assertEqual(["r4@x.edu", "r3@x.edu"], [c.email for c in picks[1]])
+
+
+class GenerateSwapUploadTests(unittest.TestCase):
+    """scripts.generate_swap_upload: confirmed picks -> the HotCRP delta upload."""
+
+    def write_confirmed(self, rows):
+        tmp = Path(tempfile.mkdtemp()) / "confirmed_swaps.csv"
+        with open(tmp, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(list(generate_swap_upload.CONFIRMED_HEADER))
+            writer.writerows(rows)
+        return str(tmp)
+
+    def test_load_confirmed_swaps_reads_remove_source_as_true_by_default(self):
+        path = self.write_confirmed([["1991", "a@x.edu", "112", "yes"]])
+        self.assertEqual(
+            [(1991, "a@x.edu", 112, True)],
+            generate_swap_upload.load_confirmed_swaps(path),
+        )
+
+    def test_load_confirmed_swaps_reads_no_as_false(self):
+        path = self.write_confirmed([["1991", "a@x.edu", "112", "no"]])
+        self.assertEqual(
+            [(1991, "a@x.edu", 112, False)],
+            generate_swap_upload.load_confirmed_swaps(path),
+        )
+
+    def test_load_confirmed_swaps_reads_a_blank_source_pid_as_none(self):
+        # An add, not a move: a reviewer with spare capacity takes the target
+        # paper on and gives nothing up, so there is no source paper to name.
+        path = self.write_confirmed([["1505", "a@x.edu", "", "no"]])
+        self.assertEqual(
+            [(1505, "a@x.edu", None, False)],
+            generate_swap_upload.load_confirmed_swaps(path),
+        )
+
+    def test_load_confirmed_swaps_rejects_a_blank_source_it_is_asked_to_clear(self):
+        # Half a swap: there is nothing to clear, and silently dropping the
+        # clear would leave the mover on a paper the chair thinks they left.
+        path = self.write_confirmed([["1505", "a@x.edu", "", "yes"]])
+        with self.assertRaises(ValueError):
+            generate_swap_upload.load_confirmed_swaps(path)
+
+    def test_build_upload_rows_emits_no_source_clear_for_a_blank_source(self):
+        rows = generate_swap_upload.build_upload_rows(
+            [(1505, "a@x.edu", None, False)], "dep@x.edu", {}
+        )
+        self.assertEqual(
+            [
+                (1505, "clearreview", "dep@x.edu", "R1"),
+                (1505, "primaryreview", "a@x.edu", "R1"),
+            ],
+            rows,
+        )
+
+    def test_build_upload_rows_clears_the_departed_from_clear_pids_too(self):
+        # Leaving the committee outright: 1991 is backfilled, 7 and 9 are not,
+        # but all three need the departed reviewer's review cleared.
+        rows = generate_swap_upload.build_upload_rows(
+            [(1991, "a@x.edu", 112, True)], "dep@x.edu", {}, frozenset({7, 9}),
+        )
+        self.assertEqual(
+            [
+                (1991, "clearreview", "dep@x.edu", "R1"),
+                (1991, "primaryreview", "a@x.edu", "R1"),
+                (112, "clearreview", "a@x.edu", "R1"),
+                (7, "clearreview", "dep@x.edu", "R1"),
+                (9, "clearreview", "dep@x.edu", "R1"),
+            ],
+            rows,
+        )
+
+    def test_build_upload_rows_never_repeats_a_clear_for_a_backfilled_paper(self):
+        rows = generate_swap_upload.build_upload_rows(
+            [(1991, "a@x.edu", 112, True)], "dep@x.edu", {}, frozenset({1991, 7}),
+        )
+        self.assertEqual(1, sum(1 for pid, action, _e, _r in rows
+                                if pid == 1991 and action == "clearreview"))
+
+    def test_load_confirmed_swaps_rejects_the_wrong_header(self):
+        tmp = Path(tempfile.mkdtemp()) / "bad.csv"
+        with open(tmp, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(["pid", "email"])
+        with self.assertRaises(ValueError):
+            generate_swap_upload.load_confirmed_swaps(str(tmp))
+
+    def test_build_upload_rows_is_a_pure_delta_never_all_clearreview_all(self):
+        confirmed = [(1991, "a@x.edu", 112, True)]
+        rows = generate_swap_upload.build_upload_rows(confirmed, "dep@x.edu", {})
+        self.assertNotIn((  "all", "clearreview", "all", "R1"), rows)
+        self.assertEqual(
+            [
+                (1991, "clearreview", "dep@x.edu", "R1"),
+                (1991, "primaryreview", "a@x.edu", "R1"),
+                (112, "clearreview", "a@x.edu", "R1"),
+            ],
+            rows,
+        )
+
+    def test_build_upload_rows_skips_the_source_clear_when_remove_source_is_false(self):
+        # The Gino Chacon case: he keeps the paper he already started.
+        confirmed = [(1991, "a@x.edu", 112, False)]
+        rows = generate_swap_upload.build_upload_rows(confirmed, "dep@x.edu", {})
+        self.assertEqual(
+            [
+                (1991, "clearreview", "dep@x.edu", "R1"),
+                (1991, "primaryreview", "a@x.edu", "R1"),
+            ],
+            rows,
+        )
+
+    def test_build_upload_rows_maps_through_hotcrp_email(self):
+        confirmed = [(1991, "roster@x.edu", 112, True)]
+        hotcrp_email = {"roster@x.edu": "hotcrp@x.edu", "dep@x.edu": "dep-hotcrp@x.edu"}
+        rows = generate_swap_upload.build_upload_rows(confirmed, "dep@x.edu", hotcrp_email)
+        self.assertEqual(
+            [
+                (1991, "clearreview", "dep-hotcrp@x.edu", "R1"),
+                (1991, "primaryreview", "hotcrp@x.edu", "R1"),
+                (112, "clearreview", "hotcrp@x.edu", "R1"),
+            ],
+            rows,
+        )
+
+    def test_build_upload_rows_multiple_papers_stay_independent(self):
+        confirmed = [(1991, "a@x.edu", 112, False), (1997, "b@x.edu", 13, True)]
+        rows = generate_swap_upload.build_upload_rows(confirmed, "dep@x.edu", {})
+        self.assertEqual(
+            [
+                (1991, "clearreview", "dep@x.edu", "R1"),
+                (1991, "primaryreview", "a@x.edu", "R1"),
+                (1997, "clearreview", "dep@x.edu", "R1"),
+                (1997, "primaryreview", "b@x.edu", "R1"),
+                (13, "clearreview", "b@x.edu", "R1"),
+            ],
+            rows,
+        )
 
 
 class RevisionCutoffsTests(unittest.TestCase):
