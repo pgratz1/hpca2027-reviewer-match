@@ -3920,6 +3920,13 @@ class CoauthorIdentityTests(unittest.TestCase):
         derived = self.derive(p, {"9/WZ": ["Wei Zhang 0001"]})
         self.assertEqual("exact", derived[7]["rev@x.edu"].match)
 
+    def test_the_uppercase_dblp_key_the_export_now_uses_is_read_too(self):
+        # HotCRP keys the field by its name; today's export says "DBLP". Read
+        # only as "dblp", nobody is indexed and the homonym is not told apart.
+        p = self.paper()
+        p["DBLP"] = "https://dblp.org/pid/9/WZ.html"
+        self.assertEqual({}, self.derive(p, {"9/WZ": ["Wei Zhang 0012"]}))
+
     def test_an_author_who_declared_no_dblp_page_keeps_the_permissive_reading(self):
         # Not knowing which Wei Zhang someone is cannot be evidence that they
         # are not this one. Roughly half the author slots are in this state,

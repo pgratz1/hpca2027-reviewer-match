@@ -162,11 +162,15 @@ def index_self_declared_pids(papers: list[dict]) -> dict[str, Counter]:
     it is only read when its length matches the author count: about one paper
     in six lists a different number of entries than authors, and indexing into
     those returns a co-author's page.
+
+    HotCRP names the JSON key after the submission field, and the export has
+    carried it as both `dblp` and `DBLP`; reading only one silently indexes
+    nobody, which empties every consumer's declared spellings.
     """
     index: dict[str, Counter] = defaultdict(Counter)
     for paper in papers:
         authors = paper.get("authors") or []
-        entries = split_dblp_field(paper.get("dblp"))
+        entries = split_dblp_field(paper.get("dblp") or paper.get("DBLP"))
         if len(entries) != len(authors):
             continue
         for author, entry in zip(authors, entries):
