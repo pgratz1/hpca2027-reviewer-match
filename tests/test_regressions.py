@@ -2160,6 +2160,122 @@ class FillOpenSlotsTests(unittest.TestCase):
             self.assertEqual(2, raised.exception.code)
 
 
+    def test_a_removed_reviewers_submitted_review_survives_and_is_not_cleared(self):
+        baseline_pairs = {
+            1: {e: Pair() for e in ["a@example.com", "b@example.com", "gone@example.com"]},
+            2: {e: Pair() for e in ["a@example.com", "gone@example.com"]},
+        }
+        kept = frozenset({(2, "gone@example.com")})
+        orphaned, _ = fill_open_slots.derive_orphaned_pids(baseline_pairs, {"gone@example.com"}, {1, 2}, kept)
+        self.assertEqual([1], orphaned)
+        self.assertTrue(fill_open_slots.is_removed(1, "gone@example.com", {"gone@example.com"}, kept))
+        self.assertFalse(fill_open_slots.is_removed(2, "gone@example.com", {"gone@example.com"}, kept))
+        used = fill_open_slots.seed_used(baseline_pairs, {"gone@example.com"}, {1, 2}, kept)
+        self.assertEqual(1, used["gone@example.com"])
+
+    def test_split_submitted_keeps_submitted_and_unplaceable_pairs(self):
+        pairs = [(1, "x@example.com"), (2, "x@example.com"), (3, "x@example.com")]
+        rid_by_pair = {(1, "x-hotcrp@example.com"): 10, (2, "x-hotcrp@example.com"): 20}
+        kept, unplaced = fill_open_slots.split_submitted(
+            pairs, {"x@example.com": "X-HotCRP@example.com"}, rid_by_pair, submitted={20},
+        )
+        self.assertEqual(frozenset({(2, "x@example.com"), (3, "x@example.com")}), kept)
+        self.assertEqual([(3, "x@example.com")], unplaced)
+
+    def test_fill_to_refills_only_papers_that_drop_below_it(self):
+        six = {e: Pair() for e in [f"r{i}@example.com" for i in range(1, 6)] + ["gone@example.com"]}
+        five = {e: Pair() for e in [f"r{i}@example.com" for i in range(1, 5)] + ["gone@example.com"]}
+        reviewers_by_email = {f"r{i}@example.com": reviewer_with_email(f"r{i}@example.com") for i in range(1, 6)}
+        _, target = fill_open_slots.seed_slates_and_targets(
+            {1: six, 2: five}, [1, 2], reviewers_by_email, {"gone@example.com"}, fill_to=5,
+        )
+        self.assertEqual({1: 0, 2: 1}, target)
+
+    def test_several_removed_emails_compose(self):
+        baseline_pairs = {1: {e: Pair() for e in ["a@example.com", "gone1@example.com", "gone2@example.com"]}}
+        reviewers_by_email = {"a@example.com": reviewer_with_email("a@example.com")}
+        slates, target = fill_open_slots.seed_slates_and_targets(
+            baseline_pairs, [1], reviewers_by_email, {"gone1@example.com", "gone2@example.com"},
+        )
+        self.assertEqual(["a@example.com"], slates[1])
+        self.assertEqual(2, target[1])
+
+    def test_live_baseline_keeps_a_survivor_who_is_off_the_roster(self):
+        # In live mode nothing this run uploads clears that survivor's review,
+        # so it still sits on the paper and must still count.
+        baseline_pairs = {1: {e: Pair() for e in ["stays@example.com", "offroster@example.com", "gone@example.com"]}}
+        reviewers_by_email = {"stays@example.com": reviewer_with_email("stays@example.com")}
+        slates, target = fill_open_slots.seed_slates_and_targets(
+            baseline_pairs, [1], reviewers_by_email, {"gone@example.com"}, fill_to=3, live=True,
+        )
+        self.assertEqual({"stays@example.com", "offroster@example.com"}, set(slates[1]))
+        self.assertEqual(1, target[1])
+
+    def test_clamp_new_per_reviewer_bounds_a_big_tier_cap(self):
+        reviewer_cap = {"full@example.com": 15, "light@example.com": 7}
+        fill_open_slots.clamp_new_per_reviewer(reviewer_cap, {"full@example.com": 9, "light@example.com": 6}, 2)
+        self.assertEqual({"full@example.com": 11, "light@example.com": 7}, reviewer_cap)
+
+    def test_check_new_per_reviewer_flags_only_those_over_the_limit(self):
+        new_slates = {1: ["a@example.com"], 2: ["a@example.com", "b@example.com"], 3: ["a@example.com"]}
+        self.assertEqual(["a@example.com"], fill_open_slots.check_new_per_reviewer(new_slates, 2))
+        self.assertEqual([], fill_open_slots.check_new_per_reviewer(new_slates, None))
+
+    def test_delta_hotcrp_csv_names_only_the_change(self):
+        reviewers_by_email = {
+            "gone@example.com": reviewer_with_email("gone@example.com", hotcrp_email="gone-hotcrp@example.com"),
+            "new@example.com": reviewer_with_email("new@example.com"),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "delta.csv"
+            fill_open_slots.write_delta_hotcrp_csv(
+                str(path), [(2, "gone@example.com"), (1, "gone@example.com")], {1: ["new@example.com"]}, reviewers_by_email,
+            )
+            with path.open(newline="", encoding="utf-8") as f:
+                rows = list(csv.reader(f))
+        self.assertEqual([
+            list(assignment_io.HOTCRP_CSV_HEADER),
+            ["1", "clearreview", "gone-hotcrp@example.com", "R1"],
+            ["2", "clearreview", "gone-hotcrp@example.com", "R1"],
+            ["1", "primaryreview", "new@example.com", "R1"],
+        ], rows)
+        self.assertNotIn("all", [row[0] for row in rows])
+
+    def test_emptied_reviewers_are_those_with_every_r1_review_unassigned(self):
+        rows = [
+            {"action": "Review 1 assigned: primary, round R1", "affected_email": "left@example.com", "paper": "1"},
+            {"action": "Review 2 assigned: primary, round R1", "affected_email": "busy@example.com", "paper": "1"},
+            {"action": "Review 3 assigned: external, round TRC", "affected_email": "trc@example.com", "paper": "1"},
+            {"action": "Review 1 unassigned", "affected_email": "left@example.com", "paper": "1"},
+        ]
+        live, _ = hotcrp_log.replay_assignments([dict(r, date="") for r in rows])
+        self.assertEqual({"left@example.com"}, fill_open_slots.emptied_reviewers(rows, live))
+
+    def test_dropped_paper_holders_are_live_r1_reviews_on_papers_left_the_export(self):
+        rows = [
+            {"action": "Review 1 assigned: primary, round R1", "affected_email": "freed@example.com", "paper": "9", "date": ""},
+            {"action": "Review 2 assigned: primary, round R1", "affected_email": "busy@example.com", "paper": "1", "date": ""},
+            {"action": "Review 3 assigned: external, round TRC", "affected_email": "trc@example.com", "paper": "9", "date": ""},
+        ]
+        live, _ = hotcrp_log.replay_assignments(rows)
+        self.assertEqual({"freed@example.com": [9]}, fill_open_slots.dropped_paper_holders(live, data_pids={1}))
+
+    def test_load_assignment_pairs_reads_hotcrps_own_export(self):
+        # HotCRP's "Review assignments" download appends a title column and
+        # keeps display casing on addresses.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "pcassignments.csv"
+            path.write_text(
+                'paper,action,email,round,title\n'
+                '1,clearreview,"#pc",any,"A Title, With Comma"\n'
+                '1,primaryreview,Mixed.Case@Example.com,R1\n',
+                encoding="utf-8",
+            )
+            fmt, pairs = assignment_io.load_assignment_pairs(str(path))
+        self.assertEqual("hotcrp", fmt)
+        self.assertEqual({1: {"mixed.case@example.com"}}, {pid: set(e) for pid, e in pairs.items()})
+
+
 class ClassificationTests(unittest.TestCase):
     def test_four_class_split(self):
         def label(target_papers, other_papers):

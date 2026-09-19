@@ -176,6 +176,27 @@ contains spaces and parentheses — always quote it in shell commands).
   `reviewers_pinned.txt`. `rerun` runs both, then `assign_reviewers.py
   --pin-csv/--pin-emails`, into `assignment-rerun.*` — **never over
   `assignment.csv`** — and prints the churn diff. Nothing is uploaded.
+- **`make fill-slots REMOVED_EMAILS="a b"`** pulls reviewers off whatever
+  they have **not submitted** (per the log) and tops every paper that drops
+  below `FILL_TO` (5) back up from spare capacity, at most
+  `MAX_NEW_PER_REVIEWER` (2) new papers each, under every COI layer, the area
+  ladder, seniority and the country/junior/out-of-area caps
+  (`fill_open_slots.py --log --fill-to --max-new-per-reviewer`). Baseline is
+  HotCRP's own "Review assignments" download (`hpca2027-pcassignments.csv`,
+  whose trailing `title` column `assignment_io` now tolerates); papers
+  desk-rejected since are absent from it, which is what frees capacity. Writes
+  `fill_slots_upload.csv`, a **delta** (per-pair clear rows, then add rows —
+  never `all,clearreview`). Anyone whose every R1 review the log shows
+  unassigned is **treated as departed and never a candidate** — HotCRP keeps
+  their `pc` role, so without this their empty load looks like the most spare
+  capacity on the committee; `FILL_SLOTS_EXCLUDE=<file>` adds more by hand.
+  The pool is further limited, by default, to reviewers who hold a live
+  review on a paper no longer in the export (`--only-dropped-paper-reviewers`;
+  `FILL_SLOTS_POOL=` opens it) — the capacity desk rejections freed. Survivors
+  on each paper are classed for seniority/country even when not candidates;
+  before that, a restricted pool left their seniors and caps uncounted.
+  Seniority/fingerprints are existence-checked, not prerequisites, so a fresh
+  export never triggers a reclassify or re-embed mid-review.
 - **`make revision-cutoffs`** is decision support for the revision cutoff: of
   the papers with `REVISION_MIN_REVIEWS` (4) submitted reviews, what share each
   net catches by average pre-rebuttal overall merit. The average test on its

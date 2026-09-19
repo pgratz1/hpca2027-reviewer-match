@@ -206,7 +206,7 @@ ASSIGN_DEPS = scripts/assign_reviewers.py src/reviewer_match/paper_matching.py \
 .PHONY: all enrich area-chairs reserve-need reserve-info reserve-pids reserves trc \
 	dblp-snapshot coauthor-coi collaborator-coi affiliation-countries pc-roster duplicates \
 	complete-papers area-chairs-complete clear-uploads baselines clean clean-fingerprints \
-	log-assignments reviewer-activity rerun targeted-rerun swap-candidates swap-upload \
+	log-assignments reviewer-activity rerun targeted-rerun swap-candidates swap-upload fill-slots \
 	revision-cutoffs paper-leads
 
 all: $(SENIORITY) enrich $(FINGERPRINTS)
@@ -496,6 +496,48 @@ swap-upload: scripts/generate_swap_upload.py src/reviewer_match/reviewers.py src
 	$(RUN) scripts.generate_swap_upload --departed-email "$(DEPARTED_EMAIL)" \
 		--confirmed-csv $(CONFIRMED_SWAPS) --out $(SWAP_UPLOAD_OUT) --csv "$(CSV)" \
 		$(SWAP_CLEAR_FLAG) $(PC_CHECK)
+
+# Reviewers being pulled off whatever they have not submitted yet, once it is
+# too late to swap: every paper that drops below FILL_TO reviewers gets topped
+# back up from spare capacity (desk rejections free some), under the same COI
+# layers, area gate, seniority, junior/out-of-area and same-country rules as
+# the main assignment, and nobody receives more than MAX_NEW_PER_REVIEWER new
+# papers. Submitted reviews stay. The baseline is HotCRP's own
+# Search -> Download -> "Review assignments" export, re-downloaded together
+# with the action log. Writes FILL_SLOTS_UPLOAD, a delta (clear rows for the
+# removed pairs, add rows for the new ones -- never all,clearreview), for
+# HotCRP's Assignments -> Bulk update preview. Nothing is uploaded here.
+# Seniority and fingerprints are checked for, not prerequisites: a patch has
+# to score with what the live assignment was built from, so a fresh HotCRP
+# export must not trigger a reclassification or a re-embed on the way through.
+REMOVED_EMAILS ?=
+FILL_TO ?= 5
+MAX_NEW_PER_REVIEWER ?= 2
+FILL_SLOTS_BASELINE ?= $(INPUT_DIR)/hpca2027-pcassignments.csv
+# Optional file of addresses never to offer a paper. Anyone the log shows
+# pulled off every review is excluded without it.
+FILL_SLOTS_EXCLUDE ?=
+# New papers go only to reviewers whose load a desk rejection lightened.
+# FILL_SLOTS_POOL= (empty) opens the pool to anyone with spare capacity.
+FILL_SLOTS_POOL ?= --only-dropped-paper-reviewers
+FILL_SLOTS_EXCLUDE_FLAG = $(if $(FILL_SLOTS_EXCLUDE),--exclude-candidates $(FILL_SLOTS_EXCLUDE),)
+FILL_SLOTS_PAIRS = $(ASSIGNMENT_DIR)/fill_slots_pairs.csv
+FILL_SLOTS_UPLOAD = $(ASSIGNMENT_DIR)/fill_slots_upload.csv
+
+fill-slots: scripts/fill_open_slots.py scripts/assign_reviewers.py src/reviewer_match/hotcrp_log.py \
+		src/reviewer_match/assignment_io.py src/reviewer_match/paper_matching.py
+	@test -n "$(REMOVED_EMAILS)" || { echo "ERROR: make fill-slots REMOVED_EMAILS=\"<address> [<address> ...]\"" >&2; exit 1; }
+	@for f in $(SENIORITY) $(FINGERPRINTS) $(RESERVE_FINGERPRINTS) $(RESERVE_SENIORITY); do \
+		test -f $$f || { echo "ERROR: $$f not found; run make and make reserves first" >&2; exit 1; }; done
+	@test -f $(FILL_SLOTS_BASELINE) || { echo "ERROR: $(FILL_SLOTS_BASELINE) not found; download HotCRP's review assignments" >&2; exit 1; }
+	@test -f $(LOG) || { echo "ERROR: $(LOG) not found; download the action log from HotCRP" >&2; exit 1; }
+	$(RUN) scripts.fill_open_slots --baseline $(FILL_SLOTS_BASELINE) --log $(LOG) \
+		$(foreach e,$(REMOVED_EMAILS),--removed-email $(e)) \
+		--fill-to $(FILL_TO) --max-new-per-reviewer $(MAX_NEW_PER_REVIEWER) $(FILL_SLOTS_EXCLUDE_FLAG) $(FILL_SLOTS_POOL) \
+		--paper-policy $(PAPER_POLICY) --csv "$(CSV)" --area-chair-csv "$(AREA_CHAIR_CSV)" \
+		--fingerprint-cache $(FINGERPRINTS) --paper-cache $(PAPER_FINGERPRINTS) --seniority $(SENIORITY) \
+		--pairs-csv $(FILL_SLOTS_PAIRS) --delta-hotcrp-csv $(FILL_SLOTS_UPLOAD) \
+		$(RESERVE_FLAG) $(PC_CHECK) $(AREA_CHAIR_CHECK) $(REGION_FLAG) $(JUNIOR_FLAG) $(COAUTHOR_COI) $(COLLABORATOR_COI) $(EXCLUDE_FLAG)
 
 $(COMPLETE_ASSIGNMENT) $(COMPLETE_ASSIGNMENT_CSV) &: $(ASSIGN_DEPS)
 	$(RUN) scripts.assign_reviewers --paper-policy complete --csv "$(CSV)" \
