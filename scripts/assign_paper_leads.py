@@ -37,11 +37,27 @@ leads per review, and that is counted as over quota. Every set is sorted
 before it is shuffled and all randomness comes from one `random.Random(--seed)`,
 so the same inputs and seed reproduce the same draw byte for byte.
 
-**Reruns keep existing leads.** Existing leads are read from `--existing-leads`
-(default: the `lead` rows of `--pcassignments`). A lead who is still an
-eligible reviewer of a paper that still advances is kept and counts towards
+**Reruns keep existing leads.** Existing leads are read from `--existing-leads`,
+HotCRP's search-page Download > Reviews > "Discussion leads (CSV)"
+(`data/inputs/hpca2027-leads.csv`). The "Review assignments" download never
+carries leads, so it cannot stand in. The leads download hides the lead of
+every paper the downloading account is conflicted with, so a lead the action
+log shows on a paper the download does not list is taken from the log and
+counted in the summary; where both name a lead, the download wins. A lead who
+is still an eligible reviewer of a paper that still advances is kept and counts towards
 their load. A paper that no longer advances gets a `clearlead`. A lead who is
 no longer eligible is replaced. `--no-keep-leads` draws every lead afresh.
+
+**Chair overrides.** `--lead-overrides` (default
+`data/curated/lead_overrides.csv`; columns `paper,email,note`) names a lead the
+chair picked by hand. On a paper that advances it is the lead, outright: exempt
+from the who-can-lead rule, never cleared as unassignable or redrawn, and
+emitted as a `lead` row only when HotCRP does not already hold it. It sits
+outside the proportional draw: the quotas do not budget for it. What it
+does not override is whether the paper advances: a paper that falls under the
+bar is cleared like any other, and the report names the override it skipped.
+A row with a blank email is a to-do and skipped; an email with no HotCRP PC
+account is an error, since HotCRP would reject the upload row.
 
 Writes `--upload`, a HotCRP bulk-assignment **delta** (`clearlead` rows, then
 `lead` rows for new and replaced leads; kept leads are not repeated), plus
@@ -52,7 +68,7 @@ papers, so all three are gitignored.
 
 from __future__ import annotations
 
-from reviewer_match.paths import assignment_path, input_path, report_path
+from reviewer_match.paths import assignment_path, curated_path, input_path, report_path
 
 import argparse
 import csv
@@ -76,9 +92,11 @@ DEFAULT_REVIEWS = input_path("hpca2027-reviews.csv")
 DEFAULT_LOG = input_path("hpca2027-log.csv")
 DEFAULT_DATA = input_path("hpca2027-data.json")
 DEFAULT_PCASSIGNMENTS = input_path("hpca2027-pcassignments.csv")
+DEFAULT_LEADS = input_path("hpca2027-leads.csv")
 DEFAULT_UPLOAD = assignment_path("lead_upload.csv")
 DEFAULT_PAPERS_CSV = report_path("paper_leads.csv")
 DEFAULT_LOADS_CSV = report_path("lead_loads.csv")
+DEFAULT_LEAD_OVERRIDES = curated_path("lead_overrides.csv")
 DEFAULT_SEED = 1
 
 # Tiers that may lead. An ex-reserve promoted onto the PC carries "light".
@@ -267,13 +285,64 @@ def unassignable_note(reviewers: list[str], roster: dict[str, object]) -> str:
     return "no PC member has submitted a review"
 
 
+def load_lead_overrides(path: str) -> dict[int, str]:
+    """{pid: lead's HotCRP address} from the chair's override file; {} if absent.
+
+    A blank email is a to-do and skipped. A paper named twice is an error:
+    which of two hand-picked leads was meant is not something to guess.
+    """
+    try:
+        f = open(path, newline="", encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    overrides: dict[int, str] = {}
+    with f:
+        for row in csv.DictReader(f):
+            raw = (row.get("paper") or "").strip().lstrip("#")
+            email = (row.get("email") or "").strip().lower()
+            if not raw or not email:
+                continue
+            pid = int(raw)
+            if pid in overrides and overrides[pid] != email:
+                raise ValueError(f"{path}: paper #{pid} has two override leads, {overrides[pid]} and {email}")
+            overrides[pid] = email
+    return overrides
+
+
+def merge_hidden_leads(
+    download: dict[int, str], log_leads: dict[int, str]
+) -> tuple[dict[int, str], list[int], list[int]]:
+    """(leads, [pid taken from the log], [pid where the two disagree]).
+
+    The leads download omits every paper its downloader is conflicted with,
+    and a missing row there is indistinguishable from "no lead". The log
+    records every change, so it fills exactly those gaps. Where both name a
+    lead the download wins: it is HotCRP's state, the log a replay of it.
+    """
+    hidden = sorted(pid for pid in log_leads if pid not in download)
+    disagree = sorted(pid for pid in download if pid in log_leads and log_leads[pid] != download[pid])
+    return {**{pid: log_leads[pid] for pid in hidden}, **download}, hidden, disagree
+
+
+def apply_overrides(draw: LeadDraw, overrides: dict[int, str], existing: dict[int, str]) -> None:
+    """Seat each override as its paper's lead, status "override".
+
+    `overrides` must hold only papers that advance and were kept out of the
+    draw. `existing` decides whether HotCRP already holds the lead
+    (`upload_rows` repeats nothing HotCRP has).
+    """
+    for pid, email in sorted(overrides.items()):
+        draw.leads[pid] = email
+        draw.status[pid] = "override" if existing.get(pid) == email else "override-new"
+
+
 def upload_rows(draw: LeadDraw, extra_clears: list[int]) -> list[tuple[int, str, str]]:
-    """The HotCRP delta: clears first, then new and redrawn leads, by pid."""
+    """The HotCRP delta: clears first, then new, redrawn and new override leads, by pid."""
     rows = [(pid, "clearlead", "") for pid in sorted(set(draw.clears) | set(extra_clears))]
     rows += [
         (pid, "lead", draw.leads[pid])
         for pid in sorted(draw.leads)
-        if draw.status[pid] in ("new", "redrawn")
+        if draw.status[pid] in ("new", "redrawn", "override-new")
     ]
     return rows
 
@@ -302,13 +371,17 @@ def main() -> int:
     parser.add_argument("--data", default=DEFAULT_DATA, help="HotCRP paper export JSON")
     parser.add_argument(
         "--pcassignments", default=DEFAULT_PCASSIGNMENTS,
-        help="HotCRP PC-assignments download: review-load weights, and existing leads by default"
+        help="HotCRP PC-assignments download (review-load weights)"
     )
     parser.add_argument(
-        "--existing-leads",
-        help="CSV whose `lead` rows are the leads HotCRP holds (default: --pcassignments)"
+        "--existing-leads", default=DEFAULT_LEADS,
+        help="HotCRP \"Discussion leads (CSV)\" download, or an upload with `lead` rows: the leads HotCRP holds"
     )
     parser.add_argument("--no-keep-leads", action="store_true", help="ignore existing leads and draw every lead afresh")
+    parser.add_argument(
+        "--lead-overrides", default=DEFAULT_LEAD_OVERRIDES,
+        help="chair-picked leads (paper,email,note), exempt from the who-can-lead rule"
+    )
     parser.add_argument("--pcinfo", default=pc_membership.DEFAULT_PCINFO, help="HotCRP user export (roster tiers)")
     parser.add_argument("--exclude-pids", default="", help="comma-separated paper IDs to leave out")
     review_scores.add_bar_arguments(parser)
@@ -320,13 +393,14 @@ def main() -> int:
 
     bar = review_scores.bar_from_args(args)
     exclude = paper_matching.parse_exclude_pids(args.exclude_pids)
-    leads_path = args.existing_leads or args.pcassignments
+    leads_path = args.existing_leads
     for path in (args.reviews, args.log, args.data, args.pcassignments, leads_path):
         if not os.path.exists(path):
             print(f"ERROR: {path} not found", file=sys.stderr)
             return 1
 
-    training, outstanding = review_scores.review_rounds(hotcrp_log.load_log(args.log))
+    log_rows = hotcrp_log.load_log(args.log)
+    training, outstanding = review_scores.review_rounds(log_rows)
     reviews, skipped = review_scores.load_reviews(args.reviews, training)
     eligible, _ = review_scores.eligible_pids(args.data, exclude)
     scores: dict[int, list[int]] = {}
@@ -354,8 +428,24 @@ def main() -> int:
               file=sys.stderr)
     weights = {e: max(1, assigned[e]) for e in pool}
 
-    existing = {} if args.no_keep_leads else assignment_io.load_leads(leads_path)
-    draw = assign_leads(candidates, weights, existing, random.Random(args.seed))
+    overrides = load_lead_overrides(args.lead_overrides)
+    unknown = sorted(e for e in overrides.values() if e not in roster)
+    if unknown:
+        print(f"ERROR: {args.lead_overrides} names lead(s) with no HotCRP PC account: {', '.join(unknown)}",
+              file=sys.stderr)
+        return 1
+    fixed = {pid: e for pid, e in overrides.items() if pid in need}
+    skipped_overrides = sorted(pid for pid in overrides if pid not in need)
+
+    existing, hidden, disagree = {}, [], []
+    if not args.no_keep_leads:
+        existing, hidden, disagree = merge_hidden_leads(
+            assignment_io.load_leads(leads_path), hotcrp_log.replay_leads(log_rows)
+        )
+    draw = assign_leads(
+        {pid: c for pid, c in candidates.items() if pid not in fixed}, weights, existing, random.Random(args.seed)
+    )
+    apply_overrides(draw, fixed, existing)
     # A lead on a paper still under review that no longer advances is cleared.
     no_longer = sorted(pid for pid in existing if pid in eligible and pid not in need)
     elsewhere = sorted(pid for pid in existing if pid not in eligible)
@@ -367,8 +457,9 @@ def main() -> int:
         "advancing papers with a candidate but no lead": sum(
             1 for pid, c in candidates.items() if c and pid not in draw.leads),
         "leads who are not a submitted PC reviewer of the paper": sum(
-            1 for pid, e in draw.leads.items() if e not in candidates.get(pid, ())),
-        "leads who are not full or light PC": sum(1 for e in draw.leads.values() if not can_lead(e)),
+            1 for pid, e in draw.leads.items() if pid not in fixed and e not in candidates.get(pid, ())),
+        "leads who are not full or light PC": sum(
+            1 for pid, e in draw.leads.items() if pid not in fixed and not can_lead(e)),
         "papers with more than one lead row": sum(
             1 for n in Counter(pid for pid, action, _ in rows if action == "lead").values() if n > 1),
     }
@@ -386,7 +477,8 @@ def main() -> int:
             " ".join(str(x) for x in sorted(s)), len(candidates[pid]),
             lead, getattr(record, "name", "") if lead else "", getattr(record, "tier", "") if lead else "",
             draw.status[pid],
-            unassignable_note(reviewers.get(pid, []), roster) if not candidates[pid]
+            "chair override" if pid in fixed
+            else unassignable_note(reviewers.get(pid, []), roster) if not candidates[pid]
             else ("over quota" if pid in draw.over_quota else ""),
         ])
     write_csv(args.papers_csv, PAPERS_FIELDS, paper_rows)
@@ -403,18 +495,29 @@ def main() -> int:
     # ---- summary (stdout) ----------------------------------------------------
     reasons = Counter(need.values())
     status = Counter(draw.status.values())
-    unassignable = [pid for pid in need if not candidates[pid]]
+    unassignable = [pid for pid in need if not candidates[pid] and pid not in fixed]
     print(f"Bar: {bar.describe()}. Seed {args.seed}.")
     print(f"{len(need)} of {len(eligible)} papers advance: {reasons[review_scores.OVER_BAR]} over the bar, "
           f"{reasons[review_scores.FEW_REVIEWS]} with fewer than {bar.min_reviews} reviews "
           f"({len(skipped)} TRC reviews left out).")
-    print(f"Leads: {status['new']} new, {status['redrawn']} replaced, {status['kept']} kept; "
+    print(f"Leads: {status['new']} new, {status['redrawn']} replaced, {status['kept']} kept, "
+          f"{status['override'] + status['override-new']} chair overrides "
+          f"({status['override-new']} not yet in HotCRP); "
           f"{len(no_longer) + len(draw.clears)} cleared "
           f"({len(no_longer)} on papers that no longer advance, "
           f"{len(draw.clears)} on papers nobody can lead now).")
     if unassignable:
         print(f"{len(unassignable)} unassignable (no submitted PC reviewer): "
               + ", ".join(f"#{pid}" for pid in unassignable))
+    if hidden:
+        print(f"{len(hidden)} existing lead(s) absent from {leads_path} taken from the action log "
+              f"(papers the downloading account is conflicted with).")
+    if disagree:
+        print(f"WARNING: {len(disagree)} paper(s) where {leads_path} and the action log name different "
+              f"leads; the download was used: " + ", ".join(f"#{pid}" for pid in disagree))
+    if skipped_overrides:
+        print(f"{len(skipped_overrides)} lead override(s) on papers that do not advance, not applied: "
+              + ", ".join(f"#{pid}" for pid in skipped_overrides))
     if elsewhere:
         print(f"{len(elsewhere)} existing lead(s) on papers no longer under review left alone: "
               + ", ".join(f"#{pid}" for pid in elsewhere))

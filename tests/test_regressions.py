@@ -7128,6 +7128,40 @@ class PaperLeadTests(unittest.TestCase):
             draw = assign_paper_leads.assign_leads(candidates, weights, {}, random.Random(seed))
             self.assertEqual({"a": 4, "b": 4, "c": 2, "d": 2}, dict(Counter(draw.leads.values())))
 
+    def test_lead_overrides_are_seated_and_only_uploaded_when_new(self):
+        tmp = Path(tempfile.mkdtemp()) / "lead_overrides.csv"
+        tmp.write_text(
+            "paper,email,note\n"
+            "3,Reserve@X.edu,only reserves reviewed\n"
+            "#4,other@x.edu,\n"
+            "5,,to-do\n",
+            encoding="utf-8",
+        )
+        overrides = assign_paper_leads.load_lead_overrides(str(tmp))
+        self.assertEqual({3: "reserve@x.edu", 4: "other@x.edu"}, overrides)
+        self.assertEqual({}, assign_paper_leads.load_lead_overrides(str(tmp) + ".missing"))
+
+        # Paper 3 has no eligible candidate: without the override it would be
+        # unassignable and its existing lead cleared.
+        candidates = {1: ["a", "b"], 3: [], 4: ["a"]}
+        existing = {3: "reserve@x.edu"}
+        draw = assign_paper_leads.assign_leads(
+            {pid: c for pid, c in candidates.items() if pid not in overrides},
+            {"a": 7, "b": 7}, existing, random.Random(1),
+        )
+        assign_paper_leads.apply_overrides(draw, overrides, existing)
+        self.assertEqual("override", draw.status[3])
+        self.assertEqual("override-new", draw.status[4])
+        self.assertEqual([], draw.clears)
+        rows = assign_paper_leads.upload_rows(draw, extra_clears=[])
+        self.assertEqual([(1, "lead", draw.leads[1]), (4, "lead", "other@x.edu")], rows)
+
+    def test_a_paper_with_two_override_leads_fails_loudly(self):
+        tmp = Path(tempfile.mkdtemp()) / "lead_overrides.csv"
+        tmp.write_text("paper,email,note\n3,a@x.edu,\n3,b@x.edu,\n", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            assign_paper_leads.load_lead_overrides(str(tmp))
+
     def test_load_leads_replays_lead_and_clearlead_rows(self):
         tmp = Path(tempfile.mkdtemp()) / "pcassignments.csv"
         tmp.write_text(
@@ -7140,6 +7174,33 @@ class PaperLeadTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.assertEqual({1: "a@x.edu"}, assignment_io.load_leads(str(tmp)))
+
+    def test_load_leads_reads_hotcrps_discussion_leads_download(self):
+        tmp = Path(tempfile.mkdtemp()) / "leads.csv"
+        tmp.write_text(
+            "paper,title,given_name,family_name,leademail\n"
+            '4,"A title, with a comma",Ann,Lee,Ann@X.edu\n'
+            "9,Other,Bo,Ng,bo@y.org\n",
+            encoding="utf-8",
+        )
+        self.assertEqual({4: "ann@x.edu", 9: "bo@y.org"}, assignment_io.load_leads(str(tmp)))
+
+    def test_replay_leads_follows_set_and_clear(self):
+        rows = [  # chronological, as load_log returns them
+            {"action": "Set lead", "paper": "1 2", "affected_email": "a@x.edu"},
+            {"action": "Set lead", "paper": "2", "affected_email": "b@x.edu"},
+            {"action": "Clear lead", "paper": "1", "affected_email": ""},
+            {"action": "Review 5 assigned: primary, round R1", "paper": "3", "affected_email": "c@x.edu"},
+        ]
+        self.assertEqual({2: "b@x.edu"}, hotcrp_log.replay_leads(rows))
+
+    def test_the_log_fills_only_leads_the_download_hides(self):
+        download = {1: "a@x.edu", 2: "b@x.edu"}
+        log_leads = {1: "a@x.edu", 2: "old@x.edu", 3: "c@x.edu"}  # 3: a conflicted paper
+        leads, hidden, disagree = assign_paper_leads.merge_hidden_leads(download, log_leads)
+        self.assertEqual({1: "a@x.edu", 2: "b@x.edu", 3: "c@x.edu"}, leads)
+        self.assertEqual([3], hidden)
+        self.assertEqual([2], disagree)
 
 
 class RevisionTagTests(unittest.TestCase):

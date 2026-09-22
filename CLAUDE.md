@@ -227,9 +227,18 @@ contains spaces and parentheses — always quote it in shell commands).
   - **Draw:** each share is rounded at random (systematic sampling), then filled
     by a random draw with Kuhn augmenting paths. Over-quota happens only when no
     in-quota assignment exists, and it is counted, never hidden.
-  - **Reruns keep existing leads** (the `lead` rows of the PC-assignments
-    download), clear leads on papers that no longer advance, and redraw
-    ineligible ones. Kept leads are never moved.
+  - **Reruns keep existing leads**, clear leads on papers that no longer
+    advance, and redraw ineligible ones. Kept leads are never moved. Existing
+    leads come from `data/inputs/hpca2027-leads.csv`, HotCRP's "Discussion
+    leads (CSV)" download; **the "Review assignments" download never carries
+    leads**. That download hides leads on the downloader's own conflicts, so
+    `hotcrp_log.replay_leads` fills exactly the papers it omits, and the
+    download wins wherever both name a lead.
+  - **Chair overrides** (`data/curated/lead_overrides.csv`,
+    `paper,email,note`): a hand-picked lead on an advancing paper is seated
+    outright, exempt from the who-can-lead rule and outside the draw, and
+    uploaded only if HotCRP lacks it. It never keeps a paper advancing: under
+    the bar, it is cleared like any other lead.
   - **Determinism:** everything is sorted before it is shuffled, and one
     `random.Random(LEAD_SEED)` makes the output byte-identical per seed.
   - **Self-checks** must be 0 (the script exits 1 otherwise).

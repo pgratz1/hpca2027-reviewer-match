@@ -60,6 +60,10 @@ SUBMIT_RE = re.compile(r"^Review (\d+) (?:submitted|edited, submitted):")
 # "Review 15 retracted" / "Review 726 deleted" -- either reverses a submission.
 UNSUBMIT_RE = re.compile(r"^Review (\d+) (?:retracted|deleted)$")
 
+# Discussion-lead changes, exactly as `a_lead.php` logs them.
+SET_LEAD = "Set lead"
+CLEAR_LEAD = "Clear lead"
+
 
 @dataclass(frozen=True)
 class Review:
@@ -138,6 +142,27 @@ def replay_assignments(
             elif previous.pid != int(row["paper"]):
                 anomalies.append(("unassigned from a different paper", row))
     return live, anomalies
+
+
+def replay_leads(rows: list[dict[str, str]]) -> dict[int, str]:
+    """{pid: lead's address} from replaying `Set lead` / `Clear lead`.
+
+    HotCRP logs a lead change as `Set lead` with the new lead as the affected
+    user, and a removal as `Clear lead` (`a_lead.php`). A bulk upload can log
+    one event against several papers, so `paper` is split on whitespace.
+    `rows` must be chronological -- see `load_log`.
+    """
+    leads: dict[int, str] = {}
+    for row in rows:
+        action = row["action"]
+        if action not in (SET_LEAD, CLEAR_LEAD):
+            continue
+        for pid in row["paper"].split():
+            if action == SET_LEAD:
+                leads[int(pid)] = row["affected_email"]
+            else:
+                leads.pop(int(pid), None)
+    return leads
 
 
 def submitted_review_ids(rows: list[dict[str, str]]) -> set[int]:

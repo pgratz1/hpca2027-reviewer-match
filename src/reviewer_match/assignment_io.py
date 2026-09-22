@@ -7,8 +7,8 @@
 `phase`/`affinity` alongside. Both are `(pid, email)` pairs underneath, and
 `scripts/diff_assignments.py` and `scripts/fill_open_slots.py` both need to
 read either one -- this is the one place that parsing lives, so neither
-duplicates it. `load_leads` reads the discussion-lead rows of the same HotCRP
-shape, which `load_assignment_pairs` skips.
+duplicates it. `load_leads` reads discussion leads, from HotCRP's
+"Discussion leads (CSV)" download or from `lead` rows in the upload shape.
 """
 
 from __future__ import annotations
@@ -107,23 +107,39 @@ def remap_pairs(
 
 
 LEAD_CSV_HEADER = ("paper", "action", "email")
+# The lead column of HotCRP's "Discussion leads (CSV)" download (`la_getlead.php`).
+LEAD_DOWNLOAD_COLUMN = "leademail"
 
 
 def load_leads(path: str) -> dict[int, str]:
-    """{pid: lead's HotCRP address} from the `lead` rows of an assignment CSV.
+    """{pid: lead's HotCRP address} from a lead CSV, in either of two shapes.
 
-    Reads anything whose header starts `paper,action,email`: HotCRP's own
-    PC-assignments download and `assign_paper_leads.py`'s upload alike. Rows
-    are replayed in order, so a `clearlead` (or its alias `nolead`) cancels an
-    earlier `lead` for the same paper; every other action is ignored. Emails
-    are case-folded, as in `load_assignment_pairs`.
+    HotCRP's search-page "Discussion leads (CSV)" download
+    (`paper,title,given_name,family_name,leademail`) lists one row per paper
+    that has a lead. Anything whose header starts `paper,action,email` --
+    `assign_paper_leads.py`'s upload -- is replayed in order, so a
+    `clearlead` (or its alias `nolead`) cancels an earlier `lead` for the same
+    paper; every other action is ignored. Emails are case-folded, as in
+    `load_assignment_pairs`.
+
+    HotCRP's "Review assignments" download never carries leads, so passing it
+    here reads as a committee with no leads at all.
     """
     leads: dict[int, str] = {}
     with open(path, newline="", encoding="utf-8") as f:
         reader = csv.reader(f)
         header = next(reader, None)
+        if header and header[0] == "paper" and LEAD_DOWNLOAD_COLUMN in header:
+            column = header.index(LEAD_DOWNLOAD_COLUMN)
+            for row in reader:
+                if len(row) > column and row[column].strip():
+                    leads[int(row[0])] = row[column].strip().lower()
+            return leads
         if header is None or header[:len(LEAD_CSV_HEADER)] != list(LEAD_CSV_HEADER):
-            raise ValueError(f"{path}: unrecognised header {header!r}; expected it to start {LEAD_CSV_HEADER}")
+            raise ValueError(
+                f"{path}: unrecognised header {header!r}; expected HotCRP's discussion-leads "
+                f"download (with a {LEAD_DOWNLOAD_COLUMN} column) or one starting {LEAD_CSV_HEADER}"
+            )
         for row in reader:
             if len(row) < len(LEAD_CSV_HEADER):
                 continue

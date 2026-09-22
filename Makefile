@@ -610,18 +610,21 @@ revision-cutoffs: scripts/revision_cutoffs.py src/reviewer_match/review_scores.p
 # "average <= 2.5 and at most one score of 3 or better"; LEAD_FLAGS="--bar-cutoff
 # 2.25 --bar-net no4" changes it). Drawn at random from the paper's own submitted
 # full/light PC reviewers, with lead load proportional to assigned review load.
-# Existing leads in the PC-assignments download are kept; the upload is a delta.
-# Nothing is uploaded. LEAD_SEED changes the draw.
+# Existing leads in LEADS (search page > Download > Reviews > "Discussion leads
+# (CSV)"; the review-assignments download carries none) are kept, with the ones
+# it hides on the downloader's conflicts filled in from the log; the upload is
+# a delta. Nothing is uploaded. LEAD_SEED changes the draw.
 PCASSIGNMENTS = $(INPUT_DIR)/hpca2027-pcassignments.csv
+LEADS = $(INPUT_DIR)/hpca2027-leads.csv
 LEAD_SEED ?= 1
 LEAD_FLAGS ?=
 paper-leads: scripts/assign_paper_leads.py src/reviewer_match/review_scores.py \
 		src/reviewer_match/assignment_io.py src/reviewer_match/hotcrp_log.py
-	@for f in $(REVIEWS) $(LOG) $(PCASSIGNMENTS); do \
+	@for f in $(REVIEWS) $(LOG) $(PCASSIGNMENTS) $(LEADS); do \
 	  test -f $$f || { echo "ERROR: $$f not found; download it from HotCRP" >&2; exit 1; }; \
 	done
 	$(RUN) scripts.assign_paper_leads --reviews $(REVIEWS) --log $(LOG) --data $(DATA) \
-		--pcassignments $(PCASSIGNMENTS) --min-reviews $(REVISION_MIN_REVIEWS) \
+		--pcassignments $(PCASSIGNMENTS) --existing-leads $(LEADS) --min-reviews $(REVISION_MIN_REVIEWS) \
 		--seed $(LEAD_SEED) $(EXCLUDE_FLAG) $(LEAD_FLAGS)
 
 # RevisionAdvance on papers over the bar, NoRevision on those under it, for

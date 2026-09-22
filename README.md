@@ -1688,8 +1688,15 @@ reviewers are the only possible leads for more papers than their quotas add up
 to. The report counts and names those papers. `LEAD_SEED` picks the draw; the
 same inputs and seed reproduce it byte for byte.
 
-**Reruns keep existing leads.** The `lead` rows of the PC-assignments download,
-or of `--existing-leads PATH`, are what HotCRP holds today:
+**Reruns keep existing leads.** What HotCRP holds today comes from
+`data/inputs/hpca2027-leads.csv`: on the search page, select all papers, then
+Download → Reviews → **"Discussion leads (CSV)"** (`--existing-leads PATH`
+points elsewhere; a missing file is an error). The "Review assignments"
+download never carries leads. The leads download also **hides the lead of
+every paper the downloading account is conflicted with**, so any lead the
+action log shows on a paper the download omits is taken from the log, and the
+summary counts them. Where both name a lead, the download wins, and a
+disagreement is warned about. Then:
 
 - a lead who is still an eligible reviewer of a paper that still advances is
   **kept**, and counts towards their load;
@@ -1697,6 +1704,16 @@ or of `--existing-leads PATH`, are what HotCRP holds today:
 - a lead who is no longer eligible is **replaced**.
 
 `LEAD_FLAGS=--no-keep-leads` draws everything afresh.
+
+**Chair overrides.** `data/curated/lead_overrides.csv` (`paper,email,note`,
+gitignored; `--lead-overrides PATH` points elsewhere) holds leads the chair
+picked by hand, typically for a paper listed as unassignable. On a paper that
+advances, the override is the lead: exempt from the who-can-lead rule, never
+cleared or redrawn, and written as a `lead` row only when HotCRP does not
+already hold it. The proportional draw does not budget for it. It does **not**
+keep a paper advancing: one that falls under the bar is cleared as usual, and
+the summary names the override it did not apply. A blank email is a to-do; an
+email with no HotCRP PC account is an error.
 
 Outputs:
 
@@ -1706,7 +1723,8 @@ Outputs:
   change writes only the header.
 - `outputs/reports/paper_leads.csv`: one row per advancing paper, giving the
   reason, reviews still outstanding, the scores, the number of candidates, the
-  lead and a status of kept, new, redrawn or unassignable.
+  lead and a status of kept, new, redrawn, unassignable, override (already in
+  HotCRP) or override-new.
 - `outputs/reports/lead_loads.csv`: one row per possible lead, giving weight,
   papers reviewed, target, quota, leads and how far over quota.
 
@@ -1716,12 +1734,14 @@ if any is not.
 
 Workflow:
 
-1. Download fresh reviews, log, paper and **PC-assignments** exports.
+1. Download fresh reviews, log, paper, **PC-assignments** and **discussion-leads**
+   exports.
 2. Run `make paper-leads` and read the summary and the unassignable list.
 3. Upload `lead_upload.csv` through HotCRP's bulk assignment and check its
    preview before saving.
-4. **Before any rerun, download the PC assignments again.** That download is how
-   the next run learns which leads to keep.
+4. **Before any rerun, download the discussion leads again.** That download (plus
+   the log, for your own conflicts) is how the next run learns which leads to
+   keep.
 
 ### `scripts/revision_tags.py` — tag the papers the bar has decided
 
