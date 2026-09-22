@@ -17,6 +17,7 @@
 #   make baselines        randomized arms: how much of the match is SPECTER2?
 #   make revision-cutoffs share of reviewed papers each revision cutoff would catch
 #   make paper-leads      random, load-balanced leads for papers that advance
+#   make revision-tags    RevisionAdvance / NoRevision tags for decided papers
 #   make clean            remove assignment outputs only
 #   make clean-fingerprints  remove embedding caches, never DBLP caches
 
@@ -207,7 +208,7 @@ ASSIGN_DEPS = scripts/assign_reviewers.py src/reviewer_match/paper_matching.py \
 	dblp-snapshot coauthor-coi collaborator-coi affiliation-countries pc-roster duplicates \
 	complete-papers area-chairs-complete clear-uploads baselines clean clean-fingerprints \
 	log-assignments reviewer-activity rerun targeted-rerun swap-candidates swap-upload fill-slots \
-	revision-cutoffs paper-leads
+	revision-cutoffs paper-leads revision-tags
 
 all: $(SENIORITY) enrich $(FINGERPRINTS)
 	$(RUN) scripts.build_fingerprints --csv "$(CSV)" --fingerprint-cache $(FINGERPRINTS)
@@ -596,7 +597,7 @@ baselines: $(ASSIGN_DEPS) scripts/compare_baselines.py
 # read-only apart from its two reports. REVISION_FLAGS passes more through,
 # e.g. REVISION_FLAGS=--complete-only or REVISION_FLAGS=--include-trc.
 REVIEWS = $(INPUT_DIR)/hpca2027-reviews.csv
-REVISION_MIN_REVIEWS ?= 4
+REVISION_MIN_REVIEWS ?= 5
 REVISION_FLAGS ?=
 revision-cutoffs: scripts/revision_cutoffs.py src/reviewer_match/review_scores.py src/reviewer_match/hotcrp_log.py
 	@test -f $(REVIEWS) || { echo "ERROR: $(REVIEWS) not found; download the reviews CSV from HotCRP" >&2; exit 1; }
@@ -622,6 +623,18 @@ paper-leads: scripts/assign_paper_leads.py src/reviewer_match/review_scores.py \
 	$(RUN) scripts.assign_paper_leads --reviews $(REVIEWS) --log $(LOG) --data $(DATA) \
 		--pcassignments $(PCASSIGNMENTS) --min-reviews $(REVISION_MIN_REVIEWS) \
 		--seed $(LEAD_SEED) $(EXCLUDE_FLAG) $(LEAD_FLAGS)
+
+# RevisionAdvance on papers over the bar, NoRevision on those under it, for
+# every paper with REVISION_MIN_REVIEWS+ submitted PC reviews; papers short of
+# reviews stay untagged. Same bar and flags as paper-leads (LEAD_FLAGS), so the
+# two agree. The upload is a delta that clears the opposite tag first, so a rerun
+# after a paper crosses the bar is safe. Nothing is uploaded.
+revision-tags: scripts/revision_tags.py src/reviewer_match/review_scores.py src/reviewer_match/hotcrp_log.py
+	@for f in $(REVIEWS) $(LOG); do \
+	  test -f $$f || { echo "ERROR: $$f not found; download it from HotCRP" >&2; exit 1; }; \
+	done
+	$(RUN) scripts.revision_tags --reviews $(REVIEWS) --log $(LOG) --data $(DATA) \
+		--min-reviews $(REVISION_MIN_REVIEWS) $(EXCLUDE_FLAG) $(LEAD_FLAGS)
 
 clean:
 	rm -f $(ASSIGNMENT) $(ASSIGNMENT_CSV) $(AREA_CHAIR_ASSIGNMENT) \

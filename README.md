@@ -1612,7 +1612,7 @@ review on a paper the run excluded — today, the chair's two test reviews on th
 ### `scripts/revision_cutoffs.py` — how many papers a revision cutoff would catch
 
 `make revision-cutoffs` is decision support for the revision-eligibility cutoff:
-of the papers holding at least `REVISION_MIN_REVIEWS` (4) submitted reviews,
+of the papers holding at least `REVISION_MIN_REVIEWS` (5) submitted reviews,
 what share would each *net* catch, by average pre-rebuttal overall merit. The
 nets start from the same average test and add a guard for papers that have
 someone arguing for them:
@@ -1656,7 +1656,7 @@ review data and are gitignored. Offline, instant, read-only.
 lead and writes the HotCRP upload for it. It uploads nothing.
 
 **Which papers advance.** Every paper still under review that either has fewer
-than `REVISION_MIN_REVIEWS` (4) submitted PC reviews, or is over the bar. The
+than `REVISION_MIN_REVIEWS` (5) submitted PC reviews, or is over the bar. The
 bar is `review_scores.Bar`, the same definition `make revision-cutoffs`
 measures. By default a paper is **under** it when its average is ≤ 2.5 **and**
 at most one reviewer scored it 3 or better, so a paper averaging exactly 2.5
@@ -1722,6 +1722,25 @@ Workflow:
    preview before saving.
 4. **Before any rerun, download the PC assignments again.** That download is how
    the next run learns which leads to keep.
+
+### `scripts/revision_tags.py` — tag the papers the bar has decided
+
+`make revision-tags` writes `outputs/assignments/revision_tags_upload.csv`,
+which tags every paper with at least `REVISION_MIN_REVIEWS` (5) submitted PC
+reviews: `RevisionAdvance` if it is over the bar, `NoRevision` if it is
+under. Papers with fewer reviews stay **untagged** until their reviews arrive.
+It uses the same `review_scores.Bar`, paper set and `LEAD_FLAGS` as `make
+paper-leads`, so every paper that advances on its scores for a lead is exactly
+a `RevisionAdvance`. TRC reviews count towards neither the floor nor the
+average.
+
+The upload is a HotCRP bulk-assignment delta (`paper,action,email,tag,round`).
+HotCRP's `tag` action only adds, so every decided paper first gets a `cleartag`
+of the opposite tag, and every undecided paper a `cleartag` of both. That makes
+a rerun safe after a late review moves a paper across the bar; clearing a tag a
+paper does not have changes nothing. Desk-rejected and excluded papers are not
+touched. stdout gives the three counts. Offline, instant, and nothing is
+uploaded.
 
 ## Publication exclusions
 

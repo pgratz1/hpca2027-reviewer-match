@@ -198,7 +198,7 @@ contains spaces and parentheses — always quote it in shell commands).
   Seniority/fingerprints are existence-checked, not prerequisites, so a fresh
   export never triggers a reclassify or re-embed mid-review.
 - **`make revision-cutoffs`** is decision support for the revision cutoff: of
-  the papers with `REVISION_MIN_REVIEWS` (4) submitted reviews, what share each
+  the papers with `REVISION_MIN_REVIEWS` (5) submitted reviews, what share each
   net catches by average pre-rebuttal overall merit. The average test on its
   own, then with "no score ≥4", "at most one score ≥3" or "no score ≥3" added
   (`NETS` in `review_scores.py`). Reads `data/inputs/hpca2027-reviews.csv` (HotCRP's
@@ -233,6 +233,13 @@ contains spaces and parentheses — always quote it in shell commands).
   - **Determinism:** everything is sorted before it is shuffled, and one
     `random.Random(LEAD_SEED)` makes the output byte-identical per seed.
   - **Self-checks** must be 0 (the script exits 1 otherwise).
+- **`make revision-tags`** writes `outputs/assignments/revision_tags_upload.csv`:
+  `RevisionAdvance` over the bar, `NoRevision` under it, for every paper
+  with `REVISION_MIN_REVIEWS` (5) submitted PC reviews; papers short of reviews
+  stay untagged. Same `review_scores.Bar`, paper set and `LEAD_FLAGS` as
+  `paper-leads`, so the two cannot disagree. HotCRP's `tag` only adds, so the
+  delta `cleartag`s the opposite tag (both, on an undecided paper) before any
+  `tag` row — that is what makes a rerun safe after a paper crosses the bar.
 - `make complete-papers` and `make area-chairs-complete` retain the former
   completeness filter in separate `*-complete.txt` artifacts.
 - Library modules (imported, never run): `src/reviewer_match/reviewers.py`, `src/reviewer_match/dblp.py`,
@@ -254,6 +261,7 @@ contains spaces and parentheses — always quote it in shell commands).
   `scripts/extract_log_assignments.py`, `scripts/audit_reviewer_activity.py`,
   `scripts/diff_assignments.py`, `scripts/fill_open_slots.py`,
   `scripts/revision_cutoffs.py`, `scripts/assign_paper_leads.py`,
+  `scripts/revision_tags.py`,
   `scripts/main.py`.
 
 ## Architecture (filter-then-rank, then constrained assignment)

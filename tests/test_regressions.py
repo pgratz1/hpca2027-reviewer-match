@@ -63,6 +63,7 @@ from scripts import propose_reviewer_swaps
 from scripts import generate_swap_upload
 from scripts import revision_cutoffs
 from scripts import assign_paper_leads
+from scripts import revision_tags
 from reviewer_match import review_scores
 
 PCINFO_FIELDS = [
@@ -7139,6 +7140,102 @@ class PaperLeadTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.assertEqual({1: "a@x.edu"}, assignment_io.load_leads(str(tmp)))
+
+
+class RevisionTagTests(unittest.TestCase):
+    """scripts.revision_tags: RevisionAdvance / NoRevision on decided papers."""
+
+    ADVANCE = revision_tags.ADVANCE_TAG
+    NO = revision_tags.NO_REVISION_TAG
+
+    def test_decide_tags_by_the_bar_and_leaves_short_papers_untagged(self):
+        bar = review_scores.Bar(min_reviews=5)
+        scores = {
+            1: [3, 3, 2, 2, 2],  # two scores >= 3: over the bar
+            2: [3, 3, 3, 3, 3],  # average 3: over the bar
+            3: [4, 2, 2, 2, 2],  # average 2.4, one score >= 3: under
+            4: [5, 5, 5, 5],  # strong, but only 4 reviews: not decided yet
+            5: [1, 1, 1, 1],  # weak, but only 4 reviews: not decided yet
+        }
+        decisions = revision_tags.decide({1, 2, 3, 4, 5, 6}, scores, bar)
+        self.assertEqual(
+            {1: self.ADVANCE, 2: self.ADVANCE, 3: self.NO, 4: None, 5: None, 6: None},
+            decisions,
+        )
+
+    def test_decide_agrees_with_the_bar_the_leads_use(self):
+        # Every paper paper-leads advances on scores is exactly a RevisionAdvance.
+        bar = review_scores.Bar(min_reviews=5)
+        rng = random.Random(3)
+        scores = {pid: [rng.randint(1, 5) for _ in range(rng.randint(3, 7))] for pid in range(200)}
+        decisions = revision_tags.decide(set(scores), scores, bar)
+        for pid, s in scores.items():
+            reason = bar.advances(s)
+            expected = {review_scores.OVER_BAR: self.ADVANCE, None: self.NO}.get(reason)
+            self.assertEqual(expected, decisions[pid], pid)
+
+    def test_upload_clears_the_opposite_tag_before_any_tag(self):
+        rows = revision_tags.upload_rows({2: self.NO, 1: self.ADVANCE, 3: None})
+        self.assertEqual(
+            [
+                [1, "cleartag", "", self.NO, ""],
+                [2, "cleartag", "", self.ADVANCE, ""],
+                [3, "cleartag", "", self.ADVANCE, ""],
+                [3, "cleartag", "", self.NO, ""],
+                [1, "tag", "", self.ADVANCE, ""],
+                [2, "tag", "", self.NO, ""],
+            ],
+            rows,
+        )
+
+    def test_upload_never_clears_the_tag_a_paper_is_given(self):
+        rows = revision_tags.upload_rows({pid: tag for pid, tag in enumerate((self.ADVANCE, self.NO))})
+        cleared = {(r[0], r[3]) for r in rows if r[1] == "cleartag"}
+        tagged = {(r[0], r[3]) for r in rows if r[1] == "tag"}
+        self.assertFalse(cleared & tagged)
+
+    def test_main_end_to_end_leaves_out_trc_desk_rejects_and_exclusions(self):
+        tmp = Path(tempfile.mkdtemp())
+        papers = [
+            {"pid": 1, "status": "submitted", "tags": []},
+            {"pid": 2, "status": "submitted", "tags": []},
+            {"pid": 3, "status": "submitted", "tags": []},
+            {"pid": 4, "status": "submitted", "tags": ["~~desk-reject#0"]},
+            {"pid": 5, "status": "submitted", "tags": []},
+        ]
+        (tmp / "data.json").write_text(json.dumps(papers), encoding="utf-8")
+        reviews = []
+        for pid, scores in ((1, [4, 4, 3, 3, 3]), (2, [1, 1, 2, 2, 2]), (4, [5] * 5), (5, [5] * 5)):
+            reviews += [[pid, "T", f"{pid}{i}", f"r{i}@x.edu", s] for i, s in enumerate(scores)]
+        # Paper 3 has five reviews only by counting a TRC student's.
+        reviews += [[3, "T", f"3{i}", f"r{i}@x.edu", 5] for i in range(4)]
+        reviews.append([3, "T", "3S", "Student@x.edu", 5])
+        with open(tmp / "reviews.csv", "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["paper", "title", "review", "email", review_scores.SCORE_FIELD])
+            writer.writerows(reviews)
+        with open(tmp / "log.csv", "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(hotcrp_log.LOG_HEADER)  # newest first, as HotCRP writes it
+            writer.writerow(["", "", "student@x.edu", "", "student@x.edu", "", "3", "Review 9 submitted: 400 words"])
+            writer.writerow(["", "", "chair@x.edu", "", "student@x.edu", "", "3", "Review 9 assigned: external, round TRC"])
+        upload = tmp / "upload.csv"
+        argv = [
+            "revision_tags", "--reviews", str(tmp / "reviews.csv"), "--log", str(tmp / "log.csv"),
+            "--data", str(tmp / "data.json"), "--min-reviews", "5", "--exclude-pids", "5",
+            "--upload", str(upload),
+        ]
+        with mock.patch.object(sys, "argv", argv), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(0, revision_tags.main())
+        with open(upload, newline="", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
+        self.assertEqual(revision_tags.UPLOAD_HEADER, rows[0])
+        self.assertEqual(
+            [("1", self.ADVANCE), ("2", self.NO)],
+            [(r[0], r[3]) for r in rows[1:] if r[1] == "tag"],
+        )
+        self.assertEqual({"1", "2", "3"}, {r[0] for r in rows[1:]})  # 4 desk-rejected, 5 excluded
 
 
 if __name__ == "__main__":
