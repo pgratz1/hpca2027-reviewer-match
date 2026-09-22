@@ -2251,6 +2251,39 @@ class FillOpenSlotsTests(unittest.TestCase):
         live, _ = hotcrp_log.replay_assignments([dict(r, date="") for r in rows])
         self.assertEqual({"left@example.com"}, fill_open_slots.emptied_reviewers(rows, live))
 
+    def test_replay_drops_a_deleted_review(self):
+        # A chair removing a review with content logs "deleted" and no "unassigned".
+        rows = [
+            {"action": "Review 1 assigned: primary, round R1", "affected_email": "a@example.com", "paper": "1", "date": ""},
+            {"action": "Review 2 assigned: primary, round R1", "affected_email": "a@example.com", "paper": "2", "date": ""},
+            {"action": "Review 1 deleted", "affected_email": "a@example.com", "paper": "1", "date": ""},
+        ]
+        live, anomalies = hotcrp_log.replay_assignments(rows)
+        self.assertEqual([2], [r.pid for r in live.values()])
+        self.assertEqual([], anomalies)
+
+    def test_targeted_removals_skip_bulk_resolves_and_count_deletions(self):
+        rows = [{"action": f"Review {i} assigned: primary, round R1", "affected_email": f"r{i}@example.com",
+                 "paper": "1", "date": "2026-08-01 10:00", "email": "chair@example.com"} for i in range(4)]
+        rows += [{"action": f"Review {i} unassigned", "affected_email": f"r{i}@example.com",
+                  "paper": "1", "date": "2026-08-02 10:05", "email": "chair@example.com"} for i in range(3)]
+        rows += [{"action": "Review 3 deleted", "affected_email": "r3@example.com",
+                  "paper": "1", "date": "2026-08-03 10:05", "email": "chair@example.com"}]
+        live, _ = hotcrp_log.replay_assignments(rows)
+        self.assertEqual({"r3@example.com": [1]}, fill_open_slots.targeted_removals(rows, live, bulk_people=3))
+        self.assertEqual(4, len(fill_open_slots.targeted_removals(rows, live, bulk_people=4)))
+
+    def test_behind_reviewers_count_only_selected_papers(self):
+        rows = [
+            {"action": "Review 1 assigned: primary, round R1", "affected_email": "a@example.com", "paper": "1", "date": ""},
+            {"action": "Review 2 assigned: primary, round R1", "affected_email": "a@example.com", "paper": "2", "date": ""},
+            {"action": "Review 3 assigned: primary, round R1", "affected_email": "a@example.com", "paper": "9", "date": ""},
+            {"action": "Review 4 assigned: primary, round R1", "affected_email": "b@example.com", "paper": "1", "date": ""},
+        ]
+        live, _ = hotcrp_log.replay_assignments(rows)
+        self.assertEqual({"b@example.com": (0, 1)},
+                         fill_open_slots.behind_reviewers(live, submitted={1}, pids={1, 2}, share=0.5))
+
     def test_dropped_paper_holders_are_live_r1_reviews_on_papers_left_the_export(self):
         rows = [
             {"action": "Review 1 assigned: primary, round R1", "affected_email": "freed@example.com", "paper": "9", "date": ""},

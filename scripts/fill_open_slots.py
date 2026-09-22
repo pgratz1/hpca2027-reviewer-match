@@ -63,6 +63,28 @@ The baseline for this mode should be HotCRP's own Search -> Download ->
 "Review assignments" export: it is what HotCRP holds now, and papers since
 desk-rejected are simply absent from it, which is what frees their
 reviewers' capacity.
+
+`--add N` gives each --pids paper N more reviewers on top of whatever it
+holds, nobody taken off -- for papers whose assigned reviews are overdue. The
+--log pool filters apply under --pids just as under --removed-email:
+
+    python -m scripts.fill_open_slots --baseline data/inputs/hpca2027-pcassignments.csv \\
+        --log data/inputs/hpca2027-log.csv --only-dropped-paper-reviewers \\
+        --pids 133,1984 --add 2 --max-new-per-reviewer 2 --paper-policy submitted \\
+        --include-reserves --reserve-cap 6 --same-country-cap 1 --max-juniors 2 \\
+        --exclude-pids 1152 --pairs-csv new-pairs.csv --delta-hotcrp-csv delta.csv
+
+Two more --log filters keep a rescue away from the wrong people.
+`--min-submitted-share F` drops anyone who has submitted less than F of their
+live R1 reviews on papers still selected (nobody assigned anything is not
+behind). `--exclude-removed-reviewers` drops anyone the chairs took an R1
+review off and never gave it back -- a decline, a swap, a fill-slots removal
+-- as against a bulk re-solve, told apart by size: one actor's unassigns in
+one clock hour reaching --bulk-people distinct reviewers is a re-solve.
+
+Under --log a *submitted* review on a paper no longer selected (desk-rejected,
+withdrawn) still counts toward its reviewer's cap -- the work was done. Only
+the unsubmitted ones free capacity.
 """
 
 from __future__ import annotations
@@ -97,6 +119,8 @@ from reviewer_match.roster import DEFAULT_AREA_CHAIR_CSV
 from scripts import assign_reviewers as ar
 from scripts.build_targeted_rerun_pins import load_email_list
 from scripts.classify_reviewers import DEFAULT_OUT as DEFAULT_SENIORITY, load_seniority
+
+DEFAULT_BULK_PEOPLE = 25
 
 # "Review 4861 edited, updated draft: ..." -- a saved but unsubmitted review.
 DRAFT_RE = re.compile(r"^Review (\d+) edited, updated draft")
@@ -142,6 +166,52 @@ def dropped_paper_holders(live: dict, data_pids: set[int]) -> dict[str, list[int
     for review in live.values():
         if review.round == "R1" and review.pid not in data_pids:
             out[review.email].append(review.pid)
+    return {email: sorted(pids) for email, pids in out.items()}
+
+
+def behind_reviewers(live: dict, submitted: set[int], pids: set[int], share: float) -> dict[str, tuple[int, int]]:
+    """{HotCRP address: (submitted, assigned)} for whoever has submitted under `share` of their R1 reviews.
+
+    Only reviews on `pids` count: a desk-rejected paper's review will never be
+    written and is not a sign of being behind.
+    """
+    done: dict[str, int] = defaultdict(int)
+    total: dict[str, int] = defaultdict(int)
+    for rid, review in live.items():
+        if review.round == "R1" and review.pid in pids:
+            total[review.email] += 1
+            done[review.email] += rid in submitted
+    return {email: (done[email], n) for email, n in total.items() if done[email] < share * n}
+
+
+def targeted_removals(rows: list[dict[str, str]], live: dict, bulk_people: int) -> dict[str, list[int]]:
+    """{HotCRP address: [pids]} of R1 reviews taken off someone individually and not given back.
+
+    Taken off means unassigned or, for a review with content, deleted.
+
+    Unassigns are batched by (actor, clock hour); a batch whose net removals
+    reach `bulk_people` distinct reviewers is a re-solve upload, where nobody
+    asked for anything, and is ignored. A pair live again now was a reshuffle,
+    not a removal.
+    """
+    live_pairs = {(r.pid, r.email) for r in live.values() if r.round == "R1"}
+    rounds: dict[int, str] = {}
+    batches: dict[tuple[str, str], list[tuple[int, str]]] = defaultdict(list)
+    for row in rows:
+        m = hotcrp_log.ASSIGN_RE.match(row["action"])
+        if m:
+            rounds[int(m.group(1))] = m.group(3)
+            continue
+        m = hotcrp_log.UNASSIGN_RE.match(row["action"]) or hotcrp_log.DELETE_RE.match(row["action"])
+        if m and rounds.get(int(m.group(1))) == "R1":
+            pair = (int(row["paper"]), row["affected_email"])
+            if pair not in live_pairs:
+                batches[(row["date"][:13], row["email"])].append(pair)
+    out: dict[str, set[int]] = defaultdict(set)
+    for pairs in batches.values():
+        if len({email for _, email in pairs}) < bulk_people:
+            for pid, email in pairs:
+                out[email].add(pid)
     return {email: sorted(pids) for email, pids in out.items()}
 
 
@@ -439,7 +509,14 @@ def main() -> int:
     parser.add_argument("--only-dropped-paper-reviewers", action="store_true",
                         help="with --log: offer new papers only to reviewers who were assigned a paper since "
                              "dropped from the export (desk-rejected or withdrawn) -- the capacity those freed")
+    parser.add_argument("--min-submitted-share", type=float, metavar="F",
+                        help="with --log: never offer a paper to anyone who has submitted under F of their R1 reviews")
+    parser.add_argument("--exclude-removed-reviewers", action="store_true",
+                        help="with --log: never offer a paper to anyone a chair took an R1 review off outside a bulk re-solve")
+    parser.add_argument("--bulk-people", type=int, default=DEFAULT_BULK_PEOPLE, metavar="N",
+                        help="an hour's unassigns by one actor reaching N reviewers is a bulk re-solve (default: %(default)s)")
     parser.add_argument("--fill-to", type=int, metavar="N", help="fill each orphaned paper back up to N reviewers, not to its own baseline size")
+    parser.add_argument("--add", type=int, metavar="N", help="give each --pids paper N more reviewers on top of its current slate")
     parser.add_argument("--max-new-per-reviewer", type=int, metavar="N", help="hand no reviewer more than N new papers in this run")
     parser.add_argument("--delta-hotcrp-csv", metavar="PATH", help="write only the change as a HotCRP upload: clear each removed pair, add each new one")
     parser.add_argument("--pids", help="comma-separated pids to (re)fill explicitly, instead of --removed-email")
@@ -510,10 +587,14 @@ def main() -> int:
         parser.error("--fill-to must be non-negative")
     if args.max_new_per_reviewer is not None and args.max_new_per_reviewer < 0:
         parser.error("--max-new-per-reviewer must be non-negative")
-    if args.only_dropped_paper_reviewers and not args.log:
-        parser.error("--only-dropped-paper-reviewers requires --log")
-    if args.delta_hotcrp_csv and not args.removed_email:
-        parser.error("--delta-hotcrp-csv requires --removed-email (it clears their reviews)")
+    if (args.only_dropped_paper_reviewers or args.exclude_removed_reviewers or args.min_submitted_share is not None) and not args.log:
+        parser.error("--only-dropped-paper-reviewers, --exclude-removed-reviewers and --min-submitted-share require --log")
+    if args.min_submitted_share is not None and not 0 <= args.min_submitted_share <= 1:
+        parser.error("--min-submitted-share must lie in [0, 1]")
+    if args.add is not None and (args.add < 0 or not args.pids or args.fill_to is not None):
+        parser.error("--add needs a non-negative N, --pids, and no --fill-to")
+    if args.delta_hotcrp_csv and not (args.removed_email or args.add is not None):
+        parser.error("--delta-hotcrp-csv requires --removed-email (it clears their reviews) or --add")
 
     seniority = None
     if not args.no_seniority:
@@ -596,6 +677,44 @@ def main() -> int:
     dropped_by: dict[str, list[int]] | None = None
     if args.exclude_candidates:
         not_candidates |= {hotcrp_to_roster.get(e, e) for e in load_email_list(args.exclude_candidates)}
+    if args.log:
+        rows = hotcrp_log.load_log(args.log)
+        live, _anomalies = hotcrp_log.replay_assignments(rows)
+        emptied = sorted(hotcrp_to_roster.get(e, e) for e in emptied_reviewers(rows, live))
+        emptied = [e for e in emptied if e in reviewers_by_email and e not in removed]
+        if emptied:
+            print(f"{len(emptied)} reviewer(s) on the roster have had every R1 review unassigned in "
+                  f"{args.log} -- treated as departed, never offered a paper: {', '.join(emptied)}",
+                  file=sys.stderr)
+        not_candidates |= set(emptied)
+        if args.only_dropped_paper_reviewers:
+            with open(args.data, encoding="utf-8") as f:
+                data_pids = {int(paper["pid"]) for paper in json.load(f)}
+            dropped_by = {
+                hotcrp_to_roster.get(e, e): pids for e, pids in dropped_paper_holders(live, data_pids).items()
+            }
+            outside = {e for e in reviewers_by_email if e not in dropped_by}
+            print(f"Candidate pool limited to the {len(set(reviewers_by_email) - outside)} roster reviewer(s) "
+                  f"assigned a paper no longer in {args.data} (desk-rejected or withdrawn).", file=sys.stderr)
+            not_candidates |= outside
+        if args.min_submitted_share is not None:
+            behind = {
+                hotcrp_to_roster.get(e, e): counts
+                for e, counts in behind_reviewers(live, hotcrp_log.submitted_review_ids(rows), current_pids,
+                                                  args.min_submitted_share).items()
+            }
+            behind = {e: c for e, c in behind.items() if e in reviewers_by_email}
+            print(f"{len(behind)} roster reviewer(s) have submitted under {args.min_submitted_share:g} of their R1 "
+                  f"reviews -- never offered a paper.", file=sys.stderr)
+            not_candidates |= set(behind)
+        if args.exclude_removed_reviewers:
+            taken_off = {
+                hotcrp_to_roster.get(e, e): pids for e, pids in targeted_removals(rows, live, args.bulk_people).items()
+            }
+            taken_off = {e: p for e, p in taken_off.items() if e in reviewers_by_email}
+            print(f"{len(taken_off)} roster reviewer(s) had R1 reviews taken off them outside a bulk re-solve "
+                  f"-- never offered a paper: {', '.join(sorted(taken_off))}", file=sys.stderr)
+            not_candidates |= set(taken_off)
     if args.removed_email:
         for email in sorted(removed):
             if args.log:
@@ -606,25 +725,6 @@ def main() -> int:
                 parser.error(f"{email} is still on the current roster; pass --force to fill slots for them anyway, "
                              f"or --log to take them off their unsubmitted reviews only")
         if args.log:
-            rows = hotcrp_log.load_log(args.log)
-            live, _anomalies = hotcrp_log.replay_assignments(rows)
-            emptied = sorted(hotcrp_to_roster.get(e, e) for e in emptied_reviewers(rows, live))
-            emptied = [e for e in emptied if e in reviewers_by_email and e not in removed]
-            if emptied:
-                print(f"{len(emptied)} reviewer(s) on the roster have had every R1 review unassigned in "
-                      f"{args.log} -- treated as departed, never offered a paper: {', '.join(emptied)}",
-                      file=sys.stderr)
-            not_candidates |= set(emptied)
-            if args.only_dropped_paper_reviewers:
-                with open(args.data, encoding="utf-8") as f:
-                    data_pids = {int(paper["pid"]) for paper in json.load(f)}
-                dropped_by = {
-                    hotcrp_to_roster.get(e, e): pids for e, pids in dropped_paper_holders(live, data_pids).items()
-                }
-                outside = {e for e in reviewers_by_email if e not in dropped_by}
-                print(f"Candidate pool limited to the {len(set(reviewers_by_email) - outside)} roster reviewer(s) "
-                      f"assigned a paper no longer in {args.data} (desk-rejected or withdrawn).", file=sys.stderr)
-                not_candidates |= outside
             rid_by_pair = {(r.pid, r.email): rid for rid, r in live.items() if r.kind == "primary" and r.round == "R1"}
             removed_pairs = [
                 (pid, email) for pid, emails in baseline_pairs.items() if pid in current_pids
@@ -667,9 +767,22 @@ def main() -> int:
     )
 
     used = seed_used(baseline_pairs, removed, current_pids, kept)
+    if args.log:
+        # A review written for a paper since desk-rejected or withdrawn is work
+        # done: it stays on the reviewer's load. Only unwritten ones are freed.
+        written = hotcrp_log.submitted_review_ids(rows)
+        spent = 0
+        for rid, review in live.items():
+            if review.round == "R1" and review.pid not in current_pids and rid in written:
+                used[hotcrp_to_roster.get(review.email, review.email)] += 1
+                spent += 1
+        print(f"{spent} submitted review(s) on papers no longer selected still count toward their reviewer's cap.",
+              file=sys.stderr)
     slates, target = seed_slates_and_targets(
         baseline_pairs, orphaned_pids, reviewers_by_email, removed, kept, fill_to=args.fill_to, live=bool(args.log),
     )
+    if args.add is not None:
+        target = {pid: args.add for pid in orphaned_pids}
     original_slate = {pid: list(slates[pid]) for pid in orphaned_pids}
 
     active_pids = [pid for pid in orphaned_pids if target[pid] > 0]
@@ -852,7 +965,13 @@ def main() -> int:
     containment_violations = check_pid_containment(
         (pid for pid, emails in new_slates.items() if emails), orphaned_set
     )
-    cap_violations = check_reviewer_caps(used, reviewers_by_email, args.light_cap, args.full_cap, args.reserve_cap)
+    # Load the baseline already carries (counting written reviews on dropped
+    # papers can put someone over before this run touches them) is reported
+    # apart, so the self-check keeps meaning "this run broke no cap".
+    over_cap = check_reviewer_caps(used, reviewers_by_email, args.light_cap, args.full_cap, args.reserve_cap)
+    given = {e for emails in new_slates.values() for e in emails}
+    cap_violations = [e for e in over_cap if e in given]
+    inherited_over_cap = [e for e in over_cap if e not in given]
     country_violations = check_hard_class_caps(slates, active_pids, country_capped) if not args.no_same_country_cap else {}
     new_per_reviewer_violations = check_new_per_reviewer(new_slates, args.max_new_per_reviewer)
 
@@ -884,8 +1003,8 @@ def main() -> int:
         f"\nDone. {total_new} new reviewer-paper pair(s) placed across {len(active_pids)} "
         f"paper(s) with an open slot ({len(skipped_pids)} orphaned paper(s) needed nothing); "
         f"{len(containment_violations)} pair(s) touched outside the orphaned set — should "
-        f"always be 0; {len(cap_violations)} reviewer(s) over their own cap — should always "
-        f"be 0; {blocking} blocking pair(s) — should always be 0; {capped_blocking} blocking "
+        f"always be 0; {len(cap_violations)} reviewer(s) given a paper over their own cap — should always "
+        f"be 0 ({len(inherited_over_cap)} more already over it and given nothing); {blocking} blocking pair(s) — should always be 0; {capped_blocking} blocking "
         f"pair(s) among capped papers (country class crosses seniority classes, not "
         f"guaranteed stable — see README); {len(country_violations)} paper(s) over the "
         f"same-country cap — should always be 0"

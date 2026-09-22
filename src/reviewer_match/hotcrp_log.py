@@ -40,6 +40,10 @@ LOG_HEADER = ("date", "ipaddr", "email", "roles", "affected_email", "via", "pape
 # "Review 31247 assigned: primary, round R1" / "Review 11642 unassigned".
 ASSIGN_RE = re.compile(r"^Review (\d+) assigned: (\w+), round (\S+)$")
 UNASSIGN_RE = re.compile(r"^Review (\d+) unassigned$")
+# "Review 5702 deleted": how HotCRP logs a chair removing a review that has
+# content. No "unassigned" follows, so a replay that misses it keeps a review
+# HotCRP no longer has.
+DELETE_RE = re.compile(r"^Review (\d+) deleted$")
 
 # Actions that can only follow from opening a paper or a review form. Deliberately
 # narrower than "the account did something": a password reset or a topic-interest
@@ -93,7 +97,7 @@ def load_log(path: str) -> list[dict[str, str]]:
 def replay_assignments(
     rows: list[dict[str, str]]
 ) -> tuple[dict[int, Review], list[tuple[str, dict[str, str]]]]:
-    """Replay assign/unassign into ({review id: Review}, [(anomaly, row)]).
+    """Replay assign/unassign/delete into ({review id: Review}, [(anomaly, row)]).
 
     HotCRP's review id is the identity that survives an unassign/reassign
     cycle, so it -- not (pid, email) -- is what the state is keyed on. A bulk
@@ -123,7 +127,7 @@ def replay_assignments(
                 assigned_at=row["date"],
             )
             continue
-        m = UNASSIGN_RE.match(action)
+        m = UNASSIGN_RE.match(action) or DELETE_RE.match(action)
         if m:
             rid = int(m.group(1))
             previous = live.pop(rid, None)
