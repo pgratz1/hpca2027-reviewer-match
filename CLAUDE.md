@@ -249,6 +249,55 @@ contains spaces and parentheses — always quote it in shell commands).
   `paper-leads`, so the two cannot disagree. HotCRP's `tag` only adds, so the
   delta `cleartag`s the opposite tag (both, on an undecided paper) before any
   `tag` row — that is what makes a rerun safe after a paper crosses the bar.
+- **`make timeliness-tags`** writes `outputs/assignments/timeliness_tags_upload.csv`,
+  a delta upload. A paper gets `~~ontime` if all its PC/reserve authors
+  (matched by **email only**) had submitted every R1 review they hold by
+  `ONTIME_CUTOFF` (2026-09-22 11:00 -0400), or if it has no such author.
+  Otherwise it gets `~~onedaylate`, `~~twodayslate`, … by the 24-hour window
+  in which the last author **first** submitted; later edits never count. **TRC
+  reviews are ignored**, and so are **reviews on papers no longer under review**
+  (desk-rejected or withdrawn: absent from the export or tagged `desk-reject`).
+  The log keeps those live, and counting them wrongly held 43 papers. An R1 review assigned after `EXEMPT_AFTER`
+  (2026-09-13), or an `extension` row in `data/curated/review_extensions.csv`,
+  exempts that reviewer. A `late` row there overrides the exemption. Any
+  unfinished, non-exempt author blocks the paper, which then takes the
+  placeholder `~~delayedmissingreview` — it has no day yet. **Day tags stick,
+  the placeholder does not:** a paper already carrying a day tag in
+  `hpca2027-data.json` is never re-tagged, but one carrying only the placeholder
+  is still decided, and every paper no longer blocked gets a `cleartag` of it
+  **unconditionally** — driving that off the export's `tags` instead would let
+  two runs against one stale export leave a paper carrying both. Clears first,
+  then tags, the `revision-tags` shape. Run it daily on fresh exports. Offline,
+  instant.
+- **`make timeliness-emails`** drafts one email per paper carrying
+  `~~delayedmissingreview` into `outputs/reports/timeliness_emails.txt`, for the
+  chair to split and send by hand — **nothing is sent, no mail is configured**.
+  Held papers and their blockers come from the same
+  `timeliness_tags.evaluate()` the tags do, so the two cannot name different
+  people. Addressed to `authors` ∪ `contacts` (the contact list holds the
+  submitting account); names the blocker by the user export's spelling and the
+  address that paper lists them under, with the count they still owe. A blocker
+  with **0 outstanding** was marked `late` by hand and gets count-free wording —
+  the count sentence would be false. **`ANNOUNCED_DEADLINE` is deliberately not
+  `ONTIME_CUTOFF`**: the email quotes what the committee was told (Monday,
+  September 21, 2026 8:00am EST), the tags use a cutoff ~27h later, and neither
+  derives from the other. The file names individuals as delinquent to their
+  collaborators, so it is gitignored **by name as well as location** — the
+  `hpca2027-log.csv` treatment. Offline, instant, read-only.
+  **`make timeliness-apologies`** (`--apology-for SENT_FILE`) drafts corrections
+  for the papers in an already-sent file (`SENT_EMAILS`) that are no longer held,
+  into `timeliness_apology_emails.txt`. Sent papers still held are listed on
+  stdout with the count as emailed, never emailed again. Keep each sent file
+  under its own name, because `timeliness-emails` overwrites its output.
+- **`make extra-reviewers`** lists, for each `EXTRA_PIDS` paper, a shortlist
+  of full/light PC members who first-submitted every R1 review they hold (on
+  papers still under review) before `COMPLETED_BY`, to **ask** for one extra
+  review, and stars one distinct suggested ask per paper. Every COI layer, the
+  area gate (in-area first, then released) and the junior/out-of-area/country
+  caps against the live R1 slate bind; the **tier load cap deliberately does
+  not**, since everyone listed has met theirs. Anyone ever assigned on the paper
+  (TRC included, or since unassigned) is barred. Offline, read-only, nothing
+  uploaded.
 - `make complete-papers` and `make area-chairs-complete` retain the former
   completeness filter in separate `*-complete.txt` artifacts.
 - Library modules (imported, never run): `src/reviewer_match/reviewers.py`, `src/reviewer_match/dblp.py`,
@@ -270,7 +319,8 @@ contains spaces and parentheses — always quote it in shell commands).
   `scripts/extract_log_assignments.py`, `scripts/audit_reviewer_activity.py`,
   `scripts/diff_assignments.py`, `scripts/fill_open_slots.py`,
   `scripts/revision_cutoffs.py`, `scripts/assign_paper_leads.py`,
-  `scripts/revision_tags.py`,
+  `scripts/revision_tags.py`, `scripts/timeliness_tags.py`,
+  `scripts/timeliness_emails.py`, `scripts/extra_reviewer_candidates.py`,
   `scripts/main.py`.
 
 ## Architecture (filter-then-rank, then constrained assignment)

@@ -18,6 +18,10 @@
 #   make revision-cutoffs share of reviewed papers each revision cutoff would catch
 #   make paper-leads      random, load-balanced leads for papers that advance
 #   make revision-tags    RevisionAdvance / NoRevision tags for decided papers
+#   make timeliness-tags  ~~ontime / ~~onedaylate / ... by authors' own reviews
+#   make timeliness-emails  draft author emails for papers held by a late author
+#   make timeliness-apologies  corrections for emailed papers no longer held
+#   make extra-reviewers  shortlist finished PC members to ask for one more review
 #   make clean            remove assignment outputs only
 #   make clean-fingerprints  remove embedding caches, never DBLP caches
 
@@ -208,7 +212,8 @@ ASSIGN_DEPS = scripts/assign_reviewers.py src/reviewer_match/paper_matching.py \
 	dblp-snapshot coauthor-coi collaborator-coi affiliation-countries pc-roster duplicates \
 	complete-papers area-chairs-complete clear-uploads baselines clean clean-fingerprints \
 	log-assignments reviewer-activity rerun targeted-rerun swap-candidates swap-upload fill-slots \
-	revision-cutoffs paper-leads revision-tags
+	revision-cutoffs paper-leads revision-tags timeliness-tags timeliness-emails \
+	timeliness-apologies extra-reviewers
 
 all: $(SENIORITY) enrich $(FINGERPRINTS)
 	$(RUN) scripts.build_fingerprints --csv "$(CSV)" --fingerprint-cache $(FINGERPRINTS)
@@ -638,6 +643,77 @@ revision-tags: scripts/revision_tags.py src/reviewer_match/review_scores.py src/
 	done
 	$(RUN) scripts.revision_tags --reviews $(REVIEWS) --log $(LOG) --data $(DATA) \
 		--min-reviews $(REVISION_MIN_REVIEWS) $(EXCLUDE_FLAG) $(LEAD_FLAGS)
+
+# ~~ontime on every paper whose PC/reserve authors had submitted all the R1
+# reviews they hold by ONTIME_CUTOFF (or that has no such author), and
+# ~~onedaylate, ~~twodayslate, ... by the 24-hour window the last of them first
+# submitted in. A paper whose author still owes a review has no day yet and gets
+# ~~delayedmissingreview until it does. TRC reviews are ignored. A reviewer given
+# an R1 review after EXEMPT_AFTER, or listed as an extension in EXTENSIONS,
+# counts as on time. Papers already carrying a day tag in DATA are never
+# re-tagged; the placeholder is cleared off every paper no longer blocked, so the
+# upload is a delta. Run it daily on a fresh log and paper export and upload the
+# result. Nothing is uploaded.
+ONTIME_CUTOFF ?= 2026-09-22 11:00:00 -0400
+EXEMPT_AFTER ?= 2026-09-13
+EXTENSIONS ?= $(CURATED_DIR)/review_extensions.csv
+timeliness-tags: scripts/timeliness_tags.py src/reviewer_match/hotcrp_log.py src/reviewer_match/review_scores.py
+	@for f in $(LOG) $(DATA); do \
+	  test -f $$f || { echo "ERROR: $$f not found; download it from HotCRP" >&2; exit 1; }; \
+	done
+	$(RUN) scripts.timeliness_tags --log $(LOG) --data $(DATA) --cutoff "$(ONTIME_CUTOFF)" \
+		--exempt-after $(EXEMPT_AFTER) --extensions "$(EXTENSIONS)" $(PC_CHECK) $(EXCLUDE_FLAG)
+
+# One drafted email per paper held by ~~delayedmissingreview, addressed to that
+# paper's authors and contacts, naming the committee author whose reviews are
+# outstanding. Decided by the same timeliness_tags.evaluate() as the tags, so the
+# two cannot name different people. ANNOUNCED_DEADLINE is what the email quotes
+# and is deliberately not ONTIME_CUTOFF: the cutoff the tags use is later, so
+# nobody is tagged for missing the announced time by a few hours. The output
+# names individuals to their collaborators -- read it before sending any of it.
+# Nothing is sent.
+ANNOUNCED_DEADLINE ?= Monday, September 21, 2026 at 8:00am EST
+SIGNATURE ?= -- The HPCA 2027 Program Chairs
+timeliness-emails: scripts/timeliness_emails.py scripts/timeliness_tags.py
+	@for f in $(LOG) $(DATA); do \
+	  test -f $$f || { echo "ERROR: $$f not found; download it from HotCRP" >&2; exit 1; }; \
+	done
+	$(RUN) scripts.timeliness_emails --log $(LOG) --data $(DATA) --cutoff "$(ONTIME_CUTOFF)" \
+		--exempt-after $(EXEMPT_AFTER) --extensions "$(EXTENSIONS)" \
+		--announced-deadline "$(ANNOUNCED_DEADLINE)" --signature "$(SIGNATURE)" \
+		$(PC_CHECK) $(EXCLUDE_FLAG)
+
+# Corrections for papers in an already-sent drafts file (SENT_EMAILS) that are
+# not held today -- the first batch counted reviews on desk-rejected papers as
+# outstanding. Sent papers still held are listed on stdout, not emailed. Keep a
+# copy of each sent file under its own name: timeliness-emails overwrites its
+# output. Nothing is sent.
+SENT_EMAILS ?= outputs/reports/timeliness_emails_sent_2026-09-22.txt
+timeliness-apologies: scripts/timeliness_emails.py scripts/timeliness_tags.py
+	@for f in $(LOG) $(DATA) "$(SENT_EMAILS)"; do \
+	  test -f "$$f" || { echo "ERROR: $$f not found" >&2; exit 1; }; \
+	done
+	$(RUN) scripts.timeliness_emails --log $(LOG) --data $(DATA) --cutoff "$(ONTIME_CUTOFF)" \
+		--exempt-after $(EXEMPT_AFTER) --extensions "$(EXTENSIONS)" \
+		--signature "$(SIGNATURE)" --apology-for "$(SENT_EMAILS)" \
+		$(PC_CHECK) $(EXCLUDE_FLAG)
+
+# For each EXTRA_PIDS paper, a ranked shortlist of full/light PC members who
+# first-submitted every R1 review they hold (papers still under review only)
+# before COMPLETED_BY, to ask for one extra review -- plus one suggested first
+# ask per paper, nobody suggested twice. Every COI layer, the area gate (in-area
+# first, then released) and the junior/out-of-area/same-country caps against
+# the paper's live R1 slate bind; the tier load cap does not, since everyone
+# listed has met theirs. Offline, no GPU. Nothing is uploaded.
+EXTRA_PIDS ?= 178,344,583,707,1723
+COMPLETED_BY ?= 2026-09-19 08:00:00 -0400
+EXTRA_SHORTLIST ?= 8
+extra-reviewers: scripts/extra_reviewer_candidates.py
+	@for f in $(LOG) $(DATA) $(PCINFO) $(SENIORITY) $(RESERVE_SENIORITY) $(FINGERPRINTS) $(RESERVE_FINGERPRINTS) $(COAUTHORS); do \
+	  test -f $$f || { echo "ERROR: $$f not found" >&2; exit 1; }; \
+	done
+	$(RUN) scripts.extra_reviewer_candidates --pids $(EXTRA_PIDS) --completed-by "$(COMPLETED_BY)" \
+		--shortlist $(EXTRA_SHORTLIST) --log $(LOG) --data $(DATA) $(REGION_FLAG) $(JUNIOR_FLAG) $(EXCLUDE_FLAG)
 
 clean:
 	rm -f $(ASSIGNMENT) $(ASSIGNMENT_CSV) $(AREA_CHAIR_ASSIGNMENT) \

@@ -36,6 +36,9 @@ hpca2027-trc*.csv
 hpca2027-log*.csv
 reviewer_activity.csv
 reviewers_pinned.txt
+# Drafted emails that name an individual as delinquent to their collaborators.
+timeliness_emails*.txt
+timeliness_apology_emails.txt
 current_assignment*.csv
 assignment-rerun*.csv
 trc_dblp_overrides.csv

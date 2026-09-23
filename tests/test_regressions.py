@@ -6,6 +6,7 @@ import json
 import math
 import os
 import random
+import re
 import subprocess
 import sys
 import tempfile
@@ -36,6 +37,7 @@ from scripts import compare_abstract_rankings
 from reviewer_match import dblp
 from scripts import enrich_publications
 from scripts import estimate_reserve_need
+from scripts import extra_reviewer_candidates
 from reviewer_match import paper_matching
 from reviewer_match import fingerprint
 from reviewer_match import paths
@@ -64,6 +66,8 @@ from scripts import generate_swap_upload
 from scripts import revision_cutoffs
 from scripts import assign_paper_leads
 from scripts import revision_tags
+from scripts import timeliness_emails
+from scripts import timeliness_tags
 from reviewer_match import review_scores
 
 PCINFO_FIELDS = [
@@ -7297,6 +7301,400 @@ class RevisionTagTests(unittest.TestCase):
             [(r[0], r[3]) for r in rows[1:] if r[1] == "tag"],
         )
         self.assertEqual({"1", "2", "3"}, {r[0] for r in rows[1:]})  # 4 desk-rejected, 5 excluded
+
+
+class TimelinessTagTests(unittest.TestCase):
+    """hotcrp_log.first_submitted_at + scripts.timeliness_tags: ~~ontime / ~~Ndayslate."""
+
+    CUTOFF = hotcrp_log.parse_date("2026-09-22 11:00:00 -0400")
+    EXEMPT_AFTER = timeliness_tags.date(2026, 9, 13)
+
+    @staticmethod
+    def row(date, action, affected="r@x.edu", paper="1"):
+        return {"date": date, "email": "chair@x.edu", "affected_email": affected,
+                "paper": paper, "action": action}
+
+    def status(self, reviews, submitted, first, override=None):
+        return timeliness_tags.reviewer_status(
+            reviews, submitted, first, cutoff=self.CUTOFF, exempt_after=self.EXEMPT_AFTER,
+            override=override,
+        )
+
+    @staticmethod
+    def review(pid=1, assigned="2026-08-10 09:00:00 -0400", round="R1"):
+        return hotcrp_log.Review(pid, "r@x.edu", "primary", round, assigned)
+
+    def test_first_submission_wins_over_a_later_edit(self):
+        rows = [
+            self.row("2026-09-20 10:00:00 -0400", "Review 7 edited, submitted: 300 words"),
+            self.row("2026-09-25 10:00:00 -0400", "Review 7 edited, submitted: 350 words"),
+        ]
+        self.assertEqual({7: "2026-09-20 10:00:00 -0400"}, hotcrp_log.first_submitted_at(rows))
+
+    def test_a_retracted_review_is_outstanding(self):
+        rows = [
+            self.row("2026-09-20 10:00:00 -0400", "Review 7 submitted: 300 words"),
+            self.row("2026-09-21 10:00:00 -0400", "Review 7 retracted"),
+        ]
+        submitted = hotcrp_log.submitted_review_ids(rows)
+        state = self.status([(7, self.review())], submitted, hotcrp_log.first_submitted_at(rows))
+        self.assertIsNone(state.days)
+
+    def test_tier_words(self):
+        self.assertEqual(["ontime", "onedaylate", "twodayslate", "twentydayslate", "21dayslate"],
+                         [timeliness_tags.tier_tag(d) for d in (0, 1, 2, 20, 21)])
+        self.assertTrue(timeliness_tags.is_timeliness_tag("threedayslate"))
+        self.assertFalse(timeliness_tags.is_timeliness_tag("norevision"))
+        # The placeholder is one of ours, but it is not a day, so it never sticks.
+        self.assertTrue(timeliness_tags.is_timeliness_tag(timeliness_tags.BLOCKED_TAG))
+        self.assertFalse(timeliness_tags.is_day_tag(timeliness_tags.BLOCKED_TAG))
+        self.assertTrue(timeliness_tags.is_day_tag("threedayslate"))
+
+    def test_placeholder_does_not_stick_and_is_cleared_when_the_day_lands(self):
+        State = timeliness_tags.ReviewerState
+        states = {"a": State(1, 1, None, None, ""), "b": State(1, 0, None, 1, "")}
+        held = {"pid": 1, "title": "", "tags": ["~~delayedmissingreview"]}
+        papers = [
+            dict(held, pid=1),                                  # still blocked
+            dict(held, pid=2),                                  # placeholder, now decided
+            {"pid": 3, "title": "", "tags": []},                # newly blocked
+            {"pid": 4, "title": "", "tags": ["~~ontime#0"]},    # a day tag sticks
+        ]
+        report = timeliness_tags.decide(
+            papers, {1: ["a"], 2: ["b"], 3: ["a"], 4: ["a"]}, states)
+        self.assertEqual(["still blocked", "tagged", "blocked", "already tagged"],
+                         [r["status"] for r in report])
+        self.assertEqual(["", "~~onedaylate", "~~delayedmissingreview", ""],
+                         [r["new_tag"] for r in report])
+        # 4 is cleared although it is blocked today: nothing later would clear it.
+        self.assertEqual([
+            [2, "cleartag", "", "~~delayedmissingreview", ""],
+            [4, "cleartag", "", "~~delayedmissingreview", ""],
+            [2, "tag", "", "~~onedaylate", ""],
+            [3, "tag", "", "~~delayedmissingreview", ""],
+        ], timeliness_tags.upload_rows(report))
+
+    def test_days_are_24_hour_windows_from_the_cutoff(self):
+        at = hotcrp_log.parse_date
+        self.assertEqual(0, timeliness_tags.days_late(at("2026-09-22 11:00:00 -0400"), self.CUTOFF))
+        self.assertEqual(1, timeliness_tags.days_late(at("2026-09-22 11:00:01 -0400"), self.CUTOFF))
+        self.assertEqual(1, timeliness_tags.days_late(at("2026-09-23 11:00:00 -0400"), self.CUTOFF))
+        self.assertEqual(2, timeliness_tags.days_late(at("2026-09-23 11:00:01 -0400"), self.CUTOFF))
+        # 10:30 CDT is 11:30 EDT: an offset is compared, never the wall clock.
+        self.assertEqual(1, timeliness_tags.days_late(at("2026-09-22 10:30:00 -0500"), self.CUTOFF))
+
+    def test_completion_is_the_last_first_submission(self):
+        first = {1: "2026-09-10 10:00:00 -0400", 2: "2026-09-23 12:00:00 -0400"}
+        state = self.status([(1, self.review()), (2, self.review(2))], {1, 2}, first)
+        self.assertEqual(2, state.days)
+
+    def test_post_cutoff_assignment_exempts_an_unfinished_reviewer(self):
+        reviews = [(1, self.review()), (2, self.review(2, assigned="2026-09-14 08:00:00 -0400"))]
+        self.assertEqual(0, self.status(reviews, set(), {}).days)
+        on_the_13th = [(1, self.review(assigned="2026-09-13 23:00:00 -0400"))]
+        self.assertIsNone(self.status(on_the_13th, set(), {}).days)
+
+    def test_extension_and_late_overrides(self):
+        reviews = [(1, self.review())]
+        self.assertEqual(0, self.status(reviews, set(), {}, ("extension", None)).days)
+        done = ({1}, {1: "2026-09-01 10:00:00 -0400"})
+        self.assertIsNone(self.status(reviews, *done, ("late", None)).days)
+        late_date = timeliness_tags.parse_override_date("2026-09-25", self.CUTOFF)
+        self.assertEqual(3, self.status(reviews, *done, ("late", late_date)).days)
+        # `late` beats the post-13th exemption.
+        exempt = [(1, self.review(assigned="2026-09-20 08:00:00 -0400"))]
+        self.assertIsNone(self.status(exempt, set(), {}, ("late", None)).days)
+
+    def test_paper_waits_for_every_author_and_takes_the_latest(self):
+        State = timeliness_tags.ReviewerState
+        states = {"a": State(1, 0, None, 0, ""), "b": State(1, 0, None, 2, ""),
+                  "c": State(1, 1, None, None, "")}
+        self.assertEqual((2, []), timeliness_tags.paper_days(["a", "b"], states))
+        self.assertEqual((None, ["c"]), timeliness_tags.paper_days(["a", "c"], states))
+        self.assertEqual((0, []), timeliness_tags.paper_days([], states))
+
+    def test_end_to_end_ignores_trc_and_skips_tagged_papers(self):
+        tmp = Path(tempfile.mkdtemp())
+        papers = [
+            {"pid": 1, "title": "One", "status": "submitted", "tags": [],
+             "authors": [{"email": "Late@x.edu", "given_name": "L", "family_name": "Ate"}]},
+            {"pid": 2, "title": "Two", "status": "submitted", "tags": [],
+             "authors": [{"email": "outsider@y.edu", "given_name": "O", "family_name": "Ut"}]},
+            {"pid": 3, "title": "Three", "status": "submitted", "tags": ["~~ontime#0"],
+             "authors": [{"email": "slow@x.edu", "given_name": "S", "family_name": "Low"}]},
+            {"pid": 4, "title": "Four", "status": "submitted", "tags": [],
+             "authors": [{"email": "slow@x.edu", "given_name": "S", "family_name": "Low"}]},
+        ]
+        (tmp / "data.json").write_text(json.dumps(papers))
+        events = [  # oldest first; written newest first below, as HotCRP does
+            ("2026-08-10 09:00:00 -0400", "late@x.edu", "2", "Review 1 assigned: primary, round R1"),
+            ("2026-08-10 09:00:00 -0400", "slow@x.edu", "1", "Review 2 assigned: primary, round R1"),
+            ("2026-09-20 09:00:00 -0400", "late@x.edu", "4", "Review 3 assigned: external, round TRC"),
+            ("2026-09-23 10:00:00 -0400", "late@x.edu", "2", "Review 1 edited, submitted: 500 words"),
+        ]
+        with open(tmp / "log.csv", "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(hotcrp_log.LOG_HEADER)
+            for when, who, pid, action in reversed(events):
+                writer.writerow([when, "", "chair@x.edu", "", who, "", pid, action])
+        upload = tmp / "upload.csv"
+        argv = [
+            "timeliness_tags", "--log", str(tmp / "log.csv"), "--data", str(tmp / "data.json"),
+            "--no-pc-check", "--extensions", str(tmp / "ext.csv"),
+            "--upload", str(upload), "--report", str(tmp / "report.csv"),
+        ]
+        with mock.patch.object(timeliness_tags, "load_pc_and_reserves", return_value=[]), \
+                mock.patch.object(sys, "argv", argv), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(0, timeliness_tags.main())
+        with open(upload, newline="", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
+        self.assertEqual(timeliness_tags.UPLOAD_HEADER, rows[0])
+        # 1: the late author's outstanding TRC review neither blocks nor exempts;
+        # 2: no reviewer author; 3: already tagged; 4: slow@ is unfinished, so it
+        # takes the placeholder while every unblocked paper has it cleared.
+        self.assertEqual([
+            ["1", "cleartag", "", "~~delayedmissingreview", ""],
+            ["2", "cleartag", "", "~~delayedmissingreview", ""],
+            ["3", "cleartag", "", "~~delayedmissingreview", ""],
+            ["1", "tag", "", "~~onedaylate", ""],
+            ["2", "tag", "", "~~ontime", ""],
+            ["4", "tag", "", "~~delayedmissingreview", ""],
+        ], rows[1:])
+        self.assertEqual(timeliness_tags.EXTENSION_HEADER,
+                         next(csv.reader(open(tmp / "ext.csv", encoding="utf-8"))))
+
+    def test_reviews_on_desk_rejected_papers_never_count(self):
+        tmp = Path(tempfile.mkdtemp())
+        author = [{"email": "rev@x.edu", "given_name": "R", "family_name": "Ev"}]
+        papers = [
+            {"pid": 1, "title": "One", "status": "submitted", "tags": [], "authors": author},
+            {"pid": 5, "title": "Five", "status": "submitted", "tags": [], "authors": []},
+            # Tagged desk-reject, still `submitted`; pid 99 has left the export.
+            {"pid": 6, "title": "Six", "status": "submitted", "tags": ["~~desk-reject#0"],
+             "authors": []},
+        ]
+        (tmp / "data.json").write_text(json.dumps(papers))
+        events = [
+            ("2026-08-10 09:00:00 -0400", "rev@x.edu", "5", "Review 1 assigned: primary, round R1"),
+            ("2026-08-10 09:00:00 -0400", "rev@x.edu", "6", "Review 2 assigned: primary, round R1"),
+            ("2026-08-10 09:00:00 -0400", "rev@x.edu", "99", "Review 3 assigned: primary, round R1"),
+            ("2026-09-20 09:00:00 -0400", "rev@x.edu", "5", "Review 1 edited, submitted: 500 words"),
+            # Submitted late, but on a desk-rejected paper: no day either.
+            ("2026-09-25 09:00:00 -0400", "rev@x.edu", "6", "Review 2 edited, submitted: 500 words"),
+        ]
+        with open(tmp / "log.csv", "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(hotcrp_log.LOG_HEADER)
+            for when, who, pid, action in reversed(events):
+                writer.writerow([when, "", "chair@x.edu", "", who, "", pid, action])
+        with mock.patch.object(timeliness_tags, "load_pc_and_reserves", return_value=[]), \
+                contextlib.redirect_stderr(io.StringIO()):
+            ev = timeliness_tags.evaluate(
+                log=str(tmp / "log.csv"), data=str(tmp / "data.json"), exclude_pids="",
+                cutoff=self.CUTOFF, exempt_after=self.EXEMPT_AFTER, extensions={},
+                extensions_path="", pcinfo=None)
+        self.assertEqual((1, 0), (ev.states["rev@x.edu"].held, ev.states["rev@x.edu"].outstanding))
+        row = next(r for r in ev.report if r["paper"] == 1)
+        self.assertEqual(("tagged", "~~ontime"), (row["status"], row["new_tag"]))
+
+
+class TimelinessEmailTests(unittest.TestCase):
+    """scripts.timeliness_emails: the drafts sent to a held paper's authors."""
+
+    State = timeliness_tags.ReviewerState
+    PAPER = {
+        "pid": 7,
+        "title": "A Cache For Everything",
+        "authors": [
+            {"email": "Alice@x.edu", "given_name": "Alice", "family_name": "Ant"},
+            {"email": "slow@y.edu", "given_name": "Sam", "family_name": "Low"},
+        ],
+        # The submitting account, which is not in the author list.
+        "contacts": [{"email": "alice@x.edu"}, {"email": "submitter@x.edu"}],
+    }
+
+    def render(self, keys, states, source=None):
+        return timeliness_emails.render(
+            self.PAPER, keys, states, source or {"slow@y.edu": "slow@y.edu"}, None,
+            {"slow@y.edu": "Sam Low"},
+            deadline="Monday, September 21, 2026 at 8:00am EST",
+            signature="-- The HPCA 2027 Program Chairs",
+        )
+
+    def test_every_author_and_contact_is_addressed_once(self):
+        # Alice is both an author and a contact, and her author row is capitalised.
+        self.assertEqual(["alice@x.edu", "slow@y.edu", "submitter@x.edu"],
+                         timeliness_emails.recipients(self.PAPER))
+
+    def test_headers_and_the_named_author_with_counts(self):
+        body = self.render(["slow@y.edu"], {"slow@y.edu": self.State(6, 3, None, None, "")})
+        self.assertIn("===== PAPER 7 =====", body)
+        self.assertIn("To: alice@x.edu, slow@y.edu, submitter@x.edu", body)
+        self.assertIn("Subject: HPCA 2027 submission #7: review release delayed", body)
+        self.assertIn('"A Cache For Everything"', body)
+        self.assertIn("that author is Sam Low <slow@y.edu>", " ".join(body.split()))
+        self.assertIn("who has 3 of 6 assigned reviews still outstanding",
+                      " ".join(body.split()))
+        # The email quotes the announced deadline, never the internal cutoff.
+        self.assertIn("Monday, September 21, 2026 at 8:00am EST", " ".join(body.split()))
+        self.assertNotIn("2026-09-22", body)
+
+    def test_the_address_the_paper_lists_them_under_wins(self):
+        body = self.render(["slow@y.edu"], {"slow@y.edu": self.State(6, 3, None, None, "")},
+                           source={"slow@y.edu": "s.low@oldschool.edu"})
+        self.assertIn("<s.low@oldschool.edu>", body)
+
+    def test_two_blockers_are_joined_and_pluralised(self):
+        states = {"slow@y.edu": self.State(6, 3, None, None, ""),
+                  "late@z.edu": self.State(6, 1, None, None, "")}
+        body = " ".join(self.render(["slow@y.edu", "late@z.edu"], states).split())
+        self.assertIn("those authors are Sam Low <slow@y.edu>, who has 3 of 6 assigned reviews "
+                      "still outstanding, and late@z.edu <late@z.edu>, who has 1 of 6", body)
+
+    def test_a_marked_late_blocker_never_gets_a_count(self):
+        # outstanding == 0 means the chair marked them late by hand; they have
+        # no missing reviews, so the count sentence would be a falsehood.
+        body = " ".join(self.render(
+            ["slow@y.edu"], {"slow@y.edu": self.State(6, 0, None, None, "marked late")}).split())
+        self.assertIn("whose reviewing obligation for HPCA 2027 is not yet discharged", body)
+        self.assertNotIn("assigned reviews still outstanding", body)
+        self.assertNotIn(" of 6 ", body)
+
+    def test_only_held_papers_are_drafted(self):
+        states = {"slow@y.edu": self.State(6, 3, None, None, ""),
+                  "done@y.edu": self.State(6, 0, None, 1, "")}
+        papers = {n: dict(self.PAPER, pid=n) for n in (1, 2, 3, 4)}
+        ev = timeliness_tags.Evaluation(
+            papers=papers,
+            report=[
+                {"paper": 1, "status": "blocked"},        # drafted
+                {"paper": 2, "status": "still blocked"},  # drafted
+                {"paper": 3, "status": "tagged"},         # decided: no email
+                {"paper": 4, "status": "already tagged"},  # carries a day tag already
+            ],
+            states=states,
+            author_keys={1: ["slow@y.edu"], 2: ["slow@y.edu"], 3: ["done@y.edu"], 4: []},
+            author_source={n: {"slow@y.edu": "slow@y.edu"} for n in (1, 2, 3, 4)},
+            display={"slow@y.edu": "Sam Low"},
+            name_only={},
+            cutoff=hotcrp_log.parse_date("2026-09-22 11:00:00 -0400"),
+            exempt_after=timeliness_tags.date(2026, 9, 13),
+        )
+        drafts = timeliness_emails.drafts(ev, None, deadline="D", signature="S")
+        self.assertEqual([1, 2], [int(re.search(r"PAPER (\d+)", d).group(1)) for d in drafts])
+
+    def test_sent_papers_recovers_named_addresses_and_counts(self):
+        states = {"slow@y.edu": self.State(6, 3, None, None, ""),
+                  "late@z.edu": self.State(6, 0, None, None, "marked late")}
+        sent = "\n\n".join([
+            self.render(["slow@y.edu"], states, source={"slow@y.edu": "S.Low@oldschool.edu"}),
+            timeliness_emails.render(dict(self.PAPER, pid=9), ["slow@y.edu", "late@z.edu"], states,
+                                     {}, None, {}, deadline="D", signature="S"),
+        ])
+        self.assertEqual({
+            7: {"s.low@oldschool.edu": (3, 6)},
+            9: {"slow@y.edu": (3, 6), "late@z.edu": None},
+        }, timeliness_emails.sent_papers(sent))
+
+    def test_apologies_only_for_papers_no_longer_held(self):
+        papers = {n: dict(self.PAPER, pid=n) for n in (1, 2)}
+        ev = timeliness_tags.Evaluation(
+            papers=papers,
+            report=[{"paper": 1, "status": "tagged"}, {"paper": 2, "status": "still blocked"}],
+            states={"slow@y.edu": self.State(2, 0, None, 0, "")},
+            author_keys={1: ["slow@y.edu"], 2: ["slow@y.edu"]},
+            author_source={n: {"slow@y.edu": "slow@y.edu"} for n in (1, 2)},
+            display={"slow@y.edu": "Sam Low"},
+            name_only={},
+            cutoff=hotcrp_log.parse_date("2026-09-22 11:00:00 -0400"),
+            exempt_after=timeliness_tags.date(2026, 9, 13),
+        )
+        sent = {1: {"slow@y.edu": (1, 3)}, 2: {"slow@y.edu": (1, 3)}, 3: {"x@y.edu": None}}
+        out, still_held, missing = timeliness_emails.apologies(ev, None, sent, signature="S")
+        self.assertEqual(([2], [3]), (still_held, missing))
+        self.assertEqual(1, len(out))
+        body = " ".join(out[0].split())
+        self.assertIn("===== PAPER 1 =====", out[0])
+        self.assertIn("To: alice@x.edu, slow@y.edu, submitter@x.edu", out[0])
+        self.assertIn("correction -- reviews are not delayed", body)
+        self.assertIn("because Sam Low had assigned reviews outstanding", body)
+        self.assertIn("to Sam Low in particular", body)
+        self.assertIn("Your submission is not being held back.", body)
+        # Never discloses which other paper was desk-rejected.
+        self.assertEqual({"1"}, set(re.findall(r"#(\d+)", body)))
+
+
+class ExtraReviewerCandidateTests(unittest.TestCase):
+    """scripts.extra_reviewer_candidates: who finished in time, who is barred, the suggested asks."""
+
+    CUTOFF = hotcrp_log.parse_date("2026-09-19 08:00:00 -0400")
+
+    @staticmethod
+    def rows(events):
+        return [{"date": when, "email": "chair@x.edu", "affected_email": who, "paper": pid, "action": action}
+                for when, who, pid, action in events]
+
+    def finished(self, events, under_review=frozenset({1, 2, 3})):
+        rows = self.rows(events)
+        live, _ = hotcrp_log.replay_assignments(rows)
+        return extra_reviewer_candidates.finished_reviewers(
+            live, hotcrp_log.submitted_review_ids(rows), hotcrp_log.first_submitted_at(rows),
+            set(under_review), self.CUTOFF)
+
+    def test_finished_before_the_cutoff_by_first_submission(self):
+        events = [
+            ("2026-08-10 09:00:00 -0400", "early@x.edu", "1", "Review 1 assigned: primary, round R1"),
+            ("2026-08-10 09:00:00 -0400", "early@x.edu", "2", "Review 2 assigned: primary, round R1"),
+            ("2026-09-15 09:00:00 -0400", "early@x.edu", "1", "Review 1 submitted: 300 words"),
+            ("2026-09-19 07:59:00 -0400", "early@x.edu", "2", "Review 2 submitted: 300 words"),
+            # An edit after the cutoff does not move when they finished.
+            ("2026-09-21 09:00:00 -0400", "early@x.edu", "2", "Review 2 edited, submitted: 350 words"),
+            ("2026-08-10 09:00:00 -0400", "late@x.edu", "1", "Review 3 assigned: primary, round R1"),
+            ("2026-09-19 08:00:00 -0400", "late@x.edu", "1", "Review 3 submitted: 300 words"),
+            ("2026-08-10 09:00:00 -0400", "open@x.edu", "1", "Review 4 assigned: primary, round R1"),
+            ("2026-08-10 09:00:00 -0400", "open@x.edu", "2", "Review 5 assigned: primary, round R1"),
+            ("2026-09-10 09:00:00 -0400", "open@x.edu", "1", "Review 4 submitted: 300 words"),
+        ]
+        done = self.finished(events)
+        self.assertEqual({"early@x.edu"}, set(done))
+        self.assertEqual(2, done["early@x.edu"][0])
+
+    def test_unsubmitted_review_on_a_paper_no_longer_under_review_is_ignored(self):
+        events = [
+            ("2026-08-10 09:00:00 -0400", "r@x.edu", "1", "Review 1 assigned: primary, round R1"),
+            ("2026-08-10 09:00:00 -0400", "r@x.edu", "9", "Review 2 assigned: primary, round R1"),
+            ("2026-09-10 09:00:00 -0400", "r@x.edu", "1", "Review 1 submitted: 300 words"),
+            # TRC reviews neither count nor bar anyone.
+            ("2026-08-10 09:00:00 -0400", "r@x.edu", "3", "Review 3 assigned: primary, round TRC"),
+        ]
+        self.assertEqual({"r@x.edu": 1}, {e: n for e, (n, _) in self.finished(events).items()})
+
+    def test_ever_on_paper_covers_live_trc_and_unassigned(self):
+        rows = self.rows([
+            ("2026-08-10 09:00:00 -0400", "live@x.edu", "1", "Review 1 assigned: primary, round R1"),
+            ("2026-08-10 09:00:00 -0400", "trc@x.edu", "1", "Review 2 assigned: primary, round TRC"),
+            ("2026-08-10 09:00:00 -0400", "gone@x.edu", "1", "Review 3 assigned: primary, round R1"),
+            ("2026-08-11 09:00:00 -0400", "gone@x.edu", "1", "Review 3 unassigned"),
+            ("2026-08-10 09:00:00 -0400", "other@x.edu", "2", "Review 4 assigned: primary, round R1"),
+        ])
+        on = extra_reviewer_candidates.ever_on_paper(rows)
+        self.assertEqual({"live@x.edu", "trc@x.edu", "gone@x.edu"}, on[1])
+        self.assertEqual({"other@x.edu"}, on[2])
+
+    def test_suggest_is_distinct_maximal_and_deterministic(self):
+        lists = {
+            1: [("a", 0.97), ("b", 0.96)],
+            2: [("a", 0.99), ("c", 0.90)],
+            3: [("a", 0.95)],
+        }
+        # Filling all three beats the greedy 0.99 for "a" on paper 2.
+        self.assertEqual({1: "b", 2: "c", 3: "a"}, extra_reviewer_candidates.suggest(lists))
+        # A tie goes to the earlier-ranked candidate.
+        self.assertEqual({1: "x"}, extra_reviewer_candidates.suggest({1: [("x", 0.5), ("y", 0.5)]}))
+        # A paper with nobody left goes without rather than repeating a person.
+        self.assertEqual({1: "a"}, extra_reviewer_candidates.suggest({1: [("a", 0.9)], 2: [("a", 0.8)]}))
+        self.assertEqual({}, extra_reviewer_candidates.suggest({1: []}))
 
 
 if __name__ == "__main__":

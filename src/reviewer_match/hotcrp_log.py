@@ -34,6 +34,10 @@ import csv
 import re
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import datetime
+
+# `2026-09-22 11:06:00 -0400`: local time with its own offset.
+DATE_FORMAT = "%Y-%m-%d %H:%M:%S %z"
 
 LOG_HEADER = ("date", "ipaddr", "email", "roles", "affected_email", "via", "paper", "action")
 
@@ -187,6 +191,38 @@ def submitted_review_ids(rows: list[dict[str, str]]) -> set[int]:
         if m:
             submitted[int(m.group(1))] = False
     return {rid for rid, state in submitted.items() if state}
+
+
+def first_submitted_at(rows: list[dict[str, str]]) -> dict[int, str]:
+    """{review id: date of its FIRST submission}, over every review ever submitted.
+
+    Later "edited, submitted" rows are revisions of a review already turned in
+    and do not move this date -- a deadline is met by the first submission, not
+    the last edit. It says nothing about whether the review is submitted *now*
+    (a retraction does not erase it), so pair it with `submitted_review_ids`.
+    `rows` must be chronological -- see `load_log`.
+    """
+    first: dict[int, str] = {}
+    for row in rows:
+        m = SUBMIT_RE.match(row["action"])
+        if m:
+            first.setdefault(int(m.group(1)), row["date"])
+    return first
+
+
+def parse_date(value: str) -> datetime:
+    """A log `date` as an aware datetime; seconds may be omitted.
+
+    Always compare these, never the strings: the offset is part of the value,
+    and string order stops being time order the moment two offsets differ.
+    """
+    value = value.strip()
+    for fmt in (DATE_FORMAT, "%Y-%m-%d %H:%M %z"):
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            pass
+    raise ValueError(f"unrecognised timestamp {value!r}; expected e.g. '2026-09-22 11:00:00 -0400'")
 
 
 def live_pairs(live: dict[int, Review], kind: str = "primary", round: str = "R1") -> dict[int, set[str]]:

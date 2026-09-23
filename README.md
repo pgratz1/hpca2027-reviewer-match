@@ -1762,6 +1762,151 @@ paper does not have changes nothing. Desk-rejected and excluded papers are not
 touched. stdout gives the three counts. Offline, instant, and nothing is
 uploaded.
 
+### `scripts/timeliness_tags.py` — tag papers by their authors' own review timeliness
+
+`make timeliness-tags` writes `outputs/assignments/timeliness_tags_upload.csv`,
+which puts one chairs-only tag on every paper: `~~ontime` if every PC/reserve
+author had submitted all the R1 reviews they hold by `ONTIME_CUTOFF`
+(2026-09-22 11:00 EDT / 10:00 CDT), or if the paper has no PC/reserve author.
+Otherwise it gets `~~onedaylate`, `~~twodayslate`, … according to the 24-hour
+window after the cutoff in which the last of those authors finished. A paper
+whose author still owes a review has no day yet and gets the placeholder
+`~~delayedmissingreview` instead. The tags are what delays review release and
+shortens the rebuttal for tardy reviewers.
+
+- **Authorship is email-only.** An author email must match a PC/reserve
+  roster address or a HotCRP address. Name-only matches go in the
+  `name_only_matches` column of `outputs/reports/timeliness_papers.csv` and
+  are not enforced.
+- **Only R1 reviews held today, on papers still under review, count.** TRC
+  reviews are ignored. A review pulled off someone does not count against them,
+  and neither does one on a paper since desk-rejected or withdrawn (absent from
+  the paper export, or tagged `desk-reject`): the log keeps those reviews live,
+  and counting them held back 43 papers in the first batch of emails. What is judged is each
+  review's **first** submission, so later edits never make anyone late.
+- **Exempt, i.e. on time:** a reviewer given an R1 review after `EXEMPT_AFTER`
+  (2026-09-13), or listed in `data/curated/review_extensions.csv`
+  (`email,status,date,note`; created header-only on the first run). A row with
+  status `extension` (or blank) grants an approved extension. Status `late`
+  overrides the exemption: with a blank `date` the reviewer blocks their papers,
+  and with a date they count as finishing no earlier than that date (11:00 EDT
+  that day if no time is given).
+- **A paper waits for all its PC/reserve authors.** While any of them is
+  unfinished and not exempt it carries `~~delayedmissingreview`; once they have
+  all finished it takes the latest author's day.
+- **The day tags stick; `~~delayedmissingreview` does not.** A paper that
+  already carries a day tag in `hpca2027-data.json` is never re-tagged. The day
+  comes from log timestamps, not from when the script runs, so a missed day
+  catches up. The placeholder is only a stand-in for a day not yet known, so a
+  paper carrying it is still decided — the upload is a **delta** that
+  `cleartag`s the placeholder off every paper no longer blocked, unconditionally
+  (clearing a tag a paper does not have changes nothing, and doing it whether or
+  not the export shows the tag is what keeps two runs against one stale paper
+  export from leaving a paper carrying both). Clears come first, then the tags.
+
+Daily: download a fresh action log and paper JSON, run `make timeliness-tags`,
+and upload the file through HotCRP's bulk assignment. stdout lists the counts
+and the reviewers still holding papers up. Offline, instant, and nothing is
+uploaded.
+
+### `scripts/timeliness_emails.py` — draft the author emails for held papers
+
+`make timeliness-emails` writes `outputs/reports/timeliness_emails.txt`: one
+drafted message per paper carrying `~~delayedmissingreview`, for the chair to
+split and send by hand. **Nothing is sent and no mail is configured.** Which
+papers are held, and who is holding them, comes from the same
+`timeliness_tags.evaluate()` the tags come from, so the emails and the tags
+cannot name different people.
+
+- **Recipients** are every address in the paper's `authors` and `contacts`
+  lists, deduped, authors first — the contact list is where the submitting
+  account lives, which on some papers is the only person who reads HotCRP.
+- **The named author** is whoever has R1 reviews outstanding, by the name the
+  HotCRP user export shows and the address that paper lists them under, with
+  the count they still owe. A blocker with nothing outstanding was marked
+  `late` by hand in `review_extensions.csv` rather than having missing reviews,
+  and gets wording that says so — the count sentence would be false.
+- **`ANNOUNCED_DEADLINE` is deliberately not `ONTIME_CUTOFF`.** The email
+  quotes the deadline the committee was given (Monday, September 21, 2026 at
+  8:00am EST); the cutoff the tags are decided against is about 27 hours later,
+  so nobody is tagged for missing the announced time by a few hours. The two
+  never derive from each other. `SIGNATURE` sets the sign-off.
+
+**Corrections.** `make timeliness-apologies` reads an already-sent drafts file
+(`SENT_EMAILS`, default `outputs/reports/timeliness_emails_sent_2026-09-22.txt`)
+and writes `outputs/reports/timeliness_apology_emails.txt`: one correction per
+sent paper that is **not** held today. It goes to the same recipients, says the
+hold was an error and the paper is not held back, and apologizes to the author
+it named, without saying which other paper was involved. Sent papers still held
+get no email and are listed on stdout, each with its count now against the count
+emailed, and `COUNT CHANGED` where the two differ. Save each sent file under its
+own name before rerunning `timeliness-emails`, which overwrites its output.
+- Each message is a block separated by `===== PAPER n =====`, then `To:` and
+  `Subject:` headers, a blank line, and the body wrapped at 78 columns. The
+  quoted title is never wrapped, so splitting on the separator and then the
+  first blank line recovers headers and body exactly.
+
+The file names individuals as delinquent to their collaborators — the most
+socially sensitive artifact here. It is gitignored twice over, by location and
+by name. Read it before sending any of it. Offline, instant, read-only.
+
+The text of each message:
+
+```
+Dear authors of HPCA 2027 submission #7,
+
+    "A Cache For Everything"
+
+We are writing to let you know that the reviews for this submission will be
+released later than those for other papers, and that its response period will
+be shortened accordingly.
+
+Reviews are held for any submission whose author on the review committee has
+not completed their own assigned reviews. That deadline was Monday, September
+21, 2026 at 8:00am EST.
+
+For this submission that author is Sam Low <slow@y.edu>, who has 3 of 6
+assigned reviews still outstanding.
+
+The reviews for your submission will be released as soon as those reviews are
+in; how long the delay runs depends only on when that happens. If you believe
+this message is in error -- if an extension was agreed with the chairs, for
+instance -- please reply and let us know.
+
+-- The HPCA 2027 Program Chairs
+```
+
+### `scripts/extra_reviewer_candidates.py` — who to ask for one more review
+
+`make extra-reviewers` lists, for each paper in `EXTRA_PIDS`, the
+`EXTRA_SHORTLIST` (8) best-matched **full or light PC members** who had first
+submitted every R1 review they hold before `COMPLETED_BY` (default
+`2026-09-19 08:00:00 -0400`), and stars one suggested first ask per paper. The
+starred asks are the distinct set with the greatest total affinity, so nobody is
+asked twice. Only papers still under review count toward "every R1 review":
+an unsubmitted review on a desk-rejected or withdrawn paper is ignored. `~~ex-rr`
+promotions count as light. Reserves, TRC reviewers and area chairs are never
+listed.
+
+The output is a list of people to **ask**, not an assignment, so nothing is
+uploaded and the tier load cap does not apply. Everyone listed has already met
+theirs, and each row shows their R1 load instead. Everything else still binds:
+- every COI layer (`assign_reviewers.build_pair_scores`);
+- the area gate: in-area candidates come first, then area-released ones marked
+  `released`;
+- `MAX_JUNIORS`, the out-of-area cap and `SAME_COUNTRY_CAP`, counted against the
+  paper's live R1 slate with outstanding reviews included.
+
+A few people are never listed for a paper:
+- anyone who holds a review on it, R1 or TRC;
+- anyone who was ever unassigned from it (a decline, a conflict or a swap);
+- anyone whose every R1 review was unassigned.
+
+stderr gives the pool size and how many candidates each rule skipped. stdout
+gives each paper's slate and its shortlist, and
+`outputs/reports/extra_reviewer_candidates.csv` has the same rows. Offline, no
+GPU, deterministic. Once someone accepts, add the review in HotCRP.
+
 ## Publication exclusions
 
 `data/curated/publication_exclusions.csv` is an optional hand-maintained file with columns
