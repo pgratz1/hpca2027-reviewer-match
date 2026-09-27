@@ -7060,6 +7060,47 @@ class PaperLeadTests(unittest.TestCase):
     def test_bar_rejects_an_unknown_net(self):
         with self.assertRaises(ValueError):
             review_scores.Bar(net="nope")
+        with self.assertRaises(ValueError):
+            review_scores.Bar(min_reviews=5, min_decided=6)
+
+    def test_early_papers_are_under_only_when_every_score_is_a_reject(self):
+        bar = review_scores.Bar(min_reviews=5, min_decided=3)
+        self.assertIsNone(bar.advances([2, 2, 2]))
+        self.assertIsNone(bar.advances([2, 2, 1, 1]))
+        self.assertEqual(review_scores.OVER_BAR, bar.advances([3, 2, 2]))
+        self.assertEqual(review_scores.OVER_BAR, bar.advances([3, 1, 1, 1]))  # one 3 suffices
+        self.assertEqual(review_scores.OVER_BAR, bar.advances([4, 1, 1, 1]))
+        self.assertEqual(review_scores.FEW_REVIEWS, bar.advances([1, 1]))
+        # A recently assigned review still outstanding lets an early paper play out...
+        self.assertEqual(review_scores.RECENT, bar.advances([2, 2, 2], recent=True))
+        # ...but never a paper the net decides, and the net itself is unchanged.
+        self.assertIsNone(bar.advances([4, 2, 2, 2, 2], recent=True))
+        self.assertEqual(review_scores.OVER_BAR, bar.advances([3, 3, 2, 2, 2]))
+
+    def test_without_min_decided_nothing_is_decided_early(self):
+        bar = review_scores.Bar(min_reviews=5)
+        self.assertEqual(review_scores.FEW_REVIEWS, bar.advances([1, 1, 1, 1]))
+        self.assertFalse(bar.is_early([1, 1, 1, 1]))
+
+    def test_an_advance_the_export_shows_is_never_undone(self):
+        bar = review_scores.Bar(min_reviews=5, min_decided=3)
+        self.assertEqual(review_scores.HELD, review_scores.decide_paper(bar, [3, 2, 2, 2, 1], held=True))
+        self.assertIsNone(review_scores.decide_paper(bar, [3, 2, 2, 2, 1]))
+        self.assertEqual(review_scores.OVER_BAR, review_scores.decide_paper(bar, [3, 3, 2, 2, 2], held=True))
+
+    def test_recent_pids_needs_an_outstanding_r1_review_after_the_date(self):
+        def row(date, who, pid, action):
+            return {"date": date, "email": "chair@x.edu", "affected_email": who,
+                    "paper": pid, "action": action}
+        rows = [
+            row("2026-08-01 09:00:00 -0400", "a@x.edu", "1", "Review 1 assigned: primary, round R1"),
+            row("2026-09-14 09:00:00 -0400", "b@x.edu", "2", "Review 2 assigned: primary, round R1"),
+            row("2026-09-14 09:00:00 -0400", "c@x.edu", "3", "Review 3 assigned: primary, round R1"),
+            row("2026-09-15 09:00:00 -0400", "c@x.edu", "3", "Review 3 submitted: 400 words"),
+            row("2026-09-14 09:00:00 -0400", "d@x.edu", "4", "Review 4 assigned: external, round TRC"),
+            row("2026-09-13 23:00:00 -0400", "e@x.edu", "5", "Review 5 assigned: primary, round R1"),
+        ]
+        self.assertEqual({2}, review_scores.recent_pids(rows, timeliness_tags.date(2026, 9, 13)))
 
     def test_targets_are_proportional_and_sum_to_the_papers(self):
         pool = ["full@x", "light@x"]
@@ -7240,6 +7281,28 @@ class RevisionTagTests(unittest.TestCase):
             expected = {review_scores.OVER_BAR: self.ADVANCE, None: self.NO}.get(reason)
             self.assertEqual(expected, decisions[pid], pid)
 
+    def test_early_decisions_recent_caveat_and_held_advances(self):
+        bar = review_scores.Bar(min_reviews=5, min_decided=3)
+        scores = {1: [2, 2, 2], 2: [3, 2, 2, 2], 3: [2, 2, 2], 4: [3, 2, 2, 2, 1], 5: [1, 1]}
+        decisions = revision_tags.decide(set(scores), scores, bar, recent={3}, held={4})
+        self.assertEqual({1: self.NO, 2: self.ADVANCE, 3: self.ADVANCE, 4: self.ADVANCE, 5: None},
+                         decisions)
+
+    def test_unassign_only_outstanding_r1_on_early_no_revision_papers(self):
+        bar = review_scores.Bar(min_reviews=5, min_decided=3)
+        scores = {1: [2, 2, 2], 2: [3, 2, 2], 3: [2, 2, 2, 2, 2]}
+        decisions = revision_tags.decide(set(scores), scores, bar)
+        R = hotcrp_log.Review
+        live = {
+            10: R(1, "out@x.edu", "primary", "R1", ""),
+            11: R(1, "done@x.edu", "primary", "R1", ""),     # submitted
+            12: R(1, "trc@x.edu", "external", "TRC", ""),    # TRC
+            13: R(2, "adv@x.edu", "primary", "R1", ""),      # paper advances
+            14: R(3, "net@x.edu", "primary", "R1", ""),      # decided on the net
+        }
+        self.assertEqual([(1, "out@x.edu")],
+                         revision_tags.unassign_pairs(decisions, scores, bar, live, {11}))
+
     def test_upload_clears_the_opposite_tag_before_any_tag(self):
         rows = revision_tags.upload_rows({2: self.NO, 1: self.ADVANCE, 3: None})
         self.assertEqual(
@@ -7289,11 +7352,13 @@ class RevisionTagTests(unittest.TestCase):
         argv = [
             "revision_tags", "--reviews", str(tmp / "reviews.csv"), "--log", str(tmp / "log.csv"),
             "--data", str(tmp / "data.json"), "--min-reviews", "5", "--exclude-pids", "5",
-            "--upload", str(upload),
+            "--upload", str(upload), "--unassign-upload", str(tmp / "unassign.csv"),
         ]
         with mock.patch.object(sys, "argv", argv), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(0, revision_tags.main())
+        with open(tmp / "unassign.csv", newline="", encoding="utf-8") as f:
+            self.assertEqual([revision_tags.UNASSIGN_HEADER], list(csv.reader(f)))
         with open(upload, newline="", encoding="utf-8") as f:
             rows = list(csv.reader(f))
         self.assertEqual(revision_tags.UPLOAD_HEADER, rows[0])
@@ -7346,55 +7411,70 @@ class TimelinessTagTests(unittest.TestCase):
                          [timeliness_tags.tier_tag(d) for d in (0, 1, 2, 20, 21)])
         self.assertTrue(timeliness_tags.is_timeliness_tag("threedayslate"))
         self.assertFalse(timeliness_tags.is_timeliness_tag("norevision"))
-        # The placeholder is one of ours, but it is not a day, so it never sticks.
         self.assertTrue(timeliness_tags.is_timeliness_tag(timeliness_tags.BLOCKED_TAG))
+        self.assertTrue(timeliness_tags.is_timeliness_tag(timeliness_tags.DELAY_TAG))
         self.assertFalse(timeliness_tags.is_day_tag(timeliness_tags.BLOCKED_TAG))
         self.assertTrue(timeliness_tags.is_day_tag("threedayslate"))
 
-    def test_placeholder_does_not_stick_and_is_cleared_when_the_day_lands(self):
+    def test_two_buckets_and_no_revision_is_never_delayed(self):
         State = timeliness_tags.ReviewerState
-        states = {"a": State(1, 1, None, None, ""), "b": State(1, 0, None, 1, "")}
-        held = {"pid": 1, "title": "", "tags": ["~~delayedmissingreview"]}
-        papers = [
-            dict(held, pid=1),                                  # still blocked
-            dict(held, pid=2),                                  # placeholder, now decided
-            {"pid": 3, "title": "", "tags": []},                # newly blocked
-            {"pid": 4, "title": "", "tags": ["~~ontime#0"]},    # a day tag sticks
-        ]
+        states = {"blocked": State(1, 1, None, None, ""), "three": State(1, 0, None, 3, ""),
+                  "four": State(1, 0, None, 4, "")}
+        NO, ADV = revision_tags.NO_REVISION_TAG, revision_tags.ADVANCE_TAG
+        papers = [{"pid": n, "title": "", "tags": []} for n in range(1, 7)]
         report = timeliness_tags.decide(
-            papers, {1: ["a"], 2: ["b"], 3: ["a"], 4: ["a"]}, states)
-        self.assertEqual(["still blocked", "tagged", "blocked", "already tagged"],
+            papers,
+            {1: ["blocked"], 2: ["three"], 3: ["four"], 4: ["blocked"], 5: ["four"], 6: []},
+            states,
+            revision={1: NO, 2: ADV, 3: ADV, 4: ADV, 5: None, 6: ADV},
+        )
+        self.assertEqual(["~~ontime", "~~ontime", "~~revisiondelay", "~~revisiondelay",
+                          "~~revisiondelay", "~~ontime"], [r["new_tag"] for r in report])
+        self.assertEqual(["no revision", "on time", "late", "blocked", "late", "on time"],
                          [r["status"] for r in report])
-        self.assertEqual(["", "~~onedaylate", "~~delayedmissingreview", ""],
-                         [r["new_tag"] for r in report])
-        # 4 is cleared although it is blocked today: nothing later would clear it.
-        rows = timeliness_tags.upload_rows(report)
-        self.assertEqual([
-            [2, "cleartag", "", "~~delayedmissingreview", ""],
-            [4, "cleartag", "", "~~delayedmissingreview", ""],
-        ], rows[:2])
-        self.assertEqual([
-            [2, "tag", "", "~~onedaylate", ""],
-            [3, "tag", "", "~~delayedmissingreview", ""],
-        ], rows[-2:])
-        # Only the newly decided paper has other day tags cleared, never its own.
-        day_clears = rows[2:-2]
-        self.assertEqual({2}, {r[0] for r in day_clears})
-        self.assertNotIn("~~onedaylate", {r[3] for r in day_clears})
 
-    def test_a_new_day_clears_a_different_day_a_stale_export_hides(self):
-        # Run 1 uploaded ~~twodayslate; an extension then made the paper on time,
-        # and run 2, against the same export, must not leave both tags on it.
+    def test_upload_clears_retired_tags_everywhere_then_the_opposite_bucket(self):
         State = timeliness_tags.ReviewerState
         report = timeliness_tags.decide(
-            [{"pid": 1005, "title": "", "tags": ["~~delayedmissingreview"]}],
-            {1005: ["a"]}, {"a": State(1, 0, None, 0, "extension")})
+            [{"pid": 1, "title": "", "tags": ["~~twodayslate#0"]},
+             {"pid": 2, "title": "", "tags": ["~~ontime#0"]}],
+            {1: ["a"], 2: ["b"]},
+            {"a": State(1, 0, None, 0, ""), "b": State(1, 1, None, None, "")},
+        )
         rows = timeliness_tags.upload_rows(report)
-        self.assertIn([1005, "cleartag", "", "~~twodayslate", ""], rows)
-        self.assertIn([1005, "cleartag", "", "~~twentydayslate", ""], rows)
-        self.assertNotIn([1005, "cleartag", "", "~~ontime", ""], rows)
-        self.assertEqual([1005, "tag", "", "~~ontime", ""], rows[-1])
-        self.assertTrue(all(r[1] == "cleartag" for r in rows[:-1]))
+        retired = [r for r in rows if r[0] == "all"]
+        self.assertTrue(all(r[1] == "cleartag" for r in retired))
+        self.assertIn("~~twodayslate", {r[3] for r in retired})
+        self.assertIn("~~twentydayslate", {r[3] for r in retired})
+        self.assertIn("~~delayedmissingreview", {r[3] for r in retired})
+        self.assertNotIn("~~ontime", {r[3] for r in retired})
+        self.assertEqual(rows[:len(retired)], retired)  # retired clears come first
+        self.assertEqual([
+            [1, "cleartag", "", "~~revisiondelay", ""],
+            [2, "cleartag", "", "~~ontime", ""],
+            [1, "tag", "", "~~ontime", ""],
+            [2, "tag", "", "~~revisiondelay", ""],
+        ], rows[len(retired):])
+        self.assertEqual([(2, "~~ontime", "~~revisiondelay")], timeliness_tags.flips(report))
+
+    def test_unassign_effects_finds_an_author_the_removals_finish(self):
+        R = hotcrp_log.Review
+        live = [(1, R(10, "a@x.edu", "primary", "R1", "2026-08-01 09:00:00 -0400")),
+                (2, R(11, "a@x.edu", "primary", "R1", "2026-08-01 09:00:00 -0400"))]
+        first = {1: "2026-09-20 09:00:00 -0400"}
+        states = {"a@x.edu": self.status(live, {1}, first)}
+        ev = timeliness_tags.Evaluation(
+            papers={}, report=[], states=states, author_keys={5: ["a@x.edu"]}, author_source={},
+            display={}, name_only={}, cutoff=self.CUTOFF, exempt_after=self.EXEMPT_AFTER,
+            by_reviewer={"a@x.edu": live}, submitted={1}, first_submit=first,
+        )
+        effects = timeliness_tags.unassign_effects(
+            ev, [(11, "a@x.edu")], {5: revision_tags.ADVANCE_TAG}, 4)
+        self.assertEqual(1, len(effects))
+        key, before, after, papers = effects[0]
+        self.assertEqual(("a@x.edu", None, 0), (key, before.days, after.days))
+        self.assertEqual([(5, "~~revisiondelay", "~~ontime")], papers)
+        self.assertEqual([], timeliness_tags.unassign_effects(ev, [(10, "a@x.edu")], {}, 4))
 
     def test_days_are_24_hour_windows_from_the_cutoff(self):
         at = hotcrp_log.parse_date
@@ -7435,7 +7515,7 @@ class TimelinessTagTests(unittest.TestCase):
         self.assertEqual((None, ["c"]), timeliness_tags.paper_days(["a", "c"], states))
         self.assertEqual((0, []), timeliness_tags.paper_days([], states))
 
-    def test_end_to_end_ignores_trc_and_skips_tagged_papers(self):
+    def test_end_to_end_ignores_trc_and_spares_no_revision_papers(self):
         tmp = Path(tempfile.mkdtemp())
         papers = [
             {"pid": 1, "title": "One", "status": "submitted", "tags": [],
@@ -7459,9 +7539,16 @@ class TimelinessTagTests(unittest.TestCase):
             writer.writerow(hotcrp_log.LOG_HEADER)
             for when, who, pid, action in reversed(events):
                 writer.writerow([when, "", "chair@x.edu", "", who, "", pid, action])
+        with open(tmp / "reviews.csv", "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["paper", "title", "review", "email", review_scores.SCORE_FIELD])
+            # 3 is all rejects on three reviews: NoRevision, so never delayed.
+            writer.writerows([[3, "T", f"3{i}", f"r{i}@x.edu", 2] for i in range(3)])
+            writer.writerows([[4, "T", f"4{i}", f"r{i}@x.edu", 3] for i in range(3)])
         upload = tmp / "upload.csv"
         argv = [
             "timeliness_tags", "--log", str(tmp / "log.csv"), "--data", str(tmp / "data.json"),
+            "--reviews", str(tmp / "reviews.csv"), "--min-reviews", "5", "--min-decided", "3",
             "--no-pc-check", "--extensions", str(tmp / "ext.csv"),
             "--upload", str(upload), "--report", str(tmp / "report.csv"),
         ]
@@ -7472,25 +7559,16 @@ class TimelinessTagTests(unittest.TestCase):
         with open(upload, newline="", encoding="utf-8") as f:
             rows = list(csv.reader(f))
         self.assertEqual(timeliness_tags.UPLOAD_HEADER, rows[0])
-        # 1: the late author's outstanding TRC review neither blocks nor exempts;
-        # 2: no reviewer author; 3: already tagged; 4: slow@ is unfinished, so it
-        # takes the placeholder while every unblocked paper has it cleared.
+        # 1: one day late, and the late author's outstanding TRC review neither
+        # blocks nor exempts; 2: no reviewer author; 3: slow@ is unfinished but
+        # the paper is NoRevision; 4: slow@ is unfinished and the paper advances.
         self.assertEqual([
-            ["1", "cleartag", "", "~~delayedmissingreview", ""],
-            ["2", "cleartag", "", "~~delayedmissingreview", ""],
-            ["3", "cleartag", "", "~~delayedmissingreview", ""],
-        ], rows[1:4])
-        self.assertEqual([
-            ["1", "tag", "", "~~onedaylate", ""],
+            ["1", "tag", "", "~~ontime", ""],
             ["2", "tag", "", "~~ontime", ""],
-            ["4", "tag", "", "~~delayedmissingreview", ""],
-        ], rows[-3:])
-        # The newly decided papers, and only they, have their other day tags cleared.
-        day_clears = rows[4:-3]
-        self.assertEqual({"1", "2"}, {r[0] for r in day_clears})
-        self.assertTrue(all(r[1] == "cleartag" for r in day_clears))
-        self.assertNotIn(["1", "cleartag", "", "~~onedaylate", ""], day_clears)
-        self.assertNotIn(["2", "cleartag", "", "~~ontime", ""], day_clears)
+            ["3", "tag", "", "~~ontime", ""],
+            ["4", "tag", "", "~~revisiondelay", ""],
+        ], rows[-4:])
+        self.assertTrue(all(r[1] == "cleartag" for r in rows[1:-4]))
         self.assertEqual(timeliness_tags.EXTENSION_HEADER,
                          next(csv.reader(open(tmp / "ext.csv", encoding="utf-8"))))
 
@@ -7526,7 +7604,7 @@ class TimelinessTagTests(unittest.TestCase):
                 extensions_path="", pcinfo=None)
         self.assertEqual((1, 0), (ev.states["rev@x.edu"].held, ev.states["rev@x.edu"].outstanding))
         row = next(r for r in ev.report if r["paper"] == 1)
-        self.assertEqual(("tagged", "~~ontime"), (row["status"], row["new_tag"]))
+        self.assertEqual(("on time", "~~ontime"), (row["status"], row["new_tag"]))
 
 
 class TimelinessEmailTests(unittest.TestCase):
@@ -7598,10 +7676,10 @@ class TimelinessEmailTests(unittest.TestCase):
         ev = timeliness_tags.Evaluation(
             papers=papers,
             report=[
-                {"paper": 1, "status": "blocked"},        # drafted
-                {"paper": 2, "status": "still blocked"},  # drafted
-                {"paper": 3, "status": "tagged"},         # decided: no email
-                {"paper": 4, "status": "already tagged"},  # carries a day tag already
+                {"paper": 1, "status": "blocked"},      # drafted
+                {"paper": 2, "status": "blocked"},      # drafted
+                {"paper": 3, "status": "late"},         # decided: no email
+                {"paper": 4, "status": "no revision"},  # never delayed
             ],
             states=states,
             author_keys={1: ["slow@y.edu"], 2: ["slow@y.edu"], 3: ["done@y.edu"], 4: []},
@@ -7631,7 +7709,7 @@ class TimelinessEmailTests(unittest.TestCase):
         papers = {n: dict(self.PAPER, pid=n) for n in (1, 2)}
         ev = timeliness_tags.Evaluation(
             papers=papers,
-            report=[{"paper": 1, "status": "tagged"}, {"paper": 2, "status": "still blocked"}],
+            report=[{"paper": 1, "status": "on time"}, {"paper": 2, "status": "blocked"}],
             states={"slow@y.edu": self.State(2, 0, None, 0, "")},
             author_keys={1: ["slow@y.edu"], 2: ["slow@y.edu"]},
             author_source={n: {"slow@y.edu": "slow@y.edu"} for n in (1, 2)},

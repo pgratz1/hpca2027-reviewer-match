@@ -13,9 +13,13 @@ therefore found in the action log (`review_rounds`), and every consumer here
 leaves them out of both the count and the average unless told otherwise.
 
 A *net* is the average test plus an optional extra condition that spares a
-paper somebody argues for (`NETS`). A paper is **under the bar** when a net
-catches it. A paper with fewer than `min_reviews` submitted reviews always
-advances, whatever its scores (`Bar.advances`).
+paper somebody argues for (`NETS`). A paper with `min_reviews` or more
+submitted reviews is **under the bar** when the net catches it. A paper with
+`min_decided` up to `min_reviews - 1` reviews is decided early, by a simpler
+rule: under the bar when every score is `EARLY_UNDER_MAX` or lower (reject or
+weak reject), unless it holds an outstanding R1 review assigned after
+`--recent-after` -- that review is let play out, and the paper advances. A
+paper with fewer than `min_decided` reviews always advances (`Bar.advances`).
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ import csv
 import json
 from collections import Counter
 from dataclasses import dataclass
+from datetime import date
 from fractions import Fraction
 
 from . import hotcrp_log
@@ -41,6 +46,10 @@ COMPARATORS = ("le", "lt")
 COMPARATOR_SYMBOLS = {"le": "<=", "lt": "<"}
 
 DEFAULT_MIN_REVIEWS = 4
+DEFAULT_MIN_DECIDED = 3
+# An early paper (min_decided <= reviews < min_reviews) is under the bar when no
+# score exceeds this: all reject (1) or weak reject (2).
+EARLY_UNDER_MAX = 2
 DEFAULT_BAR_NET = "one3"
 DEFAULT_BAR_CUTOFF = 2.5
 DEFAULT_BAR_COMPARATOR = "le"
@@ -48,6 +57,13 @@ DEFAULT_BAR_COMPARATOR = "le"
 # `Bar.advances` reasons.
 FEW_REVIEWS = "few-reviews"
 OVER_BAR = "over-bar"
+RECENT = "recent-review"
+HELD = "held-advance"
+
+# The revision tags `scripts/revision_tags.py` writes. They live here because
+# `decide_paper` reads the export's copy of them back.
+ADVANCE_TAG = "RevisionAdvance"
+NO_REVISION_TAG = "NoRevision"
 
 # (key, label, short label, extra condition on one paper's scores). The average
 # test is applied to every net; this is what each one adds on top of it.
@@ -104,6 +120,22 @@ def review_rounds(log_rows: list[dict[str, str]]) -> tuple[set[tuple[int, str]],
         if review.round == REVIEW_ROUND and rid not in submitted
     )
     return training, outstanding
+
+
+def recent_pids(log_rows: list[dict[str, str]], after: date) -> set[int]:
+    """{pid} holding an outstanding R1 review assigned on a day after `after`.
+
+    Such a paper is not decided early: the chairs let a freshly assigned review
+    play out rather than cut it short.
+    """
+    live, _ = hotcrp_log.replay_assignments(log_rows)
+    submitted = hotcrp_log.submitted_review_ids(log_rows)
+    return {
+        review.pid
+        for rid, review in live.items()
+        if review.round == REVIEW_ROUND and rid not in submitted
+        and hotcrp_log.parse_date(review.assigned_at).date() > after
+    }
 
 
 def load_reviews(
@@ -194,6 +226,7 @@ class Bar:
     cutoff: float = DEFAULT_BAR_CUTOFF
     comparator: str = DEFAULT_BAR_COMPARATOR
     min_reviews: int = DEFAULT_MIN_REVIEWS
+    min_decided: int | None = None  # None: no early decisions (= min_reviews)
 
     def __post_init__(self) -> None:
         if self.net not in NET_CONDITIONS:
@@ -204,11 +237,29 @@ class Bar:
             raise ValueError(f"cutoff {self.cutoff:g} is off the 1-5 overall-merit scale")
         if self.min_reviews < 1:
             raise ValueError("min_reviews must be at least 1")
+        if self.min_decided is not None and not 1 <= self.min_decided <= self.min_reviews:
+            raise ValueError("min_decided must lie between 1 and min_reviews")
 
-    def advances(self, scores: list[int]) -> str | None:
-        """FEW_REVIEWS, OVER_BAR, or None when the paper is under the bar."""
-        if len(scores) < self.min_reviews:
+    @property
+    def decided_from(self) -> int:
+        """The fewest reviews on which a paper is decided at all."""
+        return self.min_reviews if self.min_decided is None else self.min_decided
+
+    def is_early(self, scores: list[int]) -> bool:
+        """Whether the paper is decided by the early rule rather than the net."""
+        return self.decided_from <= len(scores) < self.min_reviews
+
+    def advances(self, scores: list[int], recent: bool = False) -> str | None:
+        """FEW_REVIEWS, RECENT, OVER_BAR, or None when the paper is under the bar.
+
+        `recent` (see `recent_pids`) matters only to an early paper.
+        """
+        if len(scores) < self.decided_from:
             return FEW_REVIEWS
+        if self.is_early(scores):
+            if max(scores) > EARLY_UNDER_MAX:
+                return OVER_BAR
+            return RECENT if recent else None
         if caught(scores, self.cutoff, self.comparator, NET_CONDITIONS[self.net]):
             return None
         return OVER_BAR
@@ -216,8 +267,36 @@ class Bar:
     def describe(self) -> str:
         """One line naming the bar, for reports."""
         extra = "" if self.net == "average" else " and" + NET_LABELS[self.net][1:]
-        return (f"under the bar: average {COMPARATOR_SYMBOLS[self.comparator]} "
-                f"{self.cutoff:g}{extra}; fewer than {self.min_reviews} reviews always advances")
+        line = (f"under the bar: average {COMPARATOR_SYMBOLS[self.comparator]} "
+                f"{self.cutoff:g}{extra}")
+        if self.decided_from < self.min_reviews:
+            line += (f" with {self.min_reviews}+ reviews; with {self.decided_from}-"
+                     f"{self.min_reviews - 1}, every score {EARLY_UNDER_MAX} or lower and no"
+                     " recently assigned review outstanding")
+        return line + f"; fewer than {self.decided_from} reviews always advances"
+
+
+def tagged_pids(data_path: str, tag: str) -> set[int]:
+    """{pid} whose tags in the paper export include `tag` (twiddles and values ignored)."""
+    with open(data_path, encoding="utf-8") as f:
+        papers = json.load(f)
+    want = tag.lower()
+    return {p["pid"] for p in papers
+            if want in pc_membership.tag_names(" ".join(p.get("tags") or []))}
+
+
+def decide_paper(bar: Bar, scores: list[int], *, recent: bool = False, held: bool = False) -> str | None:
+    """`Bar.advances`, except that a paper already tagged RevisionAdvance never goes back.
+
+    `held` says the export already carries ADVANCE_TAG. An advance decided on
+    three or four reviews can otherwise be undone by the reviews still coming
+    in, and the chairs keep a paper they have told to advance advancing: it
+    reports HELD instead of None. Both `scripts/revision_tags.py` and
+    `scripts/assign_paper_leads.py` decide through here, so a held paper keeps
+    its tag and its lead together.
+    """
+    reason = bar.advances(scores, recent)
+    return HELD if reason is None and held else reason
 
 
 def add_bar_arguments(parser: argparse.ArgumentParser) -> None:
@@ -236,9 +315,26 @@ def add_bar_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--min-reviews", type=int, default=DEFAULT_MIN_REVIEWS,
-        help=f"papers with fewer submitted reviews always advance (default {DEFAULT_MIN_REVIEWS})"
+        help=f"papers with this many submitted reviews face the net (default {DEFAULT_MIN_REVIEWS})"
+    )
+    parser.add_argument(
+        "--min-decided", type=int, default=None,
+        help="papers with fewer submitted reviews always advance; from here up to --min-reviews"
+             f" they are under the bar when every score is {EARLY_UNDER_MAX} or lower"
+             " (default: --min-reviews, i.e. no early decisions)"
+    )
+    parser.add_argument(
+        "--recent-after", type=date.fromisoformat, default=None,
+        help="an early paper holding an outstanding R1 review assigned on a later day advances"
+             " (default: none)"
     )
 
 
 def bar_from_args(args: argparse.Namespace) -> Bar:
-    return Bar(args.bar_net, args.bar_cutoff, args.bar_comparator, args.min_reviews)
+    return Bar(args.bar_net, args.bar_cutoff, args.bar_comparator, args.min_reviews,
+               args.min_decided)
+
+
+def recent_from_args(args: argparse.Namespace, log_rows: list[dict[str, str]]) -> set[int]:
+    """`recent_pids` under `--recent-after`, or nothing when the flag is unset."""
+    return recent_pids(log_rows, args.recent_after) if args.recent_after else set()

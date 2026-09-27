@@ -7,12 +7,16 @@
 
 **Which papers.** Every paper still under review (`submitted`, not
 desk-rejected, not `--exclude-pids`) that *advances*: it has fewer than
-`--min-reviews` submitted PC reviews, or it is over the revision bar. The bar
-is `reviewer_match.review_scores.Bar`, the same definition
-`scripts/revision_cutoffs.py` measures. By default a paper is under the bar
+`--min-decided` (default `--min-reviews`) submitted PC reviews, or it is over
+the revision bar, or the export already tags it `RevisionAdvance`. The bar is
+`reviewer_match.review_scores.Bar` via `review_scores.decide_paper`, the same
+decision `scripts/revision_tags.py` tags. By default a paper is under the bar
 when its average pre-rebuttal overall merit is <= 2.5 **and** at most one
 reviewer scored it 3 or better; `--bar-net`/`--bar-cutoff`/`--bar-comparator`
-change it. TRC reviews count towards neither the review floor nor the average.
+change it. With `--min-decided` below `--min-reviews`, a paper in between is
+under the bar when every score is 2 or lower and no R1 review assigned after
+`--recent-after` is outstanding. TRC reviews count towards neither the review
+floor nor the average.
 
 **Who can lead.** Only someone who has *submitted their review of that paper*
 and is on the PC, full or light. The 7 reserves promoted onto the PC
@@ -411,7 +415,11 @@ def main() -> int:
         reviewers.setdefault(review.pid, []).append(review.email)
         titles.setdefault(review.pid, review.title)
 
-    need = {pid: reason for pid in sorted(eligible) if (reason := bar.advances(scores.get(pid, [])))}
+    recent = review_scores.recent_from_args(args, log_rows)
+    held = review_scores.tagged_pids(args.data, review_scores.ADVANCE_TAG)
+    need = {pid: reason for pid in sorted(eligible)
+            if (reason := review_scores.decide_paper(bar, scores.get(pid, []),
+                                                     recent=pid in recent, held=pid in held))}
 
     roster = build_roster(args.pcinfo)
     def can_lead(email: str) -> bool:
@@ -497,8 +505,14 @@ def main() -> int:
     status = Counter(draw.status.values())
     unassignable = [pid for pid in need if not candidates[pid] and pid not in fixed]
     print(f"Bar: {bar.describe()}. Seed {args.seed}.")
+    extra = "".join(
+        f", {reasons[key]} {label}" for key, label in (
+            (review_scores.RECENT, "for a recently assigned review"),
+            (review_scores.HELD, f"already tagged {review_scores.ADVANCE_TAG}"),
+        ) if reasons[key]
+    )
     print(f"{len(need)} of {len(eligible)} papers advance: {reasons[review_scores.OVER_BAR]} over the bar, "
-          f"{reasons[review_scores.FEW_REVIEWS]} with fewer than {bar.min_reviews} reviews "
+          f"{reasons[review_scores.FEW_REVIEWS]} with fewer than {bar.decided_from} reviews{extra} "
           f"({len(skipped)} TRC reviews left out).")
     print(f"Leads: {status['new']} new, {status['redrawn']} replaced, {status['kept']} kept, "
           f"{status['override'] + status['override-new']} chair overrides "

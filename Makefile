@@ -612,10 +612,19 @@ revision-cutoffs: scripts/revision_cutoffs.py src/reviewer_match/review_scores.p
 	$(RUN) scripts.revision_cutoffs --reviews $(REVIEWS) --log $(LOG) --data $(DATA) \
 		--min-reviews $(REVISION_MIN_REVIEWS) $(EXCLUDE_FLAG) $(REVISION_FLAGS)
 
-# One discussion lead per paper that advances to revision: fewer than
-# REVISION_MIN_REVIEWS submitted PC reviews, or over the bar (default: not
-# "average <= 2.5 and at most one score of 3 or better"; LEAD_FLAGS="--bar-cutoff
-# 2.25 --bar-net no4" changes it). Drawn at random from the paper's own submitted
+# The revision bar every tag and lead target shares. REVISION_MIN_REVIEWS+
+# submitted PC reviews: under the bar at "average <= 2.5 and at most one score of
+# 3 or better" (LEAD_FLAGS="--bar-cutoff 2.25 --bar-net no4" changes it).
+# REVISION_MIN_DECIDED up to one short of that: under the bar when every score
+# is reject or weak reject, unless an R1 review assigned after RECENT_AFTER is
+# still outstanding. Fewer: always advances, untagged. A paper the export already
+# tags RevisionAdvance never goes back.
+REVISION_MIN_DECIDED ?= 3
+RECENT_AFTER ?= $(EXEMPT_AFTER)
+REVISION_BAR = --min-reviews $(REVISION_MIN_REVIEWS) --min-decided $(REVISION_MIN_DECIDED) \
+	--recent-after $(RECENT_AFTER) $(LEAD_FLAGS)
+
+# One discussion lead per paper that advances to revision (REVISION_BAR). Drawn at random from the paper's own submitted
 # full/light PC reviewers, with lead load proportional to assigned review load.
 # Existing leads in LEADS (search page > Download > Reviews > "Discussion leads
 # (CSV)"; the review-assignments download carries none) are kept, with the ones
@@ -631,40 +640,44 @@ paper-leads: scripts/assign_paper_leads.py src/reviewer_match/review_scores.py \
 	  test -f $$f || { echo "ERROR: $$f not found; download it from HotCRP" >&2; exit 1; }; \
 	done
 	$(RUN) scripts.assign_paper_leads --reviews $(REVIEWS) --log $(LOG) --data $(DATA) \
-		--pcassignments $(PCASSIGNMENTS) --existing-leads $(LEADS) --min-reviews $(REVISION_MIN_REVIEWS) \
-		--seed $(LEAD_SEED) $(EXCLUDE_FLAG) $(LEAD_FLAGS)
+		--pcassignments $(PCASSIGNMENTS) --existing-leads $(LEADS) \
+		--seed $(LEAD_SEED) $(EXCLUDE_FLAG) $(REVISION_BAR)
 
 # RevisionAdvance on papers over the bar, NoRevision on those under it, for
-# every paper with REVISION_MIN_REVIEWS+ submitted PC reviews; papers short of
-# reviews stay untagged. Same bar and flags as paper-leads (LEAD_FLAGS), so the
-# two agree. The upload is a delta that clears the opposite tag first, so a rerun
-# after a paper crosses the bar is safe. Nothing is uploaded.
+# every paper with REVISION_MIN_DECIDED+ submitted PC reviews; papers short of
+# reviews stay untagged. Same REVISION_BAR as paper-leads, so the two agree. The
+# upload is a delta that clears the opposite tag first, so a rerun after a paper
+# crosses the bar is safe. Also writes revision_unassign_upload.csv: a per-pair
+# clearreview of every outstanding R1 review on a paper decided NoRevision
+# before REVISION_MIN_REVIEWS. Nothing is uploaded.
 revision-tags: scripts/revision_tags.py src/reviewer_match/review_scores.py src/reviewer_match/hotcrp_log.py
 	@for f in $(REVIEWS) $(LOG); do \
 	  test -f $$f || { echo "ERROR: $$f not found; download it from HotCRP" >&2; exit 1; }; \
 	done
 	$(RUN) scripts.revision_tags --reviews $(REVIEWS) --log $(LOG) --data $(DATA) \
-		--min-reviews $(REVISION_MIN_REVIEWS) $(EXCLUDE_FLAG) $(LEAD_FLAGS)
+		$(EXCLUDE_FLAG) $(REVISION_BAR)
 
-# ~~ontime on every paper whose PC/reserve authors had submitted all the R1
-# reviews they hold by ONTIME_CUTOFF (or that has no such author), and
-# ~~onedaylate, ~~twodayslate, ... by the 24-hour window the last of them first
-# submitted in. A paper whose author still owes a review has no day yet and gets
-# ~~delayedmissingreview until it does. TRC reviews are ignored. A reviewer given
-# an R1 review after EXEMPT_AFTER, or listed as an extension in EXTENSIONS,
-# counts as on time. Papers already carrying a day tag in DATA are never
-# re-tagged; the placeholder is cleared off every paper no longer blocked, so the
-# upload is a delta. Run it daily on a fresh log and paper export and upload the
-# result. Nothing is uploaded.
+# ~~revisiondelay on every paper whose PC/reserve authors finished the R1
+# reviews they hold DELAY_DAYS or more 24-hour windows after ONTIME_CUTOFF, or
+# still owe one; ~~ontime on every other paper, and on every NoRevision paper
+# however late (same REVISION_BAR as revision-tags). TRC reviews are ignored. A
+# reviewer given an R1 review after EXEMPT_AFTER, or listed as an extension in
+# EXTENSIONS, counts as on time. Recomputed every run; the retired ~~*dayslate
+# and ~~delayedmissingreview tags are cleared off every paper. Also reports whose
+# late status revision-tags' unassignments would change. Run it daily on a fresh
+# log and paper export and upload the result. Nothing is uploaded.
 ONTIME_CUTOFF ?= 2026-09-22 11:00:00 -0400
 EXEMPT_AFTER ?= 2026-09-13
+DELAY_DAYS ?= 4
 EXTENSIONS ?= $(CURATED_DIR)/review_extensions.csv
-timeliness-tags: scripts/timeliness_tags.py src/reviewer_match/hotcrp_log.py src/reviewer_match/review_scores.py
-	@for f in $(LOG) $(DATA); do \
+timeliness-tags: scripts/timeliness_tags.py scripts/revision_tags.py src/reviewer_match/hotcrp_log.py \
+		src/reviewer_match/review_scores.py
+	@for f in $(REVIEWS) $(LOG) $(DATA); do \
 	  test -f $$f || { echo "ERROR: $$f not found; download it from HotCRP" >&2; exit 1; }; \
 	done
-	$(RUN) scripts.timeliness_tags --log $(LOG) --data $(DATA) --cutoff "$(ONTIME_CUTOFF)" \
-		--exempt-after $(EXEMPT_AFTER) --extensions "$(EXTENSIONS)" $(PC_CHECK) $(EXCLUDE_FLAG)
+	$(RUN) scripts.timeliness_tags --reviews $(REVIEWS) --log $(LOG) --data $(DATA) \
+		--cutoff "$(ONTIME_CUTOFF)" --exempt-after $(EXEMPT_AFTER) --delay-days $(DELAY_DAYS) \
+		--extensions "$(EXTENSIONS)" $(PC_CHECK) $(EXCLUDE_FLAG) $(REVISION_BAR)
 
 # Everything a fresh set of HotCRP exports should regenerate, in one run: the
 # revision tags, the timeliness tags and the discussion leads. Each is a delta
@@ -674,6 +687,7 @@ timeliness-tags: scripts/timeliness_tags.py src/reviewer_match/hotcrp_log.py src
 # hpca2027-* export than INPUT_DIR. Nothing is uploaded.
 DOWNLOADS ?= $(HOME)/Downloads
 DAILY_UPLOADS = $(ASSIGNMENT_DIR)/revision_tags_upload.csv \
+	$(ASSIGNMENT_DIR)/revision_unassign_upload.csv \
 	$(ASSIGNMENT_DIR)/timeliness_tags_upload.csv $(ASSIGNMENT_DIR)/lead_upload.csv
 daily: check-exports
 	$(MAKE) --no-print-directory revision-tags

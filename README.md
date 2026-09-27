@@ -1655,15 +1655,24 @@ review data and are gitignored. Offline, instant, read-only.
 `make paper-leads` gives every paper that advances to revision one discussion
 lead and writes the HotCRP upload for it. It uploads nothing.
 
-**Which papers advance.** Every paper still under review that either has fewer
-than `REVISION_MIN_REVIEWS` (5) submitted PC reviews, or is over the bar. The
-bar is `review_scores.Bar`, the same definition `make revision-cutoffs`
-measures. By default a paper is **under** it when its average is ≤ 2.5 **and**
-at most one reviewer scored it 3 or better, so a paper averaging exactly 2.5
-with one 3+ does not advance. To change it:
-`make paper-leads LEAD_FLAGS="--bar-cutoff 2.25 --bar-net no4"`, where
-`--bar-comparator lt` lets an average on the cutoff through. TRC reviews count
-towards neither the floor nor the average.
+**Which papers advance.** Every paper still under review that has fewer than
+`REVISION_MIN_DECIDED` (3) submitted PC reviews, is over the bar, or already
+carries `RevisionAdvance` in the export. The bar is `review_scores.Bar`
+(`REVISION_BAR` in the Makefile), the decision `make revision-tags` tags:
+
+- **`REVISION_MIN_REVIEWS` (5) or more reviews:** under the bar when the average
+  is ≤ 2.5 **and** at most one reviewer scored it 3 or better, so a paper
+  averaging exactly 2.5 with one 3+ does not advance. To change it:
+  `make paper-leads LEAD_FLAGS="--bar-cutoff 2.25 --bar-net no4"`, where
+  `--bar-comparator lt` lets an average on the cutoff through.
+- **3 or 4 reviews:** under the bar when every score is reject or weak reject
+  (≤ 2). One score of 3 or better advances it. So does an outstanding R1 review
+  assigned after `RECENT_AFTER` (default `EXEMPT_AFTER`, 2026-09-13), which is
+  left to play out.
+- **Never downgraded:** a paper the export already tags `RevisionAdvance` keeps
+  advancing, and keeps its lead, even if later reviews put it under the bar.
+
+TRC reviews count towards neither the floor nor the average.
 
 **Who can lead.** Only a full or light PC member who has submitted their review
 of *that* paper. The reserves promoted onto the PC (`~~ex-rr`) are light PC
@@ -1746,7 +1755,7 @@ Workflow:
 ### `make daily` — regenerate every upload a fresh export affects
 
 `make daily` runs `make revision-tags`, `make timeliness-tags` and `make
-paper-leads` in that order, then lists the three upload files. Each one is a
+paper-leads` in that order, then lists the four upload files. Each one is a
 delta against what the exports say HotCRP holds, so a rerun is safe. That only
 holds if the exports postdate your last upload, and the **discussion-leads**
 download matters most.
@@ -1762,8 +1771,9 @@ Each time you get new data:
    exports into `data/inputs/`.
 2. Run `make daily` and read each summary. A `WARNING` line from
    `check-exports` means a newer download was left in `DOWNLOADS`.
-3. Upload `revision_tags_upload.csv`, `timeliness_tags_upload.csv` and
-   `lead_upload.csv` through HotCRP's bulk assignment, previewing each one.
+3. Upload `revision_tags_upload.csv`, `revision_unassign_upload.csv`,
+   `timeliness_tags_upload.csv` and `lead_upload.csv` through HotCRP's bulk
+   assignment, in that order, previewing each one.
 
 Variables such as `LEAD_FLAGS` and `EXTENSIONS` pass through to all three
 steps. Offline, instant, and nothing is uploaded.
@@ -1771,13 +1781,22 @@ steps. Offline, instant, and nothing is uploaded.
 ### `scripts/revision_tags.py` — tag the papers the bar has decided
 
 `make revision-tags` writes `outputs/assignments/revision_tags_upload.csv`,
-which tags every paper with at least `REVISION_MIN_REVIEWS` (5) submitted PC
+which tags every paper with at least `REVISION_MIN_DECIDED` (3) submitted PC
 reviews: `RevisionAdvance` if it is over the bar, `NoRevision` if it is
-under. Papers with fewer reviews stay **untagged** until their reviews arrive.
-It uses the same `review_scores.Bar`, paper set and `LEAD_FLAGS` as `make
-paper-leads`, so every paper that advances on its scores for a lead is exactly
-a `RevisionAdvance`. TRC reviews count towards neither the floor nor the
-average.
+under (the bar is described under `make paper-leads` above). Papers with fewer
+reviews stay **untagged** until their reviews arrive. It uses the same
+`review_scores.decide_paper`, paper set and `REVISION_BAR` as `make
+paper-leads`, so every paper that advances for a lead is exactly a
+`RevisionAdvance`. A paper the export already shows as `RevisionAdvance` is
+never downgraded, and stdout lists any paper kept that way. TRC reviews count
+towards neither the floor nor the average.
+
+It also writes `outputs/assignments/revision_unassign_upload.csv`: one
+`pid,clearreview,email,R1` row for every **outstanding** R1 review on a paper
+decided `NoRevision` on 3 or 4 reviews. It never writes `all,clearreview`, and
+never touches a submitted review, a TRC review, or a paper decided on 5+
+reviews. Taking those reviews away can finish a late reviewer. `make
+timeliness-tags` lists whose status changes, and which papers they author.
 
 The upload is a HotCRP bulk-assignment delta (`paper,action,email,tag,round`).
 HotCRP's `tag` action only adds, so every decided paper first gets a `cleartag`
@@ -1790,14 +1809,19 @@ uploaded.
 ### `scripts/timeliness_tags.py` — tag papers by their authors' own review timeliness
 
 `make timeliness-tags` writes `outputs/assignments/timeliness_tags_upload.csv`,
-which puts one chairs-only tag on every paper: `~~ontime` if every PC/reserve
-author had submitted all the R1 reviews they hold by `ONTIME_CUTOFF`
-(2026-09-22 11:00 EDT / 10:00 CDT), or if the paper has no PC/reserve author.
-Otherwise it gets `~~onedaylate`, `~~twodayslate`, … according to the 24-hour
-window after the cutoff in which the last of those authors finished. A paper
-whose author still owes a review has no day yet and gets the placeholder
-`~~delayedmissingreview` instead. The tags are what delays review release and
-shortens the rebuttal for tardy reviewers.
+which puts one of two chairs-only tags on every paper:
+
+- **`~~revisiondelay`** if the paper is not `NoRevision` and one of its
+  PC/reserve authors either finished the R1 reviews they hold `DELAY_DAYS` (4) or
+  more 24-hour windows after `ONTIME_CUTOFF` (2026-09-22 11:00 EDT / 10:00 CDT),
+  or still owes one. Four windows means `~~threedayslate` was the last on-time
+  day.
+- **`~~ontime`** otherwise. That includes **every `NoRevision` paper, however
+  late**, and every paper with no PC/reserve author.
+
+The revision decision comes from `make revision-tags` (same inputs and
+`REVISION_BAR`), so the two uploads cannot disagree. The tags are what delays
+review release and shortens the rebuttal for tardy reviewers.
 
 - **Authorship is email-only.** An author email must match a PC/reserve
   roster address or a HotCRP address. Name-only matches go in the
@@ -1816,28 +1840,30 @@ shortens the rebuttal for tardy reviewers.
   overrides the exemption: with a blank `date` the reviewer blocks their papers,
   and with a date they count as finishing no earlier than that date (11:00 EDT
   that day if no time is given).
-- **A paper waits for all its PC/reserve authors.** While any of them is
-  unfinished and not exempt it carries `~~delayedmissingreview`; once they have
-  all finished it takes the latest author's day.
-- **The day tags stick; `~~delayedmissingreview` does not.** A paper that
-  already carries a day tag in `hpca2027-data.json` is never re-tagged. The day
-  comes from log timestamps, not from when the script runs, so a missed day
-  catches up. The placeholder is only a stand-in for a day not yet known, so a
-  paper carrying it is still decided — the upload is a **delta** that
-  `cleartag`s the placeholder off every paper no longer blocked, unconditionally
-  (clearing a tag a paper does not have changes nothing, and doing it whether or
-  not the export shows the tag is what keeps two runs against one stale paper
-  export from leaving a paper carrying both). Clears come first, then the tags.
+- **A paper takes its latest author's day**, and counts as blocked while any of
+  them is unfinished and not exempt.
+- **Recomputed every run, nothing sticks.** A paper whose export tag flips
+  between the two buckets is listed on stderr. The upload is a delta that runs
+  in three steps:
+  1. It clears the retired tags (`~~onedaylate`, `~~twodayslate`, …,
+     `~~delayedmissingreview`) from every paper, with one `all,cleartag` row
+     each.
+  2. It clears each paper's opposite bucket.
+  3. It tags every paper.
+- **Unassignments.** stdout lists every reviewer whose status would change once
+  `revision_unassign_upload.csv` is uploaded, with the before and after tag of
+  each paper they author. The tags follow the log as it stands, so the change
+  lands on the first run after the upload. To keep a reviewer late anyway, give
+  them a `late` row in `review_extensions.csv`.
 
-Daily: download a fresh action log and paper JSON, run `make timeliness-tags`,
-and upload the file through HotCRP's bulk assignment. stdout lists the counts
-and the reviewers still holding papers up. Offline, instant, and nothing is
-uploaded.
+Daily: download fresh exports and run `make daily`. stdout lists the counts and
+the reviewers still delaying papers. Offline, instant, and nothing is uploaded.
 
 ### `scripts/timeliness_emails.py` — draft the author emails for held papers
 
 `make timeliness-emails` writes `outputs/reports/timeliness_emails.txt`: one
-drafted message per paper carrying `~~delayedmissingreview`, for the chair to
+drafted message per paper blocked on an unfinished author (formerly tagged
+`~~delayedmissingreview`; it does not know the revision decision), for the chair to
 split and send by hand. **Nothing is sent and no mail is configured.** Which
 papers are held, and who is holding them, comes from the same
 `timeliness_tags.evaluate()` the tags come from, so the emails and the tags

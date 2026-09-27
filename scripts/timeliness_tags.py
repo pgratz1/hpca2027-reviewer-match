@@ -1,20 +1,24 @@
 """Tag each paper by whether its PC/reserve authors turned in their own reviews on time.
 
     python -m scripts.timeliness_tags
-    python -m scripts.timeliness_tags --cutoff '2026-09-22 11:00:00 -0400'
+    python -m scripts.timeliness_tags --min-reviews 5 --min-decided 3 --recent-after 2026-09-13
+    python -m scripts.timeliness_tags --cutoff '2026-09-22 11:00:00 -0400' --delay-days 4
     python -m scripts.timeliness_tags --extensions data/curated/review_extensions.csv
 
 Chairs-only tags that delay review release and shorten the rebuttal period
-for papers whose authors are late reviewers:
+for papers whose authors are late reviewers. Two buckets:
 
-  ~~ontime        every PC/reserve author had submitted every R1 review they
-                  hold by `--cutoff` -- or the paper has no such author
-  ~~onedaylate    the last of them finished within 24 hours after the cutoff
-  ~~twodayslate   ... within the second 24 hours, and so on
+  ~~ontime          the paper is NoRevision, or every PC/reserve author had
+                    submitted every R1 review they hold within `--delay-days`
+                    24-hour windows of `--cutoff` (fewer than 4 days late by
+                    default: `~~threedayslate` was the last on-time day), or
+                    the paper has no such author
+  ~~revisiondelay   otherwise -- including a paper still waiting on an author
+                    who has not finished, since nothing is waited for any more
 
-  ~~delayedmissingreview
-                  provisional: an author still owes a review, so the paper's
-                  release is held but its day is not known yet
+**NoRevision papers are never delayed.** The revision decision is
+`scripts/revision_tags.py`'s, off the same `--reviews`, log, export and bar
+flags, so the two uploads cannot disagree about a paper.
 
 **Who.** A PC/reserve reviewer is anyone on the PC or reserve roster (HotCRP
 membership check on, so `~~ex-rr` promotions count) plus any address holding a
@@ -40,32 +44,28 @@ a date they finish no earlier than that date (11:00 at the cutoff's offset
 when no time is given). Each email in the file is matched against both address
 spaces, and one that matches nobody is a warning.
 
-**Several authors.** A paper waits for all of its PC/reserve authors. While
-any of them is unfinished and not exempt the paper is blocked and takes
-`~~delayedmissingreview` rather than a day; otherwise it takes the latest
-author's day.
+**Several authors.** A paper takes its latest author's day, and is blocked
+while any of them is unfinished and not exempt.
 
-**The day tags stick; the blocked tag does not.** A paper that already carries
-a day tag in the paper export (`--data`) is never re-tagged, so the upload only
-ever adds a day tag to a paper that has none. Because the day comes from log
-timestamps rather than from when this runs, a missed day catches up. A stale
-export can still hide a day tag an earlier upload wrote, and the day can have
-moved since -- an extension added between the two runs does exactly that -- so
-every `tag` row for a day is preceded by a `cleartag` of every *other* day tag.
-Against a current export those clears touch nothing; against a stale one they
-are what keeps a paper from carrying `~~twodayslate` and `~~ontime` at once.
-`~~delayedmissingreview` is the exception -- it is a placeholder for a day not
-yet known, so a paper carrying it is still decided, and every paper no longer
-blocked is `cleartag`ged whether or not the export shows the tag. Clearing a
-tag a paper does not have changes nothing, and doing it unconditionally is what
-keeps two runs against one stale export from leaving a paper carrying both.
+**Recomputed every run.** Nothing sticks: every paper is decided afresh from
+the log, and a paper whose export tag flips between the two buckets is listed
+on stderr. The upload clears the retired tags (`~~onedaylate`,
+`~~twodayslate`, ..., `~~delayedmissingreview`) from every paper with one
+`all,cleartag` row each, then clears each paper's opposite bucket, then tags.
+Clearing a tag a paper does not have changes nothing.
+
+**Unassignments.** `scripts/revision_tags.py` unassigns the outstanding R1
+reviews on papers decided NoRevision early. Removing a reviewer's outstanding
+reviews can finish them, and so change the papers they author; stdout lists
+every reviewer whose state those removals would change, and each authored
+paper's tag before and after. The tags themselves follow the log as it
+stands: once the unassignment is uploaded, the next export shows it.
 
 Writes `--upload` (`paper,action,email,tag,round`: every `cleartag` first,
-then one `tag` row per newly decided or newly held paper) and `--report`
-(every paper, its authors' states and any
-name-only matches). stdout gives the counts and the reviewers holding papers
-up. Offline and instant; nothing is uploaded. Both outputs name late
-reviewers, so they are gitignored with the other outputs.
+then one `tag` row per paper) and `--report` (every paper, its authors' states,
+its revision decision and any name-only matches). stdout gives the counts and
+the reviewers holding papers up. Offline and instant; nothing is uploaded. Both
+outputs name late reviewers, so they are gitignored with the other outputs.
 """
 
 from __future__ import annotations
@@ -80,7 +80,7 @@ import os
 import re
 import sys
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
 from reviewer_match import hotcrp_log
@@ -88,6 +88,7 @@ from reviewer_match import paper_matching
 from reviewer_match import pc_membership
 from reviewer_match import review_scores
 from reviewer_match.roster import load_roster
+from scripts import revision_tags
 from scripts.assign_paper_leads import write_csv
 
 DEFAULT_LOG = input_path("hpca2027-log.csv")
@@ -99,12 +100,15 @@ DEFAULT_REPORT = report_path("timeliness_papers.csv")
 DEFAULT_CUTOFF = "2026-09-22 11:00:00 -0400"
 # A review assigned on any later day exempts its reviewer.
 DEFAULT_EXEMPT_AFTER = "2026-09-13"
+# A paper whose authors finished this many 24-hour windows late, or later, is delayed.
+DEFAULT_DELAY_DAYS = 4
 
 TAG_PREFIX = "~~"
 ON_TIME = "ontime"
-# Provisional, and the one tag here that never sticks: it marks a paper blocked
-# by an author who still owes a review, and is cleared and replaced by a day tag
-# as soon as the day is known.
+DELAY_TAG = "revisiondelay"
+BUCKETS = (ON_TIME, DELAY_TAG)
+# Retired: the placeholder a paper carried while an author still owed a review.
+# Cleared from every paper, with the retired day tags.
 BLOCKED_TAG = "delayedmissingreview"
 NUMBER_WORDS = (
     "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
@@ -113,16 +117,16 @@ NUMBER_WORDS = (
 )
 TIMELINESS_RE = re.compile(r"^(ontime|onedaylate|\w+dayslate)$")
 
-# The two report statuses of a paper still waiting on one of its authors: it
-# takes the placeholder now, or already carries it.
-BLOCKED_STATUSES = ("blocked", "still blocked")
+# The report status of a delayed paper still waiting on one of its authors.
+# `scripts/timeliness_emails.py` drafts one email for each.
+BLOCKED_STATUSES = ("blocked",)
 
 UPLOAD_HEADER = ["paper", "action", "email", "tag", "round"]
 EXTENSION_HEADER = ["email", "status", "date", "note"]
 EXTENSION = "extension"
 LATE = "late"
 REPORT_FIELDS = [
-    "paper", "title", "existing_tag", "new_tag", "status",
+    "paper", "title", "revision", "existing_tag", "new_tag", "status",
     "reviewer_authors", "blocked_by", "name_only_matches",
 ]
 
@@ -141,14 +145,14 @@ def tier_tag(days: int) -> str:
 def is_day_tag(name: str) -> bool:
     """Whether a bare tag name (as `pc_membership.tag_names` gives it) states a day.
 
-    These are the tags that stick: once a paper has one, it is never re-tagged.
+    `ontime` is one of these and still in use; the rest are retired.
     """
     return bool(TIMELINESS_RE.match(name))
 
 
 def is_timeliness_tag(name: str) -> bool:
-    """Whether a bare tag name is one of ours -- a day tag or the blocked placeholder."""
-    return name == BLOCKED_TAG or is_day_tag(name)
+    """Whether a bare tag name is one of ours, current or retired."""
+    return name in (BLOCKED_TAG, DELAY_TAG) or is_day_tag(name)
 
 
 def days_late(completed_at: datetime | None, cutoff: datetime) -> int:
@@ -234,36 +238,44 @@ def existing_timeliness_tags(paper: dict) -> list[str]:
                   if is_timeliness_tag(t))
 
 
+def bucket(days: int | None, revision: str | None, delay_days: int) -> str:
+    """ON_TIME or DELAY_TAG for a paper `days` late (None: blocked) with this revision tag."""
+    if revision == revision_tags.NO_REVISION_TAG:
+        return ON_TIME
+    return DELAY_TAG if days is None or days >= delay_days else ON_TIME
+
+
 def decide(
     papers: list[dict],
     author_keys: dict[int, list[str]],
     states: dict[str, ReviewerState],
+    revision: dict[int, str | None] | None = None,
+    delay_days: int = DEFAULT_DELAY_DAYS,
 ) -> list[dict]:
-    """One report row per paper, in pid order; `new_tag` is set only for an upload row.
+    """One report row per paper, in pid order, each with its `new_tag`.
 
-    Only a day tag makes a paper already tagged: the blocked placeholder is a
-    stand-in for a day not yet known, so a paper carrying it is decided as soon
-    as its authors finish.
+    Without `revision` no paper counts as NoRevision.
     """
+    revision = revision or {}
     rows = []
     for paper in sorted(papers, key=lambda p: p["pid"]):
         pid = paper["pid"]
         authors = author_keys.get(pid, [])
-        existing = existing_timeliness_tags(paper)
         days, blockers = paper_days(authors, states)
-        if any(is_day_tag(t) for t in existing):
-            status, new_tag = "already tagged", ""
+        tag = bucket(days, revision.get(pid), delay_days)
+        if revision.get(pid) == revision_tags.NO_REVISION_TAG:
+            status = "no revision"
         elif days is None:
-            status, new_tag = ("still blocked", "") if BLOCKED_TAG in existing \
-                else ("blocked", TAG_PREFIX + BLOCKED_TAG)
+            status = "blocked"
         else:
-            status, new_tag = "tagged", TAG_PREFIX + tier_tag(days)
+            status = "late" if tag == DELAY_TAG else "on time"
         rows.append({
             "days": days,
             "paper": pid,
             "title": paper.get("title") or "",
-            "existing_tag": " ".join(TAG_PREFIX + t for t in existing),
-            "new_tag": new_tag,
+            "revision": revision.get(pid) or "",
+            "existing_tag": " ".join(TAG_PREFIX + t for t in existing_timeliness_tags(paper)),
+            "new_tag": TAG_PREFIX + tag,
             "status": status,
             "reviewer_authors": "; ".join(
                 f"{a}: {states[a].describe() if a in states else tier_tag(0) + ' (no R1 reviews)'}"
@@ -275,30 +287,39 @@ def decide(
     return rows
 
 
-def upload_rows(report: list[dict]) -> list[list[object]]:
-    """The HotCRP delta: clear the placeholder off every unblocked paper, then tag.
+def retired_tags(report: list[dict]) -> list[str]:
+    """Every retired tag an earlier run could have written, twiddled.
 
-    The clear is unconditional rather than driven by the export's tags, so a
-    second run against one stale paper export cannot leave a paper carrying both
-    the placeholder and its day. A paper already carrying a day tag is cleared
-    even if it is blocked again today: the day tag is the settled answer, and
-    nothing later would clear a placeholder left beside it.
-
-    A newly decided paper also has every other day tag cleared, in case an
-    earlier upload the export predates gave it a different day. Every spelled
-    tier is cleared, and numeric ones up to the latest day this run computes: an
-    earlier run cannot have computed a later one, since first submissions never
-    move.
+    The spelled day tags, numeric ones up to the latest day this run computes
+    (an earlier run cannot have computed a later one, since first submissions
+    never move), and the blocked placeholder.
     """
-    clears = [[r["paper"], "cleartag", "", TAG_PREFIX + BLOCKED_TAG, ""]
-              for r in report if r["status"] not in BLOCKED_STATUSES]
     max_days = max([len(NUMBER_WORDS)] + [r["days"] for r in report if r.get("days") is not None])
-    day_tags = [TAG_PREFIX + tier_tag(d) for d in range(max_days + 1)]
-    clears += [[r["paper"], "cleartag", "", t, ""]
-               for r in report if r["status"] == "tagged"
-               for t in day_tags if t != r["new_tag"]]
-    tags = [[r["paper"], "tag", "", r["new_tag"], ""] for r in report if r["new_tag"]]
+    return [TAG_PREFIX + tier_tag(d) for d in range(1, max_days + 1)] + [TAG_PREFIX + BLOCKED_TAG]
+
+
+def upload_rows(report: list[dict]) -> list[list[object]]:
+    """The HotCRP delta: clear the retired tags everywhere, clear each paper's
+    opposite bucket, then tag every paper.
+
+    The retired tags go in one `all,cleartag` row each rather than one per
+    paper, the `generate_clear_uploads.py` shape.
+    """
+    clears: list[list[object]] = [["all", "cleartag", "", t, ""] for t in retired_tags(report)]
+    clears += [[r["paper"], "cleartag", "", TAG_PREFIX + other, ""]
+               for r in report for other in BUCKETS if TAG_PREFIX + other != r["new_tag"]]
+    tags = [[r["paper"], "tag", "", r["new_tag"], ""] for r in report]
     return clears + tags
+
+
+def flips(report: list[dict]) -> list[tuple[int, str, str]]:
+    """[(pid, bucket the export shows, new bucket)] where the two differ."""
+    out = []
+    for r in report:
+        shown = [t for t in r["existing_tag"].split() if t.lstrip("~") in BUCKETS]
+        if len(shown) == 1 and shown[0] != r["new_tag"]:
+            out.append((r["paper"], shown[0], r["new_tag"]))
+    return out
 
 
 def parse_override_date(value: str, cutoff: datetime) -> datetime | None:
@@ -365,6 +386,12 @@ class Evaluation:
     name_only: dict[int, list[str]]            # pid -> name-but-not-email matches
     cutoff: datetime
     exempt_after: date
+    # What `reviewer_status` was computed from, so a caller can recompute one
+    # reviewer with some of their reviews taken away (`unassign_effects`).
+    by_reviewer: dict[str, list[tuple[int, hotcrp_log.Review]]] = field(default_factory=dict)
+    submitted: set[int] = field(default_factory=set)
+    first_submit: dict[int, str] = field(default_factory=dict)
+    overrides: dict[str, tuple[str, datetime | None]] = field(default_factory=dict)
 
 
 def evaluate(
@@ -377,8 +404,14 @@ def evaluate(
     extensions: dict[str, tuple[str, datetime | None]],
     extensions_path: str,
     pcinfo: str | None,
+    revision: dict[int, str | None] | None = None,
+    delay_days: int = DEFAULT_DELAY_DAYS,
 ) -> Evaluation:
-    """Replay the log against the rosters and decide every eligible paper."""
+    """Replay the log against the rosters and decide every eligible paper.
+
+    `revision` is `revision_tags.decide`'s {pid: tag}; without it no paper is
+    spared as NoRevision.
+    """
     rows = hotcrp_log.load_log(log)
     live, _ = hotcrp_log.replay_assignments(rows)
     submitted = hotcrp_log.submitted_review_ids(rows)
@@ -444,7 +477,7 @@ def evaluate(
         author_source[paper["pid"]] = source
         name_only[paper["pid"]] = [c for c in candidates if c.split(" ~ ")[1] not in matched]
 
-    report = decide(papers, author_keys, states)
+    report = decide(papers, author_keys, states, revision, delay_days)
     for row in report:
         row["name_only_matches"] = "; ".join(name_only[row["paper"]])
     return Evaluation(
@@ -457,7 +490,47 @@ def evaluate(
         name_only=name_only,
         cutoff=cutoff,
         exempt_after=exempt_after,
+        by_reviewer=dict(by_reviewer),
+        submitted=submitted,
+        first_submit=first_submit,
+        overrides=overrides,
     )
+
+
+def unassign_effects(
+    ev: Evaluation,
+    pairs: list[tuple[int, str]],
+    revision: dict[int, str | None],
+    delay_days: int,
+) -> list[tuple[str, ReviewerState, ReviewerState, list[tuple[int, str, str]]]]:
+    """[(reviewer, state now, state without the `pairs` reviews, [(pid, tag now, tag after)])].
+
+    Only reviewers whose day changes are listed; their authored papers are
+    re-bucketed with every affected author's new state at once.
+    """
+    removed: dict[str, set[int]] = defaultdict(set)
+    for pid, email in pairs:
+        removed[email].add(pid)
+    after = dict(ev.states)
+    changed = []
+    for key in sorted(removed):
+        if key not in ev.states:
+            continue
+        kept = [(rid, r) for rid, r in ev.by_reviewer.get(key, []) if r.pid not in removed[key]]
+        state = reviewer_status(kept, ev.submitted, ev.first_submit, cutoff=ev.cutoff,
+                                exempt_after=ev.exempt_after, override=ev.overrides.get(key))
+        if state.days != ev.states[key].days:
+            after[key] = state
+            changed.append(key)
+    out = []
+    for key in changed:
+        papers = []
+        for pid in sorted(p for p, keys in ev.author_keys.items() if key in keys):
+            before = bucket(paper_days(ev.author_keys[pid], ev.states)[0], revision.get(pid), delay_days)
+            now = bucket(paper_days(ev.author_keys[pid], after)[0], revision.get(pid), delay_days)
+            papers.append((pid, TAG_PREFIX + before, TAG_PREFIX + now))
+        out.append((key, ev.states[key], after[key], papers))
+    return out
 
 
 def add_common_arguments(parser: argparse.ArgumentParser) -> None:
@@ -477,7 +550,8 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
                         help="skip the HotCRP PC-membership check when loading the rosters")
 
 
-def evaluate_from_args(args) -> Evaluation:
+def evaluate_from_args(args, revision: dict[int, str | None] | None = None,
+                       delay_days: int = DEFAULT_DELAY_DAYS) -> Evaluation:
     """`evaluate()` off a parsed `add_common_arguments` namespace.
 
     Raises ValueError for a bad flag and FileNotFoundError for a missing input,
@@ -493,6 +567,7 @@ def evaluate_from_args(args) -> Evaluation:
         log=args.log, data=args.data, exclude_pids=args.exclude_pids, cutoff=cutoff,
         exempt_after=exempt_after, extensions=extensions, extensions_path=args.extensions,
         pcinfo=None if args.no_pc_check else args.pcinfo,
+        revision=revision, delay_days=delay_days,
     )
 
 
@@ -501,12 +576,21 @@ def main() -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     add_common_arguments(parser)
+    parser.add_argument("--reviews", default=revision_tags.DEFAULT_REVIEWS,
+                        help="HotCRP review CSV export (for the revision decision)")
+    review_scores.add_bar_arguments(parser)
+    parser.add_argument("--delay-days", type=int, default=DEFAULT_DELAY_DAYS,
+                        help="a paper this many 24-hour windows late, or blocked, is delayed "
+                             f"(default {DEFAULT_DELAY_DAYS})")
     parser.add_argument("--upload", default=DEFAULT_UPLOAD, help="HotCRP bulk-assignment file to write")
     parser.add_argument("--report", default=DEFAULT_REPORT, help="per-paper report to write")
     args = parser.parse_args()
 
     try:
-        ev = evaluate_from_args(args)
+        if not os.path.exists(args.reviews):
+            raise FileNotFoundError(f"{args.reviews} not found")
+        decided = revision_tags.load_inputs(args)
+        ev = evaluate_from_args(args, decided.decisions, args.delay_days)
     except (ValueError, FileNotFoundError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
@@ -518,39 +602,43 @@ def main() -> int:
     print(f"Wrote {args.upload}\nWrote {args.report}", file=sys.stderr)
 
     status_counts = Counter(r["status"] for r in report)
-    tag_counts = Counter(r["new_tag"] for r in report if r["new_tag"])
-    print(f"Cutoff {first_submit_label(cutoff)}; exempt if assigned an R1 review after {exempt_after}.")
-    print(f"{len(report)} papers: {status_counts['tagged']} newly tagged with a day, "
-          f"{status_counts['already tagged']} already carrying one, "
-          f"{status_counts['blocked']} newly blocked, "
-          f"{status_counts['still blocked']} blocked already.")
-    # ~~ontime first, then the days in order, then the placeholder: it is not a verdict.
-    def tag_order(kv):
-        return kv[0] == TAG_PREFIX + BLOCKED_TAG, kv[0] != TAG_PREFIX + ON_TIME, kv[0]
-    for tag, n in sorted(tag_counts.items(), key=tag_order):
-        print(f"  {tag:24s} {n}")
-    no_author = sum(1 for r in report if not author_keys[r["paper"]] and r["status"] == "tagged")
-    print(f"  ({no_author} of the new day tags are papers with no PC/reserve author)")
+    tag_counts = Counter(r["new_tag"] for r in report)
+    print(f"Cutoff {first_submit_label(cutoff)}; exempt if assigned an R1 review after {exempt_after}; "
+          f"delayed from {tier_tag(args.delay_days)}.")
+    print(f"{len(report)} papers: {tag_counts[TAG_PREFIX + ON_TIME]} {TAG_PREFIX + ON_TIME}, "
+          f"{tag_counts[TAG_PREFIX + DELAY_TAG]} {TAG_PREFIX + DELAY_TAG} "
+          f"({status_counts['late']} late, {status_counts['blocked']} blocked on an unfinished author).")
+    spared = sum(1 for r in report if r["status"] == "no revision"
+                 and bucket(r["days"], None, args.delay_days) == DELAY_TAG)
+    no_author = sum(1 for r in report if not author_keys[r["paper"]])
+    print(f"  {spared} late or blocked paper(s) are {revision_tags.NO_REVISION_TAG} and so on time; "
+          f"{no_author} paper(s) have no PC/reserve author.")
 
     held_up: Counter = Counter()
     for row in report:
         if row["status"] in BLOCKED_STATUSES:
             held_up.update(row["blocked_by"].split("; "))
     if held_up:
-        print(f"\n{len(held_up)} reviewer(s) holding papers up:")
+        print(f"\n{len(held_up)} reviewer(s) still unfinished, delaying papers they author:")
         print(f"# outstanding  papers  reviewer")
         for key in sorted(held_up, key=lambda k: (-states[k].outstanding, -held_up[k], k)):
             s = states[key]
             print(f"{s.outstanding:>6}/{s.held:<6} {held_up[key]:>6}  {key}"
                   + ("  (marked late)" if s.reason == "marked late" else ""))
 
-    # Only day tags conflict; a day tag beside the placeholder is the stale
-    # case this run clears, not a contradiction.
-    multi = [r["paper"] for r in report
-             if sum(is_day_tag(t.lstrip(TAG_PREFIX)) for t in r["existing_tag"].split()) > 1]
-    if multi:
-        print(f"\nwarning: {len(multi)} paper(s) carry more than one day tag: "
-              f"{', '.join(map(str, multi))}", file=sys.stderr)
+    effects = unassign_effects(ev, decided.pairs, decided.decisions, args.delay_days)
+    print(f"\nUnassigning {len(decided.pairs)} outstanding review(s) on early "
+          f"{revision_tags.NO_REVISION_TAG} papers changes {len(effects)} reviewer(s)' late status"
+          + (":" if effects else "."))
+    for key, before, after, papers in effects:
+        print(f"  {key}: {before.describe()} -> {after.describe()}")
+        for pid, old, new in papers:
+            print(f"    authors #{pid}: {old}" + (f" -> {new}" if new != old else " (unchanged)"))
+
+    flipped = flips(report)
+    if flipped:
+        print(f"\nwarning: {len(flipped)} paper(s) change bucket against the export: "
+              + ", ".join(f"#{pid} {old}->{new}" for pid, old, new in flipped), file=sys.stderr)
     n_name_only = sum(1 for r in report if r["name_only_matches"])
     if n_name_only:
         print(f"note: {n_name_only} paper(s) have an author matching a reviewer by name but not email; "

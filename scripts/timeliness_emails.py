@@ -14,9 +14,10 @@ split and sent by hand. **Nothing is sent and no mail is configured.** The
 same `timeliness_tags.evaluate()` decides which papers are held and who is
 holding them, so the emails and the tags can never name different people.
 
-**Which papers.** Exactly the ones `timeliness_tags` reports `blocked` or
-`still blocked`. A paper already carrying a day tag, or with no committee
-author, is never written.
+**Which papers.** Exactly the ones `timeliness_tags` reports `blocked`: an
+author still owes a review. A paper with no committee author is never written.
+This script does not pass the revision decision, so a NoRevision paper, which
+`timeliness_tags` never delays, is still drafted when it is blocked.
 
 **Who it goes to.** Every address in the paper's `authors` and `contacts`
 lists, deduped, authors first -- the contact list is where the submitting
