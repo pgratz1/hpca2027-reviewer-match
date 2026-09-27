@@ -19,9 +19,11 @@
 #   make paper-leads      random, load-balanced leads for papers that advance
 #   make revision-tags    RevisionAdvance / NoRevision tags for decided papers
 #   make timeliness-tags  ~~ontime / ~~onedaylate / ... by authors' own reviews
+#   make daily            revision-tags + timeliness-tags + paper-leads on fresh exports
 #   make timeliness-emails  draft author emails for papers held by a late author
 #   make timeliness-apologies  corrections for emailed papers no longer held
 #   make extra-reviewers  shortlist finished PC members to ask for one more review
+#   make review-quality   on-time vs late reviews: AI self-report, detail, score bias
 #   make clean            remove assignment outputs only
 #   make clean-fingerprints  remove embedding caches, never DBLP caches
 
@@ -213,7 +215,7 @@ ASSIGN_DEPS = scripts/assign_reviewers.py src/reviewer_match/paper_matching.py \
 	complete-papers area-chairs-complete clear-uploads baselines clean clean-fingerprints \
 	log-assignments reviewer-activity rerun targeted-rerun swap-candidates swap-upload fill-slots \
 	revision-cutoffs paper-leads revision-tags timeliness-tags timeliness-emails \
-	timeliness-apologies extra-reviewers
+	timeliness-apologies extra-reviewers review-quality daily check-exports
 
 all: $(SENIORITY) enrich $(FINGERPRINTS)
 	$(RUN) scripts.build_fingerprints --csv "$(CSV)" --fingerprint-cache $(FINGERPRINTS)
@@ -664,6 +666,33 @@ timeliness-tags: scripts/timeliness_tags.py src/reviewer_match/hotcrp_log.py src
 	$(RUN) scripts.timeliness_tags --log $(LOG) --data $(DATA) --cutoff "$(ONTIME_CUTOFF)" \
 		--exempt-after $(EXEMPT_AFTER) --extensions "$(EXTENSIONS)" $(PC_CHECK) $(EXCLUDE_FLAG)
 
+# Everything a fresh set of HotCRP exports should regenerate, in one run: the
+# revision tags, the timeliness tags and the discussion leads. Each is a delta
+# against what the exports say HotCRP holds, so this is safe to rerun, but only
+# on exports downloaded after the last upload -- the leads download above all.
+# check-exports runs first and warns (never copies) when DOWNLOADS holds a newer
+# hpca2027-* export than INPUT_DIR. Nothing is uploaded.
+DOWNLOADS ?= $(HOME)/Downloads
+DAILY_UPLOADS = $(ASSIGNMENT_DIR)/revision_tags_upload.csv \
+	$(ASSIGNMENT_DIR)/timeliness_tags_upload.csv $(ASSIGNMENT_DIR)/lead_upload.csv
+daily: check-exports
+	$(MAKE) --no-print-directory revision-tags
+	$(MAKE) --no-print-directory timeliness-tags
+	$(MAKE) --no-print-directory paper-leads
+	@echo; echo "Upload through HotCRP bulk assignment, previewing each:"; \
+	for f in $(DAILY_UPLOADS); do echo "  $$f"; done; \
+	echo "Then re-download the discussion leads before the next run."
+
+check-exports:
+	@for f in $(REVIEWS) $(LOG) $(DATA) $(PCASSIGNMENTS) $(LEADS) $(PCINFO); do \
+	  test -f $$f || { echo "ERROR: $$f not found; download it from HotCRP" >&2; exit 1; }; \
+	  printf '  %-45s %s\n' "$$f" "$$(date -r $$f '+%b %d %H:%M')" >&2; \
+	  d="$(DOWNLOADS)/$$(basename $$f)"; \
+	  if [ -f "$$d" ] && [ "$$d" -nt "$$f" ]; then \
+	    echo "WARNING: $$d is newer ($$(date -r "$$d" '+%b %d %H:%M')); copy it into $(INPUT_DIR)?" >&2; \
+	  fi; \
+	done
+
 # One drafted email per paper held by ~~delayedmissingreview, addressed to that
 # paper's authors and contacts, naming the committee author whose reviews are
 # outstanding. Decided by the same timeliness_tags.evaluate() as the tags, so the
@@ -714,6 +743,28 @@ extra-reviewers: scripts/extra_reviewer_candidates.py
 	done
 	$(RUN) scripts.extra_reviewer_candidates --pids $(EXTRA_PIDS) --completed-by "$(COMPLETED_BY)" \
 		--shortlist $(EXTRA_SHORTLIST) --log $(LOG) --data $(DATA) $(REGION_FLAG) $(JUNIOR_FLAG) $(EXCLUDE_FLAG)
+
+# Are reviews first submitted after ONTIME_CUTOFF worse than those before it?
+# Groups (early / grace / late / exempt), then three axes compared by cluster
+# bootstrap over reviewers and within reviewer: AI signals (the form's LLM
+# answer, marker words, style), detail
+# (length, questions, specific references, drafting effort from the log, SPECTER2
+# paper-specificity), and bias (merit residual against the paper's other
+# reviews). Group totals only; the per-review CSV stays local. SPECTER2 runs on
+# the local GPU -- review text never leaves the machine. Text-based AI detection
+# (--binoculars) is experimental and off: it scored two known frontier-model
+# reviews as human. REVIEW_QUALITY_FLAGS= (empty) runs the instant, GPU-free
+# subset. Nothing is uploaded.
+ANNOUNCED_REVIEW_DEADLINE ?= 2026-09-21 08:00:00 -0400
+REVIEW_QUALITY_FLAGS ?= --genericness --sensitivity
+review-quality: scripts/review_quality.py scripts/timeliness_tags.py src/reviewer_match/hotcrp_log.py
+	@for f in $(REVIEWS) $(LOG) $(DATA); do \
+	  test -f $$f || { echo "ERROR: $$f not found; download it from HotCRP" >&2; exit 1; }; \
+	done
+	$(RUN) scripts.review_quality --reviews $(REVIEWS) --log $(LOG) --data $(DATA) \
+		--cutoff "$(ONTIME_CUTOFF)" --announced "$(ANNOUNCED_REVIEW_DEADLINE)" \
+		--exempt-after $(EXEMPT_AFTER) --extensions "$(EXTENSIONS)" --paper-cache $(PAPER_FINGERPRINTS) \
+		$(PC_CHECK) $(EXCLUDE_FLAG) $(REVIEW_QUALITY_FLAGS)
 
 clean:
 	rm -f $(ASSIGNMENT) $(ASSIGNMENT_CSV) $(AREA_CHAIR_ASSIGNMENT) \

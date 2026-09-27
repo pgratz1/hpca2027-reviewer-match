@@ -66,6 +66,7 @@ from scripts import generate_swap_upload
 from scripts import revision_cutoffs
 from scripts import assign_paper_leads
 from scripts import revision_tags
+from scripts import review_quality
 from scripts import timeliness_emails
 from scripts import timeliness_tags
 from reviewer_match import review_scores
@@ -7367,12 +7368,33 @@ class TimelinessTagTests(unittest.TestCase):
         self.assertEqual(["", "~~onedaylate", "~~delayedmissingreview", ""],
                          [r["new_tag"] for r in report])
         # 4 is cleared although it is blocked today: nothing later would clear it.
+        rows = timeliness_tags.upload_rows(report)
         self.assertEqual([
             [2, "cleartag", "", "~~delayedmissingreview", ""],
             [4, "cleartag", "", "~~delayedmissingreview", ""],
+        ], rows[:2])
+        self.assertEqual([
             [2, "tag", "", "~~onedaylate", ""],
             [3, "tag", "", "~~delayedmissingreview", ""],
-        ], timeliness_tags.upload_rows(report))
+        ], rows[-2:])
+        # Only the newly decided paper has other day tags cleared, never its own.
+        day_clears = rows[2:-2]
+        self.assertEqual({2}, {r[0] for r in day_clears})
+        self.assertNotIn("~~onedaylate", {r[3] for r in day_clears})
+
+    def test_a_new_day_clears_a_different_day_a_stale_export_hides(self):
+        # Run 1 uploaded ~~twodayslate; an extension then made the paper on time,
+        # and run 2, against the same export, must not leave both tags on it.
+        State = timeliness_tags.ReviewerState
+        report = timeliness_tags.decide(
+            [{"pid": 1005, "title": "", "tags": ["~~delayedmissingreview"]}],
+            {1005: ["a"]}, {"a": State(1, 0, None, 0, "extension")})
+        rows = timeliness_tags.upload_rows(report)
+        self.assertIn([1005, "cleartag", "", "~~twodayslate", ""], rows)
+        self.assertIn([1005, "cleartag", "", "~~twentydayslate", ""], rows)
+        self.assertNotIn([1005, "cleartag", "", "~~ontime", ""], rows)
+        self.assertEqual([1005, "tag", "", "~~ontime", ""], rows[-1])
+        self.assertTrue(all(r[1] == "cleartag" for r in rows[:-1]))
 
     def test_days_are_24_hour_windows_from_the_cutoff(self):
         at = hotcrp_log.parse_date
@@ -7457,10 +7479,18 @@ class TimelinessTagTests(unittest.TestCase):
             ["1", "cleartag", "", "~~delayedmissingreview", ""],
             ["2", "cleartag", "", "~~delayedmissingreview", ""],
             ["3", "cleartag", "", "~~delayedmissingreview", ""],
+        ], rows[1:4])
+        self.assertEqual([
             ["1", "tag", "", "~~onedaylate", ""],
             ["2", "tag", "", "~~ontime", ""],
             ["4", "tag", "", "~~delayedmissingreview", ""],
-        ], rows[1:])
+        ], rows[-3:])
+        # The newly decided papers, and only they, have their other day tags cleared.
+        day_clears = rows[4:-3]
+        self.assertEqual({"1", "2"}, {r[0] for r in day_clears})
+        self.assertTrue(all(r[1] == "cleartag" for r in day_clears))
+        self.assertNotIn(["1", "cleartag", "", "~~onedaylate", ""], day_clears)
+        self.assertNotIn(["2", "cleartag", "", "~~ontime", ""], day_clears)
         self.assertEqual(timeliness_tags.EXTENSION_HEADER,
                          next(csv.reader(open(tmp / "ext.csv", encoding="utf-8"))))
 
@@ -7695,6 +7725,87 @@ class ExtraReviewerCandidateTests(unittest.TestCase):
         # A paper with nobody left goes without rather than repeating a person.
         self.assertEqual({1: "a"}, extra_reviewer_candidates.suggest({1: [("a", 0.9)], 2: [("a", 0.8)]}))
         self.assertEqual({}, extra_reviewer_candidates.suggest({1: []}))
+
+
+class ReviewQualityTests(unittest.TestCase):
+    """Groups, residuals and the log/text measures behind `make review-quality`."""
+
+    CUTOFF = hotcrp_log.parse_date("2026-09-22 11:00:00 -0400")
+    ANNOUNCED = hotcrp_log.parse_date("2026-09-21 08:00:00 -0400")
+    ASSIGNED = hotcrp_log.parse_date("2026-08-20 09:00:00 -0400")
+
+    def group(self, when, assigned=None, extension=False):
+        import datetime as dt
+        return review_quality.review_group(
+            hotcrp_log.parse_date(when), assigned or self.ASSIGNED, extension,
+            announced=self.ANNOUNCED, cutoff=self.CUTOFF, exempt_after=dt.date(2026, 9, 13))
+
+    def test_group_boundaries(self):
+        self.assertEqual(("early", 0), self.group("2026-09-21 08:00:00 -0400"))
+        self.assertEqual(("grace", 0), self.group("2026-09-21 08:00:01 -0400"))
+        # Exactly at the cutoff is on time, as the tags have it.
+        self.assertEqual(("grace", 0), self.group("2026-09-22 11:00:00 -0400"))
+        self.assertEqual(("late", 1), self.group("2026-09-22 11:00:01 -0400"))
+        self.assertEqual(("late", 2), self.group("2026-09-23 11:00:01 -0400"))
+        # Offsets are compared as instants, never as strings.
+        self.assertEqual(("grace", 0), self.group("2026-09-22 10:00:00 -0500"))
+
+    def test_exempt_beats_every_time(self):
+        late = "2026-09-25 09:00:00 -0400"
+        self.assertEqual(("exempt", 0), self.group(late, extension=True))
+        self.assertEqual(("exempt", 0), self.group(late, hotcrp_log.parse_date("2026-09-14 00:00:00 -0400")))
+        # Assigned on the exempt-after day itself is not exempt.
+        self.assertEqual("late", self.group(late, hotcrp_log.parse_date("2026-09-13 23:00:00 -0400"))[0])
+
+    def test_leave_one_out_residual(self):
+        out = review_quality.loo_residuals({1: [("1A", 1), ("1B", 3), ("1C", 2)], 2: [("2A", 4)]})
+        self.assertEqual({"1A": -1.5, "1B": 1.5, "1C": 0.0}, out)
+
+    def test_review_history_from_log(self):
+        rows = [
+            {"date": "2026-09-01 10:00:00 -0400", "action": "Review 7 assigned: primary, round R1"},
+            {"date": "2026-09-02 10:00:00 -0400", "action": "Review 7 edited, updated draft: PapSum, 100 words"},
+            {"date": "2026-09-03 10:00:00 -0400", "action": "Review 7 edited, updated draft: Wea, 400 words"},
+            {"date": "2026-09-04 10:00:00 -0400", "action": "Review 7 edited, submitted: ComAut, 500 words"},
+            {"date": "2026-09-05 10:00:00 -0400", "action": "Review 7 edited, updated: ComAut, 900 words"},
+            {"date": "2026-09-06 10:00:00 -0400", "action": "Review 8 submitted: 1337 words"},
+        ]
+        h = review_quality.review_histories(rows)
+        m = review_quality.history_measures(h[7])
+        # The first submission's count, not the later edit's.
+        self.assertEqual(500, m["words_at_submit"])
+        self.assertEqual(2, m["draft_saves"])
+        self.assertEqual(48.0, m["draft_hours"])
+        self.assertAlmostEqual(300 / 500, m["largest_save_share"])
+        self.assertEqual(1, m["edited_after_submit"])
+        m8 = review_quality.history_measures(h[8])
+        self.assertEqual((1337, 0, 0.0, 1.0, 0),
+                         (m8["words_at_submit"], m8["draft_saves"], m8["draft_hours"],
+                          m8["largest_save_share"], m8["edited_after_submit"]))
+
+    def test_text_measures(self):
+        m = review_quality.text_measures({
+            "Paper summary": "The authors meticulously delve into caches \u2014 a commendable effort.",
+            "Strengths": "Fast.",
+            "Weaknesses": "- Fig. 7 contradicts Section 4.\n- Only 6 benchmarks, 12% gain.\n",
+            "Questions for revision/rebuttal": "Why? What about area?",
+        })
+        self.assertEqual(3, round(m["markers_per_1000"] * m["words"] / 1000))
+        self.assertEqual(2, m["weakness_items"])
+        self.assertEqual(2, m["n_questions"])
+        self.assertEqual(2, round(m["refs_per_100"] * m["words"] / 100))
+        self.assertGreater(m["em_dashes_per_1000"], 0)
+        # Common words of the field are not markers.
+        self.assertEqual(0, review_quality.text_measures(
+            {"Strengths": "Overall a novel, robust and comprehensive design."})["markers_per_1000"])
+
+    def test_within_reviewer_diffs_skip_exempt(self):
+        import datetime as dt
+        t = dt.datetime(2026, 9, 20, tzinfo=dt.timezone.utc)
+        mk = lambda key, email, group, v: review_quality.Review(key, 1, email, group, 0, t, {"words": v})
+        reviews = [mk("1A", "a", "early", 100), mk("2A", "a", "late", 40), mk("3A", "a", "exempt", 0),
+                   mk("1B", "b", "early", 10)]
+        self.assertEqual([-60.0], review_quality.within_diffs(reviews, "words"))
 
 
 if __name__ == "__main__":

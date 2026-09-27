@@ -1743,6 +1743,31 @@ Workflow:
    the log, for your own conflicts) is how the next run learns which leads to
    keep.
 
+### `make daily` — regenerate every upload a fresh export affects
+
+`make daily` runs `make revision-tags`, `make timeliness-tags` and `make
+paper-leads` in that order, then lists the three upload files. Each one is a
+delta against what the exports say HotCRP holds, so a rerun is safe. That only
+holds if the exports postdate your last upload, and the **discussion-leads**
+download matters most.
+
+It starts with `make check-exports`, which prints the modification time of each
+input export. It also warns when `DOWNLOADS` (default `~/Downloads`) holds a
+newer `hpca2027-*` file of the same name than `data/inputs/`. It only warns and
+never copies anything in: which export is current is your call.
+
+Each time you get new data:
+
+1. Download the reviews, log, paper JSON, PC-assignments and discussion-leads
+   exports into `data/inputs/`.
+2. Run `make daily` and read each summary. A `WARNING` line from
+   `check-exports` means a newer download was left in `DOWNLOADS`.
+3. Upload `revision_tags_upload.csv`, `timeliness_tags_upload.csv` and
+   `lead_upload.csv` through HotCRP's bulk assignment, previewing each one.
+
+Variables such as `LEAD_FLAGS` and `EXTENSIONS` pass through to all three
+steps. Offline, instant, and nothing is uploaded.
+
 ### `scripts/revision_tags.py` — tag the papers the bar has decided
 
 `make revision-tags` writes `outputs/assignments/revision_tags_upload.csv`,
@@ -1906,6 +1931,102 @@ stderr gives the pool size and how many candidates each rule skipped. stdout
 gives each paper's slate and its shortlist, and
 `outputs/reports/extra_reviewer_candidates.csv` has the same rows. Offline, no
 GPU, deterministic. Once someone accepts, add the review in HotCRP.
+
+### `scripts/review_quality.py` — are late reviews worse?
+
+`make review-quality` asks whether reviews **first submitted** after
+`ONTIME_CUTOFF` differ from those submitted before it. It measures three
+things, and it reports **group statistics only**, never a verdict on one
+review.
+
+**Groups.** Each review goes into one of four groups:
+- **early**: submitted by `ANNOUNCED_REVIEW_DEADLINE`, the deadline the
+  committee was told (Mon 2026-09-21 08:00).
+- **grace**: submitted after that, up to `ONTIME_CUTOFF`.
+- **late**: submitted after `ONTIME_CUTOFF`, and also split by day.
+- **exempt**: an R1 review assigned after `EXEMPT_AFTER`, or any review by a
+  reviewer with an `extension` row in `review_extensions.csv`. These reviewers
+  had less time by design, so they are kept out of the late group.
+
+On time means early plus grace. TRC reviews and papers no longer under review
+are left out. Exemption and extensions come from the same
+`timeliness_tags.evaluate()` the tags use.
+
+**AI signals.**
+- **The form's LLM answer.** 2 means "I did not use any AI/LLM tools". 1 means
+  "I confirm the above", i.e. any use stayed within policy. People who used no
+  AI tick 1 too, so the rate of 1 is an upper bound on use, not a measurement
+  of it.
+- **Marker words and style.** The rate of words LLMs overuse (`MARKER_WORDS`,
+  after Liang et al. 2024), plus em-dashes and bold headings.
+
+**None of these detects AI-written text, so the report makes no AI-likelihood
+claim beyond self-report.** The chair supplied two reviews known to be written
+entirely by frontier models:
+- neither contains a single marker word, and their style is unremarkable;
+- the Binoculars detector (Hans et al. 2024) scored both as human, at or above
+  the median real review. That held for AllenAI's OLMo-2 1B pair and, in a
+  4-bit pilot, for Falcon-7B.
+
+Binoculars therefore stays in the script as an **experimental, off-by-default**
+`--binoculars` flag:
+- It uses the OLMo-2 1B pair, whose weights were deleted and re-download on
+  first use.
+- `--reference-size` has the instruct model polish that many early reviews
+  (default 100) as an LLM reference.
+- A larger CPU-only pair (13–32B, via llama.cpp) was sized and set aside:
+  roughly 2–5 hours for a pilot, and days for a full run.
+
+**No Chinese-origin model may be used** (university policy).
+
+**Detail.**
+- Words in the current text, and words at first submission. The latter comes
+  from the log, which records a running word count on every save.
+- Words per field, rebuttal questions and weakness items.
+- References to figures, tables and sections, and numbers, per 100 words.
+- Drafting effort from the log: draft saves, and hours from first draft to
+  submission.
+- Paper-specificity (`--genericness`): how much closer the review's SPECTER2
+  embedding is to its own paper than to the average paper.
+
+**Bias.**
+- Merit, Soundness and Novelty.
+- **The merit residual**, which is merit minus the mean of the paper's other
+  reviews. This takes paper quality out, and it is the headline number.
+- The absolute residual, as a measure of disagreement.
+- The Strengths share of Strengths + Weaknesses words.
+
+**Statistics.** Intervals come from a cluster bootstrap over reviewers, because
+one person's reviews are not independent. Three contrasts are reported for
+each metric:
+- late minus on time, across everyone;
+- the same within the reviewers who have both, with a sign-flip permutation p.
+  This one holds style, first language and seniority fixed, so it is the one
+  to trust;
+- each reviewer's last-submitted review minus their others, whatever the
+  deadline.
+
+With `--sensitivity`, the first contrast is repeated without reviews edited
+after first submission.
+
+**Outputs.**
+- `outputs/reports/review_quality.pdf`: group tables, printed by headless
+  Chrome (`--chrome`, default `google-chrome`).
+- `outputs/reports/review_quality_reviews.csv`: one row per review, for the
+  chair only.
+- stdout: the tables.
+
+Both files are gitignored by name. Under `--binoculars`, scores are cached in
+`data/cache/review_ai_scores.json`, keyed on a hash of the text and the model
+names.
+
+**Running it.**
+- Review text is confidential. Every model runs on the local GPU, and nothing
+  is sent anywhere.
+- The default run (SPECTER2 paper-specificity plus the unedited sensitivity
+  check) takes about a minute.
+- `make review-quality REVIEW_QUALITY_FLAGS=` runs the instant, GPU-free
+  subset.
 
 ## Publication exclusions
 

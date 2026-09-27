@@ -266,9 +266,19 @@ contains spaces and parentheses — always quote it in shell commands).
   `hpca2027-data.json` is never re-tagged, but one carrying only the placeholder
   is still decided, and every paper no longer blocked gets a `cleartag` of it
   **unconditionally** — driving that off the export's `tags` instead would let
-  two runs against one stale export leave a paper carrying both. Clears first,
+  two runs against one stale export leave a paper carrying both. For the same
+  reason every newly written day tag is preceded by a `cleartag` of every
+  *other* day tag: a stale export hides a day an earlier upload wrote, and an
+  extension added in between changes the day. Without these clears, 1005 ended
+  up with both `~~twodayslate` and `~~ontime`. Clears first,
   then tags, the `revision-tags` shape. Run it daily on fresh exports. Offline,
   instant.
+- **`make daily`** is what to run on every fresh set of exports: `revision-tags`,
+  `timeliness-tags` and `paper-leads` in that order, each via a recursive make so
+  their flags pass through unchanged. It first runs `check-exports`, which stamps
+  each input's mtime and **warns, never copies**, when `DOWNLOADS`
+  (`~/Downloads`) holds a newer `hpca2027-*` file of the same name. Otherwise a
+  forgotten copy silently regenerates against stale data. Nothing is uploaded.
 - **`make timeliness-emails`** drafts one email per paper carrying
   `~~delayedmissingreview` into `outputs/reports/timeliness_emails.txt`, for the
   chair to split and send by hand — **nothing is sent, no mail is configured**.
@@ -298,6 +308,27 @@ contains spaces and parentheses — always quote it in shell commands).
   not**, since everyone listed has met theirs. Anyone ever assigned on the paper
   (TRC included, or since unassigned) is barred. Offline, read-only, nothing
   uploaded.
+- **`make review-quality`** compares reviews first submitted before and after
+  `ONTIME_CUTOFF` on three axes:
+  - **AI signals:** the form's LLM answer (2 = "did not use any", 1 = "use
+    within policy", an upper bound on use), marker words and style. **None of
+    these detects AI text.** Two known frontier-model reviews had no marker
+    words, and Binoculars (OLMo-2 1B, and Falcon-7B 4-bit) scored both as
+    human. So `--binoculars` is experimental and off in `make`, and its model
+    weights were deleted; don't re-add it to the report without a detector
+    that passes that test.
+  - **Detail:** length, questions, specific references, drafting effort from
+    the log's per-save word counts, and SPECTER2 paper-specificity.
+  - **Bias:** the merit residual against the paper's other reviews.
+
+  The groups are early / grace / late / exempt. Exempt and extension come from
+  `timeliness_tags.evaluate()`. **Group statistics only**, with a cluster
+  bootstrap over reviewers and a within-reviewer contrast, which is the one to
+  trust. The per-review CSV, the PDF and `review_ai_scores.json` are
+  gitignored **by name**. **Never use a Chinese-origin model** (university
+  policy), and never send review text to an external service. Genericness
+  needs the GPU.
+  `REVIEW_QUALITY_FLAGS=` runs the offline subset.
 - `make complete-papers` and `make area-chairs-complete` retain the former
   completeness filter in separate `*-complete.txt` artifacts.
 - Library modules (imported, never run): `src/reviewer_match/reviewers.py`, `src/reviewer_match/dblp.py`,
@@ -321,6 +352,7 @@ contains spaces and parentheses — always quote it in shell commands).
   `scripts/revision_cutoffs.py`, `scripts/assign_paper_leads.py`,
   `scripts/revision_tags.py`, `scripts/timeliness_tags.py`,
   `scripts/timeliness_emails.py`, `scripts/extra_reviewer_candidates.py`,
+  `scripts/review_quality.py`,
   `scripts/main.py`.
 
 ## Architecture (filter-then-rank, then constrained assignment)

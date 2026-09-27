@@ -120,17 +120,32 @@ def ever_on_paper(rows: list[dict[str, str]]) -> dict[int, set[str]]:
 def suggest(shortlists: dict[int, list[tuple[str, float]]]) -> dict[int, str]:
     """{pid: email}: one distinct candidate per paper maximising total affinity.
 
-    Exhaustive over the shortlists, which are small. A paper may go without
-    (its whole list taken elsewhere, or empty), and filling more papers beats
-    a better total. Papers are searched in pid order and each list in rank
-    order, and only a strictly better result replaces the incumbent, so ties
-    go to the earlier-ranked candidate.
+    Exhaustive over the shortlists, pruned by branch and bound. A paper may go
+    without (its whole list taken elsewhere, or empty), and filling more
+    papers beats a better total. Papers are searched in pid order and each
+    list in rank order, and only a strictly better result replaces the
+    incumbent, so ties go to the earlier-ranked candidate. A branch is cut
+    only when even its optimistic bound (every remaining paper filled by its
+    best unused candidate) cannot strictly beat the incumbent, so pruning
+    never changes the answer; without it 15 papers x 8 candidates is ~9^15
+    leaves.
     """
     pids = sorted(shortlists)
     best: tuple[tuple[int, float], dict[int, str]] = ((-1, 0.0), {})
 
+    def bound(i: int, used: set[str], count: int, total: float) -> tuple[int, float]:
+        for pid in pids[i:]:
+            scores = [score for email, score in shortlists[pid] if email not in used]
+            if scores:
+                count += 1
+                total += max(scores)
+        return count, total
+
     def walk(i: int, used: set[str], chosen: dict[int, str], total: float) -> None:
         nonlocal best
+        count, ceiling = bound(i, used, len(chosen), total)
+        if count < best[0][0] or (count == best[0][0] and ceiling < best[0][1] - 1e-9):
+            return
         if i == len(pids):
             key = (len(chosen), round(total, 12))
             if key > best[0]:

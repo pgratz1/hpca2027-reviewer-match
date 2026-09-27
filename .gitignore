@@ -96,3 +96,8 @@ __pycache__/
 *~
 \#*\#
 .~lock.*\#
+# Per-review AI-likelihood and quality measures; a single score read out of
+# context looks like an accusation.
+review_quality*.pdf
+review_quality*.csv
+review_ai_scores*.json

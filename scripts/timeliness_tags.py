@@ -48,8 +48,12 @@ author's day.
 **The day tags stick; the blocked tag does not.** A paper that already carries
 a day tag in the paper export (`--data`) is never re-tagged, so the upload only
 ever adds a day tag to a paper that has none. Because the day comes from log
-timestamps rather than from when this runs, a missed day catches up, and a
-stale export only repeats a tag, never contradicts it.
+timestamps rather than from when this runs, a missed day catches up. A stale
+export can still hide a day tag an earlier upload wrote, and the day can have
+moved since -- an extension added between the two runs does exactly that -- so
+every `tag` row for a day is preceded by a `cleartag` of every *other* day tag.
+Against a current export those clears touch nothing; against a stale one they
+are what keeps a paper from carrying `~~twodayslate` and `~~ontime` at once.
 `~~delayedmissingreview` is the exception -- it is a placeholder for a day not
 yet known, so a paper carrying it is still decided, and every paper no longer
 blocked is `cleartag`ged whether or not the export shows the tag. Clearing a
@@ -255,6 +259,7 @@ def decide(
         else:
             status, new_tag = "tagged", TAG_PREFIX + tier_tag(days)
         rows.append({
+            "days": days,
             "paper": pid,
             "title": paper.get("title") or "",
             "existing_tag": " ".join(TAG_PREFIX + t for t in existing),
@@ -278,9 +283,20 @@ def upload_rows(report: list[dict]) -> list[list[object]]:
     the placeholder and its day. A paper already carrying a day tag is cleared
     even if it is blocked again today: the day tag is the settled answer, and
     nothing later would clear a placeholder left beside it.
+
+    A newly decided paper also has every other day tag cleared, in case an
+    earlier upload the export predates gave it a different day. Every spelled
+    tier is cleared, and numeric ones up to the latest day this run computes: an
+    earlier run cannot have computed a later one, since first submissions never
+    move.
     """
     clears = [[r["paper"], "cleartag", "", TAG_PREFIX + BLOCKED_TAG, ""]
               for r in report if r["status"] not in BLOCKED_STATUSES]
+    max_days = max([len(NUMBER_WORDS)] + [r["days"] for r in report if r.get("days") is not None])
+    day_tags = [TAG_PREFIX + tier_tag(d) for d in range(max_days + 1)]
+    clears += [[r["paper"], "cleartag", "", t, ""]
+               for r in report if r["status"] == "tagged"
+               for t in day_tags if t != r["new_tag"]]
     tags = [[r["paper"], "tag", "", r["new_tag"], ""] for r in report if r["new_tag"]]
     return clears + tags
 
