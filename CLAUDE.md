@@ -214,16 +214,22 @@ contains spaces and parentheses — always quote it in shell commands).
   and writes `outputs/assignments/lead_upload.csv`, a HotCRP **delta**
   (`clearlead`, then `lead` rows). A paper advances with fewer than
   `REVISION_MIN_DECIDED` (3) submitted PC reviews, when it is over
-  `review_scores.Bar`, or when the export already tags it `RevisionAdvance`
-  (**never downgraded**, via `review_scores.decide_paper`, which is the one
-  decision `revision-tags` and `timeliness-tags` share). `REVISION_BAR` in the
+  `review_scores.Bar`, via `review_scores.decide_paper`, which is the one
+  decision `revision-tags` and `timeliness-tags` share. **Priority, highest
+  first:** a hand-set tag; an outstanding R1 review assigned after
+  `RECENT_AFTER` (advances a 3–4-review paper; on 5+ it only *keeps* an
+  existing `RevisionAdvance`, never promotes); the reviews as they stand.
+  Since 2026-09-28 a `RevisionAdvance` paper that new reviews put under the bar
+  **is downgraded** to `NoRevision` — the former never-downgrade hold is gone. `REVISION_BAR` in the
   Makefile carries the flags to all three:
   - **5+ reviews** (`REVISION_MIN_REVIEWS`): under the bar at "average ≤ 2.5
     and ≤1 score ≥3", changed via `LEAD_FLAGS="--bar-cutoff … --bar-net …
     --bar-comparator …"`.
-  - **3–4 reviews:** under the bar only when every score is ≤2. An outstanding
-    R1 review assigned after `RECENT_AFTER` (default `EXEMPT_AFTER`) makes the
-    paper advance, so that review plays out.
+  - **3–4 reviews:** under the bar only when every score is ≤2.
+  - **Late review outstanding:** an R1 review assigned after `RECENT_AFTER`
+    (default `EXEMPT_AFTER`) still outstanding makes a 3–4-review paper under
+    the bar advance, and keeps `RevisionAdvance` on a 5+ paper the export
+    already tags so.
   - The scripts' own `--min-decided` default is `--min-reviews`, meaning no
     early decisions; the Makefile sets 3.
   - **Leads:** only a full/light PC member who **submitted their review of that
@@ -262,6 +268,12 @@ contains spaces and parentheses — always quote it in shell commands).
   `pid,clearreview,email,R1` for every **outstanding** R1 review on a paper
   decided NoRevision on 3–4 reviews. It is never `all,clearreview`, and never
   touches a submitted review, a TRC review or a 5+ paper.
+  **A hand-set revision tag is never overridden** (`review_scores.manual_revision_tags`,
+  shared by `revision-tags`, `timeliness-tags` and `paper-leads`): a tag change
+  in the log is manual when no other paper's revision tags changed under the same
+  account in the same second (an upload writes them all at once). The paper keeps
+  what the last manual edit left, even over a later upload, which this upload then
+  restores. A hand-set NoRevision unassigns no review the bar would not.
 - **`make timeliness-tags`** writes `outputs/assignments/timeliness_tags_upload.csv`,
   a delta upload with **two buckets**:
   - `~~revisiondelay` when the paper is not NoRevision and a PC/reserve author

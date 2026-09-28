@@ -616,9 +616,10 @@ revision-cutoffs: scripts/revision_cutoffs.py src/reviewer_match/review_scores.p
 # submitted PC reviews: under the bar at "average <= 2.5 and at most one score of
 # 3 or better" (LEAD_FLAGS="--bar-cutoff 2.25 --bar-net no4" changes it).
 # REVISION_MIN_DECIDED up to one short of that: under the bar when every score
-# is reject or weak reject, unless an R1 review assigned after RECENT_AFTER is
-# still outstanding. Fewer: always advances, untagged. A paper the export already
-# tags RevisionAdvance never goes back.
+# is reject or weak reject. Fewer: always advances, untagged. Priority, highest
+# first: a hand-set tag in HotCRP; an R1 review assigned after RECENT_AFTER still
+# outstanding (advances an early paper, keeps a RevisionAdvance one); the reviews as they stand, so new reviews can turn a
+# RevisionAdvance paper NoRevision.
 REVISION_MIN_DECIDED ?= 3
 RECENT_AFTER ?= $(EXEMPT_AFTER)
 REVISION_BAR = --min-reviews $(REVISION_MIN_REVIEWS) --min-decided $(REVISION_MIN_DECIDED) \

@@ -626,6 +626,8 @@ def main() -> int:
             print(f"{s.outstanding:>6}/{s.held:<6} {held_up[key]:>6}  {key}"
                   + ("  (marked late)" if s.reason == "marked late" else ""))
 
+    print()
+    print("\n".join(review_scores.manual_report(decided.manual, decided.by_bar)))
     effects = unassign_effects(ev, decided.pairs, decided.decisions, args.delay_days)
     print(f"\nUnassigning {len(decided.pairs)} outstanding review(s) on early "
           f"{revision_tags.NO_REVISION_TAG} papers changes {len(effects)} reviewer(s)' late status"

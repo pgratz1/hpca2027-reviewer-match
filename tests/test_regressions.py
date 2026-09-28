@@ -7073,20 +7073,28 @@ class PaperLeadTests(unittest.TestCase):
         self.assertEqual(review_scores.FEW_REVIEWS, bar.advances([1, 1]))
         # A recently assigned review still outstanding lets an early paper play out...
         self.assertEqual(review_scores.RECENT, bar.advances([2, 2, 2], recent=True))
-        # ...but never a paper the net decides, and the net itself is unchanged.
+        # ...and keeps a paper the net decides at RevisionAdvance, never promotes one.
+        self.assertEqual(review_scores.RECENT, bar.advances([4, 2, 2, 2, 2], recent=True, held=True))
         self.assertIsNone(bar.advances([4, 2, 2, 2, 2], recent=True))
-        self.assertEqual(review_scores.OVER_BAR, bar.advances([3, 3, 2, 2, 2]))
+        self.assertIsNone(bar.advances([4, 2, 2, 2, 2], held=True))
+        self.assertEqual(review_scores.OVER_BAR, bar.advances([3, 3, 2, 2, 2], recent=True))
 
     def test_without_min_decided_nothing_is_decided_early(self):
         bar = review_scores.Bar(min_reviews=5)
         self.assertEqual(review_scores.FEW_REVIEWS, bar.advances([1, 1, 1, 1]))
         self.assertFalse(bar.is_early([1, 1, 1, 1]))
 
-    def test_an_advance_the_export_shows_is_never_undone(self):
+    def test_priority_is_manual_then_late_review_then_the_reviews(self):
         bar = review_scores.Bar(min_reviews=5, min_decided=3)
-        self.assertEqual(review_scores.HELD, review_scores.decide_paper(bar, [3, 2, 2, 2, 1], held=True))
-        self.assertIsNone(review_scores.decide_paper(bar, [3, 2, 2, 2, 1]))
-        self.assertEqual(review_scores.OVER_BAR, review_scores.decide_paper(bar, [3, 3, 2, 2, 2], held=True))
+        under = [3, 2, 2, 2, 1]
+        self.assertIsNone(review_scores.decide_paper(bar, under))  # reviews: NoRevision
+        self.assertIsNone(review_scores.decide_paper(bar, under, held=True))  # downgraded
+        self.assertEqual(review_scores.RECENT, review_scores.decide_paper(bar, under, recent=True, held=True))
+        self.assertIsNone(review_scores.decide_paper(bar, under, recent=True))  # never promoted
+        self.assertIsNone(review_scores.decide_paper(bar, under, recent=True, held=True,
+                                                     manual=review_scores.NO_REVISION_TAG))
+        self.assertEqual(review_scores.MANUAL_ADVANCE,
+                         review_scores.decide_paper(bar, under, manual=review_scores.ADVANCE_TAG))
 
     def test_recent_pids_needs_an_outstanding_r1_review_after_the_date(self):
         def row(date, who, pid, action):
@@ -7281,12 +7289,14 @@ class RevisionTagTests(unittest.TestCase):
             expected = {review_scores.OVER_BAR: self.ADVANCE, None: self.NO}.get(reason)
             self.assertEqual(expected, decisions[pid], pid)
 
-    def test_early_decisions_recent_caveat_and_held_advances(self):
+    def test_early_decisions_and_the_late_review_caveat(self):
         bar = review_scores.Bar(min_reviews=5, min_decided=3)
-        scores = {1: [2, 2, 2], 2: [3, 2, 2, 2], 3: [2, 2, 2], 4: [3, 2, 2, 2, 1], 5: [1, 1]}
-        decisions = revision_tags.decide(set(scores), scores, bar, recent={3}, held={4})
-        self.assertEqual({1: self.NO, 2: self.ADVANCE, 3: self.ADVANCE, 4: self.ADVANCE, 5: None},
-                         decisions)
+        scores = {1: [2, 2, 2], 2: [3, 2, 2, 2], 3: [2, 2, 2], 4: [3, 2, 2, 2, 1], 5: [1, 1],
+                  6: [3, 2, 2, 2, 1]}
+        scores[7] = [3, 2, 2, 2, 1]
+        decisions = revision_tags.decide(set(scores), scores, bar, recent={3, 6, 7}, held={4, 6})
+        self.assertEqual({1: self.NO, 2: self.ADVANCE, 3: self.ADVANCE, 4: self.NO, 5: None,
+                          6: self.ADVANCE, 7: self.NO}, decisions)
 
     def test_unassign_only_outstanding_r1_on_early_no_revision_papers(self):
         bar = review_scores.Bar(min_reviews=5, min_decided=3)
@@ -7302,6 +7312,51 @@ class RevisionTagTests(unittest.TestCase):
         }
         self.assertEqual([(1, "out@x.edu")],
                          revision_tags.unassign_pairs(decisions, scores, bar, live, {11}))
+
+    @staticmethod
+    def tag_row(date, email, pid, action):
+        return {"date": date, "email": email, "paper": str(pid), "action": action}
+
+    def test_manual_tags_are_told_from_uploads_and_survive_them(self):
+        r = self.tag_row
+        rows = [
+            # An upload: one account, one second, several papers.
+            r("t1", "chair@x", 1, "Tag +#RevisionAdvance"), r("t1", "chair@x", 2, "Tag +#NoRevision"),
+            r("t1", "chair@x", 3, "Tag +#NoRevision"), r("t1", "chair@x", 5, "Tag +#RevisionAdvance"),
+            r("t2", "pc@x", 1, "Tag +#NoRevision"),                       # hand-set, then...
+            r("t3", "chair@x", 1, "Tag -#NoRevision"), r("t3", "chair@x", 2, "Tag -#NoRevision"),
+            r("t4", "ac@x", 2, "Tag -#NoRevision +#~~rescued"),           # removal only: untagged
+            r("t5", "chair@x", 3, "Tag -#NoRevision"),                    # removal only, one left: none
+            r("t6", "pc@x", 4, "Tag +#other"),                            # not a revision tag
+            r("t7", "pc@x", 5, "Tag -#RevisionAdvance +#NoRevision"),
+        ]
+        manual = review_scores.manual_revision_tags(rows)
+        self.assertEqual({1: self.NO, 2: "", 3: "", 5: self.NO}, {p: m.tag for p, m in manual.items()})
+        self.assertEqual(("pc@x", "t2"), (manual[1].email, manual[1].date))
+
+    def test_hand_set_tags_override_the_bar_but_unassign_nothing_new(self):
+        bar = review_scores.Bar(min_reviews=5, min_decided=3)
+        scores = {1: [5, 5, 5, 5, 5], 2: [1, 1, 1, 1, 1], 3: [2, 2, 2], 4: [1, 1], 5: [5, 5, 5]}
+        M = review_scores.ManualTag
+        manual = {1: M(self.NO, "a", "t"), 2: M(self.ADVANCE, "a", "t"), 3: M("", "a", "t"),
+                  4: M(self.NO, "a", "t")}
+        decisions = revision_tags.decide(set(scores), scores, bar, manual=manual)
+        self.assertEqual({1: self.NO, 2: self.ADVANCE, 3: None, 4: self.NO, 5: self.ADVANCE}, decisions)
+        why = revision_tags.reasons(set(scores), scores, bar, manual=manual)
+        self.assertEqual(review_scores.MANUAL_UNTAGGED, why[3])  # advances for a lead
+        self.assertEqual(review_scores.MANUAL_ADVANCE, why[2])
+
+    def test_manual_report_lists_every_hand_set_tag_oldest_first(self):
+        M = review_scores.ManualTag
+        manual = {1: M(self.NO, "b@x", "t2"), 2: M(self.ADVANCE, "a@x", "t1"), 3: M("", "c@x", "t3"),
+                  9: M(self.NO, "d@x", "t0")}  # not in play: left out
+        lines = review_scores.manual_report(manual, {1: self.NO, 2: self.NO, 3: None, 4: self.NO})
+        self.assertEqual([
+            "3 paper(s) keep a hand-set revision tag instead of the bar's (1 where the bar disagrees, marked *):",
+            f"  * #2: {self.ADVANCE}, set by a@x at t1 (bar: {self.NO})",
+            f"    #1: {self.NO}, set by b@x at t2 (bar: {self.NO})",
+            "    #3: untagged, set by c@x at t3 (bar: untagged)",
+        ], lines)
 
     def test_upload_clears_the_opposite_tag_before_any_tag(self):
         rows = revision_tags.upload_rows({2: self.NO, 1: self.ADVANCE, 3: None})

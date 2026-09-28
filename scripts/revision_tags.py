@@ -13,17 +13,25 @@ desk-rejected, not `--exclude-pids`) with at least `--min-decided` (default:
 the tags, the leads and the timeliness tags agree on the same inputs and
 flags: over the bar gets `RevisionAdvance`, under it `NoRevision`. From
 `--min-reviews` reviews up the net decides; below that, a paper is under the
-bar when every score is reject or weak reject, unless it holds an outstanding
-R1 review assigned after `--recent-after`. TRC reviews count towards neither
-the review floor nor the average.
+bar when every score is reject or weak reject. An outstanding R1 review
+assigned after `--recent-after` is let play out: it advances an early paper,
+and keeps `RevisionAdvance` on a paper the export already tags so. TRC reviews count towards neither the review floor nor the average.
 
 **Papers short of reviews are left untagged.** They advance for a lead, but
 the bar has not decided them yet. Tag them on a later run, once their reviews
 are in.
 
-**RevisionAdvance never goes back.** A paper the export (`--data`) already
-shows as `RevisionAdvance` keeps it even if later reviews put it under the bar
-(`review_scores.decide_paper`); such papers are listed on stdout.
+**The tag follows the reviews.** A `RevisionAdvance` paper that new reviews put
+under the bar becomes `NoRevision` -- unless a late-assigned review is still
+outstanding on it, or the tag was set by hand (below). Priority, highest first:
+a hand-set tag, an outstanding late-assigned review, the reviews
+(`review_scores.decide_paper`).
+
+**A hand-set tag is never overridden.** A paper whose RevisionAdvance or
+NoRevision tag somebody changed in HotCRP's UI keeps what their last edit left
+(`review_scores.manual_revision_tags`) -- even where a later upload of this
+file changed it, which this upload then puts back. Such papers are listed on
+stdout, with who set the tag and when, and those the bar disagrees with marked.
 
 **Early NoRevision papers lose their outstanding reviews.** Every outstanding
 R1 review on a paper decided `NoRevision` below `--min-reviews` gets a
@@ -31,6 +39,8 @@ per-pair `clearreview` row in `--unassign-upload` -- never
 `all,clearreview`, and never a submitted or TRC review. A paper decided on the
 net is not touched: its slate was complete when it was decided.
 `scripts/timeliness_tags.py` reports whose late status those removals change.
+A hand-set NoRevision unassigns nothing the bar would not: taking reviews
+away is the chairs' call, not the side effect of a PC member's tag.
 
 **Reruns are safe.** HotCRP's bulk-assignment `tag` action only adds, so a
 paper that crosses the bar between runs would otherwise carry both tags. The
@@ -78,11 +88,14 @@ def reasons(
     scores: dict[int, list[int]],
     bar: review_scores.Bar,
     recent: set[int] = frozenset(),
+    manual: dict[int, review_scores.ManualTag] | None = None,
     held: set[int] = frozenset(),
 ) -> dict[int, str | None]:
     """{pid: `review_scores.decide_paper`'s reason}, None meaning under the bar."""
+    manual = manual or {}
     return {
-        pid: review_scores.decide_paper(bar, scores.get(pid, []), recent=pid in recent, held=pid in held)
+        pid: review_scores.decide_paper(bar, scores.get(pid, []), recent=pid in recent, held=pid in held,
+                                        manual=manual[pid].tag if pid in manual else None)
         for pid in sorted(eligible)
     }
 
@@ -92,13 +105,13 @@ def decide(
     scores: dict[int, list[int]],
     bar: review_scores.Bar,
     recent: set[int] = frozenset(),
+    manual: dict[int, review_scores.ManualTag] | None = None,
     held: set[int] = frozenset(),
 ) -> dict[int, str | None]:
-    """{pid: ADVANCE_TAG, NO_REVISION_TAG, or None while short of reviews}."""
+    """{pid: ADVANCE_TAG, NO_REVISION_TAG, or None while short of reviews or untagged by hand}."""
     return {
-        pid: None if reason == review_scores.FEW_REVIEWS
-        else NO_REVISION_TAG if reason is None else ADVANCE_TAG
-        for pid, reason in reasons(eligible, scores, bar, recent, held).items()
+        pid: review_scores.reason_tag(reason)
+        for pid, reason in reasons(eligible, scores, bar, recent, manual, held).items()
     }
 
 
@@ -129,6 +142,8 @@ class Decided:
     why: dict[int, str | None]            # pid -> `reasons`
     decisions: dict[int, str | None]      # pid -> tag, None while undecided
     pairs: list[tuple[int, str]]          # `unassign_pairs`
+    manual: dict[int, review_scores.ManualTag]  # `review_scores.manual_revision_tags`
+    by_bar: dict[int, str | None]         # `decide` without the hand-set tags
 
 
 def load_inputs(args) -> Decided:
@@ -146,12 +161,16 @@ def load_inputs(args) -> Decided:
     for review in reviews:
         scores.setdefault(review.pid, []).append(review.score)
     recent = review_scores.recent_from_args(args, log_rows)
+    manual = review_scores.manual_revision_tags(log_rows)
     held = review_scores.tagged_pids(args.data, ADVANCE_TAG)
-    why = reasons(eligible, scores, bar, recent, held)
-    decisions = decide(eligible, scores, bar, recent, held)
+    why = reasons(eligible, scores, bar, recent, manual, held)
+    decisions = decide(eligible, scores, bar, recent, manual, held)
+    by_bar = decide(eligible, scores, bar, recent, held=held)
+    # Unassign only where the bar agrees: see the module docstring.
+    agreed = {pid: tag if tag == by_bar[pid] else None for pid, tag in decisions.items()}
     live, _ = hotcrp_log.replay_assignments(log_rows)
-    pairs = unassign_pairs(decisions, scores, bar, live, hotcrp_log.submitted_review_ids(log_rows))
-    return Decided(bar, scores, why, decisions, pairs)
+    pairs = unassign_pairs(agreed, scores, bar, live, hotcrp_log.submitted_review_ids(log_rows))
+    return Decided(bar, scores, why, decisions, pairs, manual, by_bar)
 
 
 def upload_rows(decisions: dict[int, str | None]) -> list[list[object]]:
@@ -204,13 +223,17 @@ def main() -> int:
           f"{counts[None]} untagged with fewer than {bar.decided_from} reviews.")
     if bar.decided_from < bar.min_reviews:
         print(f"  decided on {bar.decided_from}-{bar.min_reviews - 1} reviews: "
-              f"{early[ADVANCE_TAG]} {ADVANCE_TAG} "
-              f"({Counter(why.values())[review_scores.RECENT]} only for a recently assigned review), "
-              f"{early[NO_REVISION_TAG]} {NO_REVISION_TAG}")
-    held = sorted(pid for pid, reason in why.items() if reason == review_scores.HELD)
-    if held:
-        print(f"  {len(held)} paper(s) under the bar kept {ADVANCE_TAG}, as the export already shows it: "
-              f"{', '.join(map(str, held))}")
+              f"{early[ADVANCE_TAG]} {ADVANCE_TAG}, {early[NO_REVISION_TAG]} {NO_REVISION_TAG}")
+    recent = sorted(pid for pid, reason in why.items() if reason == review_scores.RECENT)
+    if recent:
+        print(f"  {len(recent)} paper(s) under the bar kept at {ADVANCE_TAG} for an outstanding "
+              f"late-assigned review: {', '.join(map(str, recent))}")
+    was = review_scores.tagged_pids(args.data, ADVANCE_TAG)
+    downgraded = sorted(pid for pid, tag in decisions.items() if tag == NO_REVISION_TAG and pid in was)
+    if downgraded:
+        print(f"  {len(downgraded)} paper(s) go from {ADVANCE_TAG} to {NO_REVISION_TAG} on new reviews: "
+              f"{', '.join(map(str, downgraded))}")
+    print("\n".join(review_scores.manual_report(d.manual, d.by_bar)))
     print(f"{len(pairs)} outstanding R1 review(s) to unassign on "
           f"{len({pid for pid, _ in pairs})} early {NO_REVISION_TAG} paper(s), "
           f"{len({email for _, email in pairs})} reviewer(s).")

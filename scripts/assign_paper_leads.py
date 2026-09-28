@@ -8,14 +8,15 @@
 **Which papers.** Every paper still under review (`submitted`, not
 desk-rejected, not `--exclude-pids`) that *advances*: it has fewer than
 `--min-decided` (default `--min-reviews`) submitted PC reviews, or it is over
-the revision bar, or the export already tags it `RevisionAdvance`. The bar is
+the revision bar, or an outstanding R1 review assigned after `--recent-after`
+holds it (an early paper, or one the export tags `RevisionAdvance`) -- unless a revision tag was set by hand in HotCRP, which
+decides it outright (`review_scores.manual_revision_tags`). The bar is
 `reviewer_match.review_scores.Bar` via `review_scores.decide_paper`, the same
 decision `scripts/revision_tags.py` tags. By default a paper is under the bar
 when its average pre-rebuttal overall merit is <= 2.5 **and** at most one
 reviewer scored it 3 or better; `--bar-net`/`--bar-cutoff`/`--bar-comparator`
 change it. With `--min-decided` below `--min-reviews`, a paper in between is
-under the bar when every score is 2 or lower and no R1 review assigned after
-`--recent-after` is outstanding. TRC reviews count towards neither the review
+under the bar when every score is 2 or lower. TRC reviews count towards neither the review
 floor nor the average.
 
 **Who can lead.** Only someone who has *submitted their review of that paper*
@@ -416,10 +417,15 @@ def main() -> int:
         titles.setdefault(review.pid, review.title)
 
     recent = review_scores.recent_from_args(args, log_rows)
+    manual = review_scores.manual_revision_tags(log_rows)
     held = review_scores.tagged_pids(args.data, review_scores.ADVANCE_TAG)
+    by_bar = {pid: review_scores.reason_tag(review_scores.decide_paper(
+                  bar, scores.get(pid, []), recent=pid in recent, held=pid in held))
+              for pid in eligible}
     need = {pid: reason for pid in sorted(eligible)
-            if (reason := review_scores.decide_paper(bar, scores.get(pid, []),
-                                                     recent=pid in recent, held=pid in held))}
+            if (reason := review_scores.decide_paper(
+                bar, scores.get(pid, []), recent=pid in recent, held=pid in held,
+                manual=manual[pid].tag if pid in manual else None))}
 
     roster = build_roster(args.pcinfo)
     def can_lead(email: str) -> bool:
@@ -508,12 +514,14 @@ def main() -> int:
     extra = "".join(
         f", {reasons[key]} {label}" for key, label in (
             (review_scores.RECENT, "for a recently assigned review"),
-            (review_scores.HELD, f"already tagged {review_scores.ADVANCE_TAG}"),
+            (review_scores.MANUAL_ADVANCE, f"tagged {review_scores.ADVANCE_TAG} by hand"),
+            (review_scores.MANUAL_UNTAGGED, "with revision tags removed by hand"),
         ) if reasons[key]
     )
     print(f"{len(need)} of {len(eligible)} papers advance: {reasons[review_scores.OVER_BAR]} over the bar, "
           f"{reasons[review_scores.FEW_REVIEWS]} with fewer than {bar.decided_from} reviews{extra} "
           f"({len(skipped)} TRC reviews left out).")
+    print("\n".join(review_scores.manual_report(manual, by_bar)))
     print(f"Leads: {status['new']} new, {status['redrawn']} replaced, {status['kept']} kept, "
           f"{status['override'] + status['override-new']} chair overrides "
           f"({status['override-new']} not yet in HotCRP); "

@@ -17,9 +17,20 @@ paper somebody argues for (`NETS`). A paper with `min_reviews` or more
 submitted reviews is **under the bar** when the net catches it. A paper with
 `min_decided` up to `min_reviews - 1` reviews is decided early, by a simpler
 rule: under the bar when every score is `EARLY_UNDER_MAX` or lower (reject or
-weak reject), unless it holds an outstanding R1 review assigned after
-`--recent-after` -- that review is let play out, and the paper advances. A
-paper with fewer than `min_decided` reviews always advances (`Bar.advances`).
+weak reject). A paper with fewer than `min_decided` reviews always advances
+(`Bar.advances`).
+
+**An outstanding late-assigned review keeps a paper advancing.** An R1 review
+assigned after `--recent-after` and still outstanding is let play out: an
+early paper under the bar advances, and a paper the net puts under the bar
+*keeps* RevisionAdvance if the export already shows it (it is never promoted
+for one). Otherwise the bar follows the reviews as they stand, so a
+RevisionAdvance paper that new reviews put under the bar becomes NoRevision.
+
+**A hand-set revision tag wins over both** (`manual_revision_tags`). Once
+anyone -- a chair or a PC member -- has changed a paper's RevisionAdvance or
+NoRevision tag in HotCRP's UI, the paper keeps what their last such edit
+left, whatever its scores say and whatever a bulk upload did since.
 """
 
 from __future__ import annotations
@@ -27,6 +38,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date
@@ -58,7 +70,8 @@ DEFAULT_BAR_COMPARATOR = "le"
 FEW_REVIEWS = "few-reviews"
 OVER_BAR = "over-bar"
 RECENT = "recent-review"
-HELD = "held-advance"
+MANUAL_ADVANCE = "manual-advance"   # tagged RevisionAdvance by hand
+MANUAL_UNTAGGED = "manual-untagged"  # both tags removed by hand: advances, untagged
 
 # The revision tags `scripts/revision_tags.py` writes. They live here because
 # `decide_paper` reads the export's copy of them back.
@@ -249,20 +262,22 @@ class Bar:
         """Whether the paper is decided by the early rule rather than the net."""
         return self.decided_from <= len(scores) < self.min_reviews
 
-    def advances(self, scores: list[int], recent: bool = False) -> str | None:
+    def advances(self, scores: list[int], recent: bool = False, held: bool = False) -> str | None:
         """FEW_REVIEWS, RECENT, OVER_BAR, or None when the paper is under the bar.
 
-        `recent` (see `recent_pids`) matters only to an early paper.
+        `recent` (see `recent_pids`) turns a paper under the bar into RECENT:
+        an early paper always, a paper the net decides only when `held` says
+        the export already tags it RevisionAdvance.
         """
         if len(scores) < self.decided_from:
             return FEW_REVIEWS
         if self.is_early(scores):
-            if max(scores) > EARLY_UNDER_MAX:
-                return OVER_BAR
-            return RECENT if recent else None
-        if caught(scores, self.cutoff, self.comparator, NET_CONDITIONS[self.net]):
-            return None
-        return OVER_BAR
+            under = max(scores) <= EARLY_UNDER_MAX
+        else:
+            under = caught(scores, self.cutoff, self.comparator, NET_CONDITIONS[self.net])
+        if not under:
+            return OVER_BAR
+        return RECENT if recent and (held or self.is_early(scores)) else None
 
     def describe(self) -> str:
         """One line naming the bar, for reports."""
@@ -271,9 +286,10 @@ class Bar:
                 f"{self.cutoff:g}{extra}")
         if self.decided_from < self.min_reviews:
             line += (f" with {self.min_reviews}+ reviews; with {self.decided_from}-"
-                     f"{self.min_reviews - 1}, every score {EARLY_UNDER_MAX} or lower and no"
-                     " recently assigned review outstanding")
-        return line + f"; fewer than {self.decided_from} reviews always advances"
+                     f"{self.min_reviews - 1}, every score {EARLY_UNDER_MAX} or lower")
+        return (line + "; a recently assigned review outstanding advances an early paper"
+                " and keeps a RevisionAdvance one"
+                f"; fewer than {self.decided_from} reviews always advances")
 
 
 def tagged_pids(data_path: str, tag: str) -> set[int]:
@@ -285,18 +301,104 @@ def tagged_pids(data_path: str, tag: str) -> set[int]:
             if want in pc_membership.tag_names(" ".join(p.get("tags") or []))}
 
 
-def decide_paper(bar: Bar, scores: list[int], *, recent: bool = False, held: bool = False) -> str | None:
-    """`Bar.advances`, except that a paper already tagged RevisionAdvance never goes back.
+@dataclass(frozen=True)
+class ManualTag:
+    """The revision tag a hand edit in HotCRP left on a paper."""
 
-    `held` says the export already carries ADVANCE_TAG. An advance decided on
-    three or four reviews can otherwise be undone by the reviews still coming
-    in, and the chairs keep a paper they have told to advance advancing: it
-    reports HELD instead of None. Both `scripts/revision_tags.py` and
-    `scripts/assign_paper_leads.py` decide through here, so a held paper keeps
-    its tag and its lead together.
+    tag: str    # ADVANCE_TAG, NO_REVISION_TAG, or "" when it left neither
+    email: str  # who made the edit
+    date: str   # the log's timestamp, as written
+
+
+def manual_revision_tags(log_rows: list[dict[str, str]]) -> dict[int, ManualTag]:
+    """{pid: ManualTag} for every paper whose revision tags were ever changed by hand.
+
+    `log_rows` oldest first (`hotcrp_log.load_log`). The log does not say
+    whether a tag change came from the UI or a bulk upload, but an upload writes
+    every row under one account and one timestamp, and a UI edit touches one
+    paper per request. So a change is **manual when no other paper's revision
+    tags changed under the same account at the same second.** The cost of the
+    rule: an upload that happens to change one paper's tag reads as manual, and
+    pins that paper to what the upload said.
+
+    A manual edit wins over any later upload: the paper keeps the tag the
+    *last* manual edit added, or, when that edit only removed a tag, whatever
+    the paper was left holding (replayed from the log). An edit that left both
+    tags cannot happen in the UI, which replaces one with the other.
     """
-    reason = bar.advances(scores, recent)
-    return HELD if reason is None and held else reason
+    ours = {ADVANCE_TAG.lower(): ADVANCE_TAG, NO_REVISION_TAG.lower(): NO_REVISION_TAG}
+    events = []
+    for row in log_rows:
+        changes = [(sign, ours[name.lower()])
+                   for sign, name in re.findall(r"([+-])#([^\s#]+)", row["action"])
+                   if row["action"].startswith("Tag ") and name.lower() in ours]
+        if changes and row["paper"].strip().isdigit():
+            events.append((row, int(row["paper"]), changes))
+    papers_per_request = Counter()
+    seen = set()
+    for row, pid, _ in events:
+        key = (row["email"], row["date"])
+        if (key, pid) not in seen:
+            seen.add((key, pid))
+            papers_per_request[key] += 1
+
+    state: dict[int, set[str]] = {}
+    manual: dict[int, ManualTag] = {}
+    for row, pid, changes in events:
+        tags = state.setdefault(pid, set())
+        for sign, tag in changes:
+            (tags.add if sign == "+" else tags.discard)(tag)
+        if papers_per_request[(row["email"], row["date"])] > 1:
+            continue
+        added = [tag for sign, tag in changes if sign == "+"]
+        left = added[-1] if added else (next(iter(tags)) if len(tags) == 1 else "")
+        manual[pid] = ManualTag(left, row["email"], row["date"])
+    return manual
+
+
+def reason_tag(reason: str | None) -> str | None:
+    """The revision tag a `decide_paper` reason gets: None while untagged."""
+    if reason in (FEW_REVIEWS, MANUAL_UNTAGGED):
+        return None
+    return NO_REVISION_TAG if reason is None else ADVANCE_TAG
+
+
+def manual_report(manual: dict[int, ManualTag], by_bar: dict[int, str | None]) -> list[str]:
+    """stdout lines naming every hand-set tag the bar was skipped for, oldest first.
+
+    `by_bar` is {pid: tag the bar alone would give} over the papers in play;
+    a hand-set tag on a paper outside it (desk-rejected, excluded) is left out.
+    """
+    pids = sorted((pid for pid in manual if pid in by_bar), key=lambda pid: (manual[pid].date, pid))
+    differ = sum((manual[pid].tag or None) != by_bar[pid] for pid in pids)
+    lines = [f"{len(pids)} paper(s) keep a hand-set revision tag instead of the bar's "
+             f"({differ} where the bar disagrees, marked *):"]
+    for pid in pids:
+        m = manual[pid]
+        tag, bar_tag = m.tag or None, by_bar[pid]
+        lines.append(f"  {'*' if tag != bar_tag else ' '} #{pid}: {tag or 'untagged'}, "
+                     f"set by {m.email} at {m.date} (bar: {bar_tag or 'untagged'})")
+    return lines
+
+
+def decide_paper(bar: Bar, scores: list[int], *, recent: bool = False, held: bool = False,
+                 manual: str | None = None) -> str | None:
+    """`Bar.advances`, unless a revision tag was set by hand.
+
+    In priority order: a hand-set tag; an outstanding late-assigned review
+    (`recent`), which keeps the paper advancing (`held`: the export already
+    tags it RevisionAdvance; see `Bar.advances`); the reviews as they stand.
+    Both `scripts/revision_tags.py` and `scripts/assign_paper_leads.py` decide
+    through here, so a paper's tag and its lead always agree.
+
+    `manual` (a `ManualTag.tag`, None when nobody tagged the paper by hand)
+    overrides everything: RevisionAdvance gives MANUAL_ADVANCE, NoRevision
+    None, and "" (both removed by hand) MANUAL_UNTAGGED, which advances but is
+    left untagged.
+    """
+    if manual is not None:
+        return {ADVANCE_TAG: MANUAL_ADVANCE, NO_REVISION_TAG: None}.get(manual, MANUAL_UNTAGGED)
+    return bar.advances(scores, recent, held)
 
 
 def add_bar_arguments(parser: argparse.ArgumentParser) -> None:
