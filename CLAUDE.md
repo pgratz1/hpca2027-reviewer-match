@@ -266,14 +266,17 @@ contains spaces and parentheses — always quote it in shell commands).
   `tag` row, which is what makes a rerun safe after a paper crosses the bar. It
   also writes `revision_unassign_upload.csv`, a per-pair
   `pid,clearreview,email,R1` for every **outstanding** R1 review on a paper
-  decided NoRevision on 3–4 reviews. It is never `all,clearreview`, and never
-  touches a submitted review, a TRC review or a 5+ paper.
+  decided NoRevision — early, on the net or by hand (since 2026-09-28; before,
+  3–4-review papers only), so no review still to come can flip it back. It is
+  never `all,clearreview`, and never touches a submitted or TRC review. A
+  submitted score that is later *edited* can still flip a paper: NoRevision is
+  deliberately not sticky.
   **A hand-set revision tag is never overridden** (`review_scores.manual_revision_tags`,
   shared by `revision-tags`, `timeliness-tags` and `paper-leads`): a tag change
   in the log is manual when no other paper's revision tags changed under the same
   account in the same second (an upload writes them all at once). The paper keeps
   what the last manual edit left, even over a later upload, which this upload then
-  restores. A hand-set NoRevision unassigns no review the bar would not.
+  restores.
 - **`make timeliness-tags`** writes `outputs/assignments/timeliness_tags_upload.csv`,
   a delta upload with **two buckets**:
   - `~~revisiondelay` when the paper is not NoRevision and a PC/reserve author

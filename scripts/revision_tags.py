@@ -33,14 +33,13 @@ NoRevision tag somebody changed in HotCRP's UI keeps what their last edit left
 file changed it, which this upload then puts back. Such papers are listed on
 stdout, with who set the tag and when, and those the bar disagrees with marked.
 
-**Early NoRevision papers lose their outstanding reviews.** Every outstanding
-R1 review on a paper decided `NoRevision` below `--min-reviews` gets a
-per-pair `clearreview` row in `--unassign-upload` -- never
-`all,clearreview`, and never a submitted or TRC review. A paper decided on the
-net is not touched: its slate was complete when it was decided.
+**NoRevision papers lose their outstanding reviews.** Every outstanding R1
+review on a paper decided `NoRevision` -- early, on the net, or by hand, late-
+assigned or not -- gets a per-pair `clearreview` row in `--unassign-upload`,
+so no review still to come can flip the paper back. Never `all,clearreview`,
+and never a submitted or TRC review. This locks out *new* reviews only: a
+reviewer who edits a submitted score can still move a paper over the bar.
 `scripts/timeliness_tags.py` reports whose late status those removals change.
-A hand-set NoRevision unassigns nothing the bar would not: taking reviews
-away is the chairs' call, not the side effect of a PC member's tag.
 
 **Reruns are safe.** HotCRP's bulk-assignment `tag` action only adds, so a
 paper that crosses the bar between runs would otherwise carry both tags. The
@@ -117,18 +116,15 @@ def decide(
 
 def unassign_pairs(
     decisions: dict[int, str | None],
-    scores: dict[int, list[int]],
-    bar: review_scores.Bar,
     live: dict[int, hotcrp_log.Review],
     submitted: set[int],
 ) -> list[tuple[int, str]]:
-    """[(pid, email)] of outstanding R1 reviews on papers decided NoRevision early, sorted."""
-    early_no = {pid for pid, tag in decisions.items()
-                if tag == NO_REVISION_TAG and bar.is_early(scores.get(pid, []))}
+    """[(pid, email)] of outstanding R1 reviews on papers decided NoRevision, sorted."""
+    no = {pid for pid, tag in decisions.items() if tag == NO_REVISION_TAG}
     return sorted(
         (review.pid, review.email)
         for rid, review in live.items()
-        if review.pid in early_no and review.round == review_scores.REVIEW_ROUND
+        if review.pid in no and review.round == review_scores.REVIEW_ROUND
         and rid not in submitted
     )
 
@@ -166,10 +162,8 @@ def load_inputs(args) -> Decided:
     why = reasons(eligible, scores, bar, recent, manual, held)
     decisions = decide(eligible, scores, bar, recent, manual, held)
     by_bar = decide(eligible, scores, bar, recent, held=held)
-    # Unassign only where the bar agrees: see the module docstring.
-    agreed = {pid: tag if tag == by_bar[pid] else None for pid, tag in decisions.items()}
     live, _ = hotcrp_log.replay_assignments(log_rows)
-    pairs = unassign_pairs(agreed, scores, bar, live, hotcrp_log.submitted_review_ids(log_rows))
+    pairs = unassign_pairs(decisions, live, hotcrp_log.submitted_review_ids(log_rows))
     return Decided(bar, scores, why, decisions, pairs, manual, by_bar)
 
 
@@ -234,9 +228,12 @@ def main() -> int:
         print(f"  {len(downgraded)} paper(s) go from {ADVANCE_TAG} to {NO_REVISION_TAG} on new reviews: "
               f"{', '.join(map(str, downgraded))}")
     print("\n".join(review_scores.manual_report(d.manual, d.by_bar)))
+    unassigned = {pid for pid, _ in pairs}
     print(f"{len(pairs)} outstanding R1 review(s) to unassign on "
-          f"{len({pid for pid, _ in pairs})} early {NO_REVISION_TAG} paper(s), "
-          f"{len({email for _, email in pairs})} reviewer(s).")
+          f"{len(unassigned)} {NO_REVISION_TAG} paper(s), "
+          f"{len({email for _, email in pairs})} reviewer(s); of the papers, "
+          f"{sum(bar.is_early(scores.get(pid, [])) for pid in unassigned)} decided early, "
+          f"{len(unassigned & d.manual.keys())} hand-set.")
     return 0
 
 

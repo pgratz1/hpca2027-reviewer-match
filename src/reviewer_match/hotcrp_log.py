@@ -58,11 +58,17 @@ ENGAGEMENT_RE = re.compile(
 
 # "Review 18025 submitted: 1337 words" (first submission) / "Review 4861 edited,
 # submitted: ComAut, ..., 466 words" (a resubmission after edits) -- both
-# distinct from "Review N edited, updated draft: ..." / "Review N edited,
-# updated: ...", which are draft saves and do not mean submitted.
-SUBMIT_RE = re.compile(r"^Review (\d+) (?:submitted|edited, submitted):")
-# "Review 15 retracted" / "Review 726 deleted" -- either reverses a submission.
-UNSUBMIT_RE = re.compile(r"^Review (\d+) (?:retracted|deleted)$")
+# distinct from "Review N edited, updated draft: ...", a draft save that does
+# not mean submitted, and from "Review N edited, updated: ...", which is an
+# edit to a review that is *already* submitted (every one of the 1,681 such
+# rows today lands on a submitted review). A draft saved first and submitted
+# unchanged logs a bare "Review 17095 submitted", with no colon or word count
+# -- rare (1 in 7,000 today), but missing it read a turned-in review as
+# outstanding and put it in an unassign upload.
+SUBMIT_RE = re.compile(r"^Review (\d+) (?:submitted|edited, submitted)(?::|$)")
+# "Review 15 retracted" / "Review 726 deleted" / "Review 5702 unsubmitted draft:
+# 482 words" (a chair returning it to draft) -- each reverses a submission.
+UNSUBMIT_RE = re.compile(r"^Review (\d+) (?:retracted$|deleted$|unsubmitted\b)")
 
 # Discussion-lead changes, exactly as `a_lead.php` logs them.
 SET_LEAD = "Set lead"

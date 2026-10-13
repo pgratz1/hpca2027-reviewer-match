@@ -55,7 +55,7 @@ on stderr. The upload clears the retired tags (`~~onedaylate`,
 Clearing a tag a paper does not have changes nothing.
 
 **Unassignments.** `scripts/revision_tags.py` unassigns the outstanding R1
-reviews on papers decided NoRevision early. Removing a reviewer's outstanding
+reviews on every paper decided NoRevision. Removing a reviewer's outstanding
 reviews can finish them, and so change the papers they author; stdout lists
 every reviewer whose state those removals would change, and each authored
 paper's tag before and after. The tags themselves follow the log as it
@@ -629,7 +629,7 @@ def main() -> int:
     print()
     print("\n".join(review_scores.manual_report(decided.manual, decided.by_bar)))
     effects = unassign_effects(ev, decided.pairs, decided.decisions, args.delay_days)
-    print(f"\nUnassigning {len(decided.pairs)} outstanding review(s) on early "
+    print(f"\nUnassigning {len(decided.pairs)} outstanding review(s) on "
           f"{revision_tags.NO_REVISION_TAG} papers changes {len(effects)} reviewer(s)' late status"
           + (":" if effects else "."))
     for key, before, after, papers in effects:

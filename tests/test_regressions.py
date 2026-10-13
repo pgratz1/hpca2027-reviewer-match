@@ -6292,6 +6292,18 @@ class HotcrpLogTests(unittest.TestCase):
             )]),
         )
 
+    def test_a_bare_submission_after_a_draft_counts_as_submitted(self):
+        self.assertEqual({7}, self.submitted([
+            log_row("2026-08-01 09:00:00 -0400", "Review 7 edited, updated draft: PapSum, N words", email="a@x.edu"),
+            log_row("2026-08-01 09:00:03 -0400", "Review 7 submitted", email="a@x.edu"),
+        ]))
+
+    def test_returning_a_review_to_draft_reverses_a_submission(self):
+        self.assertEqual(set(), self.submitted([
+            log_row("2026-08-01 09:00:00 -0400", "Review 7 submitted: 500 words", email="a@x.edu"),
+            log_row("2026-08-02 09:00:00 -0400", "Review 7 unsubmitted draft: 500 words", email="c@x.edu"),
+        ]))
+
     def test_a_draft_save_does_not_count_as_submitted(self):
         self.assertEqual(set(), self.submitted([
             log_row("2026-08-01 09:00:00 -0400", "Review 7 edited, updated draft: PapSum, N words", email="a@x.edu"),
@@ -7298,10 +7310,11 @@ class RevisionTagTests(unittest.TestCase):
         self.assertEqual({1: self.NO, 2: self.ADVANCE, 3: self.ADVANCE, 4: self.NO, 5: None,
                           6: self.ADVANCE, 7: self.NO}, decisions)
 
-    def test_unassign_only_outstanding_r1_on_early_no_revision_papers(self):
+    def test_unassign_every_outstanding_r1_on_no_revision_papers(self):
         bar = review_scores.Bar(min_reviews=5, min_decided=3)
-        scores = {1: [2, 2, 2], 2: [3, 2, 2], 3: [2, 2, 2, 2, 2]}
-        decisions = revision_tags.decide(set(scores), scores, bar)
+        scores = {1: [2, 2, 2], 2: [3, 2, 2], 3: [2, 2, 2, 2, 2], 4: [5, 5, 5, 5, 5]}
+        manual = {4: review_scores.ManualTag(self.NO, "chair@x.edu", "t")}
+        decisions = revision_tags.decide(set(scores), scores, bar, manual=manual)
         R = hotcrp_log.Review
         live = {
             10: R(1, "out@x.edu", "primary", "R1", ""),
@@ -7309,9 +7322,10 @@ class RevisionTagTests(unittest.TestCase):
             12: R(1, "trc@x.edu", "external", "TRC", ""),    # TRC
             13: R(2, "adv@x.edu", "primary", "R1", ""),      # paper advances
             14: R(3, "net@x.edu", "primary", "R1", ""),      # decided on the net
+            15: R(4, "hand@x.edu", "primary", "R1", ""),     # hand-set NoRevision
         }
-        self.assertEqual([(1, "out@x.edu")],
-                         revision_tags.unassign_pairs(decisions, scores, bar, live, {11}))
+        self.assertEqual([(1, "out@x.edu"), (3, "net@x.edu"), (4, "hand@x.edu")],
+                         revision_tags.unassign_pairs(decisions, live, {11}))
 
     @staticmethod
     def tag_row(date, email, pid, action):

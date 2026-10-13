@@ -650,7 +650,7 @@ paper-leads: scripts/assign_paper_leads.py src/reviewer_match/review_scores.py \
 # upload is a delta that clears the opposite tag first, so a rerun after a paper
 # crosses the bar is safe. Also writes revision_unassign_upload.csv: a per-pair
 # clearreview of every outstanding R1 review on a paper decided NoRevision
-# before REVISION_MIN_REVIEWS. Nothing is uploaded.
+# (early, on the net or by hand). Nothing is uploaded.
 revision-tags: scripts/revision_tags.py src/reviewer_match/review_scores.py src/reviewer_match/hotcrp_log.py
 	@for f in $(REVIEWS) $(LOG); do \
 	  test -f $$f || { echo "ERROR: $$f not found; download it from HotCRP" >&2; exit 1; }; \
