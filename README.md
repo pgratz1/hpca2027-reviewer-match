@@ -1806,6 +1806,64 @@ paper does not have changes nothing. Desk-rejected and excluded papers are not
 touched. stdout gives the three counts. Offline, instant, and nothing is
 uploaded.
 
+### `scripts/advance_review_rounds.py` — move advancing papers' reviews into R2
+
+```
+make advance-rounds                       # R1 -> R2, every undecided paper
+make advance-rounds ADVANCE_FLAGS=--require-response     # ... that submitted a "Revision" response
+make advance-rounds ADVANCE_FLAGS=--require-attachment   # ... with the revision attached
+make advance-rounds ROUND_TO=R3 RESPONSE_NAME=Revision2
+```
+
+A HotCRP review belongs to exactly one round, fixed when it is assigned, and a
+review-form field restricted to a round ("Present on: `round:R2`") appears
+only on reviews whose own round that is. Opening R2 and reopening R1 for
+editing change nothing about reviews already filed under R1, so to put the R2
+questions in front of the reviewers the reviews themselves have to move.
+
+`make advance-rounds` writes `outputs/assignments/round_change_upload.csv`
+with one row per live R1 review on every paper that advances:
+
+```
+paper,action,email,reviewtype,round
+1234,review,drew@example.edu,any,R1:R2
+```
+
+That is HotCRP's own documented form for changing an existing review's round.
+`any` matches only an existing review, so a row can never create one, and
+`R1:R2` matches only a review still in R1, so a re-upload after the move is a
+no-op. The review's text, scores and submitted status stay with it; the file
+never contains a `clearreview`. Preview it on the bulk-assignment page before
+committing: HotCRP lists every round change it is about to make.
+
+A paper advances when it has **no decision** in the paper export. Two
+opt-in gates narrow that: `--require-response` also asks that the authors
+**submitted** the `Revision` response, either with the revised paper attached
+or as a rebuttal comment in its text (a draft does not count), and
+`--require-attachment` asks for the attachment too. The response state is
+replayed from the action log (`hotcrp_log.replay_responses`), where HotCRP
+logs every save as `Response N (Revision) submitted: attachments`. The log
+names the fields a save changed, never whether a file was added or removed,
+so "attached" means some save changed the attachments; under
+`--require-attachment` the script also lists any advancing paper whose
+attachments changed again after submission. Under every setting stdout lists
+the undecided papers with no submitted response and the attached/text-only
+split, so the policy's effect is visible.
+
+The PC reviews to move come from `hpca2027-pcassignments.csv`, HotCRP's
+"Review assignments" download, which is authoritative and carries each
+account's current address. The log replay is diffed against it and every
+disagreement is printed; today's are all addresses reviewers have changed
+since assignment. The download carries no external reviews, so the few
+external reviews assigned in R1 come from the log and move too. TRC reviews
+are in their own round and are left alone, with a count. stdout gives the
+counts, the split between attached and text-only responses, and the undecided
+papers that submitted nothing. Offline, instant, and nothing is uploaded.
+
+After the upload, everything here that keys on round R1 — `make
+timeliness-tags`, `make revision-tags`' unassign file, `make fill-slots`,
+`hotcrp_log.live_pairs` — sees the moved reviews under R2.
+
 ### `scripts/timeliness_tags.py` — tag papers by their authors' own review timeliness
 
 `make timeliness-tags` writes `outputs/assignments/timeliness_tags_upload.csv`,

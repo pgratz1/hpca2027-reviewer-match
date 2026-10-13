@@ -277,6 +277,27 @@ contains spaces and parentheses — always quote it in shell commands).
   account in the same second (an upload writes them all at once). The paper keeps
   what the last manual edit left, even over a later upload, which this upload then
   restores.
+- **`make advance-rounds`** writes `outputs/assignments/round_change_upload.csv`,
+  one `pid,review,email,any,R1:R2` row per live R1 review on **every paper
+  without a decision** (the policy since 2026-10-12; `--require-response`
+  narrows it to papers whose authors submitted the `Revision` response, as an
+  attached revision or a rebuttal comment, and `--require-attachment` to the
+  former). That is HotCRP's documented form for moving an existing review to
+  another round: `any` matches only an existing review, so no review can be
+  created, and `R1:R2` matches only one still in R1, so a re-upload is a no-op.
+  Review text, scores and submitted status travel with the review; **never a
+  `clearreview`**. Why move reviews at all: a review's round is fixed at
+  assignment, and form fields restricted to `round:R2` show only on R2 reviews,
+  so reopening R1 never shows reviewers the R2 questions. Decisions come from
+  the paper export; responses from the log (`Response N (Revision) submitted:
+  attachments`), via `hotcrp_log.replay_responses`; PC reviews from
+  `hpca2027-pcassignments.csv`, the authoritative "Review assignments" download,
+  whose current addresses win over the log's (the export-vs-log diff is reported,
+  and is address changes); the download carries no external reviews, so the R1
+  externals come from the log. TRC reviews stay in their round. Once uploaded,
+  every R1-keyed tool here (`timeliness-tags`, `revision-tags`' unassign file,
+  `fill-slots`, `hotcrp_log.live_pairs`) sees those reviews under R2.
+  Offline, instant.
 - **`make timeliness-tags`** writes `outputs/assignments/timeliness_tags_upload.csv`,
   a delta upload with **two buckets**:
   - `~~revisiondelay` when the paper is not NoRevision and a PC/reserve author

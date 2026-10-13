@@ -314,3 +314,73 @@ def engagement_actions(
     """`last_activity`, restricted to actions that mean a paper was actually opened."""
     engaged = [row for row in rows if ENGAGEMENT_RE.match(row["action"])]
     return last_activity(engaged, since=since)
+
+
+# "Response 1843 (Revision) submitted: attachments" / "Response 2261 (Revision)
+# edited draft: text" / "Response 2255 (Revision) deleted". HotCRP stores a
+# response as a comment, one per paper per response round, and logs each save
+# as the verb plus the fields that save changed. "attachments" in the field
+# list means the attachment set changed -- the log never says whether a file
+# was added or removed, so attachment presence is an inference (see
+# `replay_responses`).
+RESPONSE_RE = re.compile(
+    r"^Response (\d+) \(([^)]*)\) (started draft|edited draft|submitted|edited|deleted)(?::\s*(.*))?$"
+)
+RESPONSE_SUBMITTED_VERBS = frozenset({"submitted", "edited"})
+
+
+@dataclass
+class Response:
+    """One paper's live response in one response round, as the log records it."""
+
+    pid: int
+    rid: int
+    name: str
+    submitted: bool = False
+    attachment_saves: int = 0  # saves whose field list named "attachments"
+    attachment_saves_after_submit: int = 0  # ... of which came on a submitted response
+    last_saved_at: str = ""
+
+    @property
+    def attached(self) -> bool:
+        """Whether the response ever carried an attachment.
+
+        A removal also logs "attachments", so a response edited that way after
+        submission could in principle be empty again; callers report
+        `attachment_saves_after_submit` rather than pretend the log can tell.
+        """
+        return self.attachment_saves > 0
+
+
+def replay_responses(rows: list[dict[str, str]], name: str | None = None) -> dict[int, Response]:
+    """Replay the response saves into {pid: Response} for one response round.
+
+    `name` is the response round as HotCRP prints it in parentheses
+    ("Revision"); None keeps every round, in which case a paper with responses
+    in two rounds keeps the one saved last. A deleted response is dropped; a
+    re-created one (new id) replaces it. "submitted"/"edited" leave the
+    response submitted, "started draft"/"edited draft" leave it a draft.
+    """
+    live: dict[int, Response] = {}
+    for row in rows:
+        m = RESPONSE_RE.match(row["action"])
+        if not m or not row.get("paper"):
+            continue
+        rid, rname, verb, fields = int(m.group(1)), m.group(2), m.group(3), m.group(4) or ""
+        if name is not None and rname != name:
+            continue
+        pid = int(row["paper"])
+        if verb == "deleted":
+            if pid in live and live[pid].rid == rid:
+                del live[pid]
+            continue
+        resp = live.get(pid)
+        if resp is None or resp.rid != rid:
+            resp = live[pid] = Response(pid=pid, rid=rid, name=rname)
+        resp.submitted = verb in RESPONSE_SUBMITTED_VERBS
+        if "attachments" in [f.strip() for f in fields.split(",")]:
+            resp.attachment_saves += 1
+            if verb == "edited":
+                resp.attachment_saves_after_submit += 1
+        resp.last_saved_at = row.get("date", "")
+    return live

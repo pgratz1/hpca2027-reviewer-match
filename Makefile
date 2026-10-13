@@ -214,7 +214,7 @@ ASSIGN_DEPS = scripts/assign_reviewers.py src/reviewer_match/paper_matching.py \
 	dblp-snapshot coauthor-coi collaborator-coi affiliation-countries pc-roster duplicates \
 	complete-papers area-chairs-complete clear-uploads baselines clean clean-fingerprints \
 	log-assignments reviewer-activity rerun targeted-rerun swap-candidates swap-upload fill-slots \
-	revision-cutoffs paper-leads revision-tags timeliness-tags timeliness-emails \
+	revision-cutoffs paper-leads revision-tags advance-rounds timeliness-tags timeliness-emails \
 	timeliness-apologies extra-reviewers review-quality daily check-exports
 
 all: $(SENIORITY) enrich $(FINGERPRINTS)
@@ -657,6 +657,27 @@ revision-tags: scripts/revision_tags.py src/reviewer_match/review_scores.py src/
 	done
 	$(RUN) scripts.revision_tags --reviews $(REVIEWS) --log $(LOG) --data $(DATA) \
 		$(EXCLUDE_FLAG) $(REVISION_BAR)
+
+# One `pid,review,email,any,R1:R2` row per live R1 review on every paper that
+# has no decision (ADVANCE_FLAGS=--require-response narrows that to papers whose
+# authors submitted the RESPONSE_NAME response, --require-attachment to an
+# attached revision): HotCRP's form for moving an existing review into another
+# round. `any` matches only an existing review, so nothing
+# is created and no review text is touched; never a clearreview. PC reviews come
+# from PCASSIGNMENTS, external R1 reviews from the log. Preview on the
+# bulk-assignment page before committing. Nothing is uploaded.
+ROUND_FROM ?= R1
+ROUND_TO ?= R2
+RESPONSE_NAME ?= Revision
+ADVANCE_FLAGS ?=
+ROUND_CHANGE_UPLOAD = $(ASSIGNMENT_DIR)/round_change_upload.csv
+advance-rounds: scripts/advance_review_rounds.py src/reviewer_match/hotcrp_log.py
+	@for f in $(DATA) $(LOG) $(PCASSIGNMENTS); do \
+	  test -f $$f || { echo "ERROR: $$f not found; download it from HotCRP" >&2; exit 1; }; \
+	done
+	$(RUN) scripts.advance_review_rounds --data $(DATA) --log $(LOG) \
+		--pcassignments $(PCASSIGNMENTS) --from-round $(ROUND_FROM) --to-round $(ROUND_TO) \
+		--response "$(RESPONSE_NAME)" $(EXCLUDE_FLAG) --upload $(ROUND_CHANGE_UPLOAD) $(ADVANCE_FLAGS)
 
 # ~~revisiondelay on every paper whose PC/reserve authors finished the R1
 # reviews they hold DELAY_DAYS or more 24-hour windows after ONTIME_CUTOFF, or

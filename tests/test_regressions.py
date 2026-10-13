@@ -7957,3 +7957,62 @@ class ReviewQualityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AdvanceReviewRoundsTests(unittest.TestCase):
+    def _rows(self, specs):
+        return [{"action": a, "paper": p, "date": f"2026-10-{i + 1:02d} 10:00:00 -0400",
+                 "email": "", "affected_email": ""} for i, (p, a) in enumerate(specs)]
+
+    def test_replay_responses_tracks_submission_attachments_and_deletion(self):
+        rows = self._rows([
+            ("1", "Response 10 (Revision) started draft: attachments"),
+            ("1", "Response 10 (Revision) submitted: text"),
+            ("1", "Response 10 (Revision) edited: attachments"),
+            ("2", "Response 11 (Revision) started draft: text"),
+            ("2", "Response 11 (Revision) edited draft: text"),
+            ("3", "Response 12 (Revision) submitted"),
+            ("3", "Response 12 (Revision) deleted"),
+            ("3", "Response 13 (Revision) submitted: text"),
+            ("4", "Response 14 (Rebuttal) submitted: text"),
+        ])
+        live = hotcrp_log.replay_responses(rows, "Revision")
+        self.assertEqual({1, 2, 3}, set(live))
+        self.assertTrue(live[1].submitted and live[1].attached)
+        self.assertEqual((2, 1), (live[1].attachment_saves, live[1].attachment_saves_after_submit))
+        self.assertFalse(live[2].submitted)
+        self.assertEqual((13, True, False), (live[3].rid, live[3].submitted, live[3].attached))
+        self.assertIn(4, hotcrp_log.replay_responses(rows))
+
+    def test_advancing_pids_gates_only_when_asked(self):
+        from scripts import advance_review_rounds as arr
+        rows = self._rows([
+            ("1", "Response 10 (Revision) submitted: attachments"),
+            ("2", "Response 11 (Revision) submitted: text"),
+            ("3", "Response 12 (Revision) edited draft: attachments"),
+        ])
+        responses = hotcrp_log.replay_responses(rows, "Revision")
+        # Default: every undecided paper advances; the other sets only describe it.
+        self.assertEqual(({1, 2, 3, 4}, set(), {3, 4}), arr.advancing_pids({1, 2, 3, 4}, responses))
+        self.assertEqual(({1, 2}, set(), {3, 4}),
+                         arr.advancing_pids({1, 2, 3, 4}, responses, require_response=True))
+        self.assertEqual(({1}, {2}, {3, 4}),
+                         arr.advancing_pids({1, 2, 3, 4}, responses, require_attachment=True))
+
+    def test_upload_rows_are_any_old_to_new_and_never_clearreview(self):
+        from scripts import advance_review_rounds as arr
+        rows = arr.upload_rows({2, 1}, {1: {"b@x.org", "a@x.org"}, 2: set(), 3: {"c@x.org"}}, "R1", "R2")
+        self.assertEqual([[1, "review", "a@x.org", "any", "R1:R2"],
+                          [1, "review", "b@x.org", "any", "R1:R2"]], rows)
+
+    def test_load_export_reviews_keeps_pc_reviews_in_the_round_only(self):
+        from scripts import advance_review_rounds as arr
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "pcassignments.csv"
+            path.write_text("paper,action,email,round,title\n"
+                            "1,clearreview,\"#pc\",any,T\n"
+                            "1,primaryreview,A@x.org,R1,T\n"
+                            "1,pcreview,b@x.org,R1,T\n"
+                            "1,primaryreview,c@x.org,R2,T\n"
+                            "2,externalreview,d@x.org,R1,T\n", encoding="utf-8")
+            self.assertEqual({1: {"a@x.org", "b@x.org"}}, arr.load_export_reviews(str(path), "R1"))
