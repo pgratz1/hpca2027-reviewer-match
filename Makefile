@@ -16,6 +16,7 @@
 #   make clear-uploads    HotCRP CSVs that wipe R1 reviews and the track tags
 #   make baselines        randomized arms: how much of the match is SPECTER2?
 #   make revision-cutoffs share of reviewed papers each revision cutoff would catch
+#   make summary-scores   do papers lacking a lead summary score worse? length vs score
 #   make paper-leads      random, load-balanced leads for papers that advance
 #   make revision-tags    RevisionAdvance / NoRevision tags for decided papers
 #   make timeliness-tags  ~~ontime / ~~onedaylate / ... by authors' own reviews
@@ -215,7 +216,7 @@ ASSIGN_DEPS = scripts/assign_reviewers.py src/reviewer_match/paper_matching.py \
 	complete-papers area-chairs-complete clear-uploads baselines clean clean-fingerprints \
 	log-assignments reviewer-activity rerun targeted-rerun swap-candidates swap-upload fill-slots \
 	revision-cutoffs paper-leads revision-tags advance-rounds timeliness-tags timeliness-emails \
-	timeliness-apologies extra-reviewers review-quality daily check-exports
+	timeliness-apologies extra-reviewers review-quality daily check-exports summary-scores
 
 all: $(SENIORITY) enrich $(FINGERPRINTS)
 	$(RUN) scripts.build_fingerprints --csv "$(CSV)" --fingerprint-cache $(FINGERPRINTS)
@@ -611,6 +612,20 @@ revision-cutoffs: scripts/revision_cutoffs.py src/reviewer_match/review_scores.p
 	@test -f $(LOG) || { echo "ERROR: $(LOG) not found; download the action log from HotCRP" >&2; exit 1; }
 	$(RUN) scripts.revision_cutoffs --reviews $(REVIEWS) --log $(LOG) --data $(DATA) \
 		--min-reviews $(REVISION_MIN_REVIEWS) $(EXCLUDE_FLAG) $(REVISION_FLAGS)
+
+# Whether the RevisionAdvance papers that got no author-visible summary comment
+# score worse than those that did, and whether summary length tracks score.
+# Comments come from the text export (HotCRP "Download reviews (text)"); TRC
+# reviews are left out of the averages. Offline, read-only apart from its
+# per-paper CSV. SUMMARY_FLAGS=--all-decided widens it past RevisionAdvance.
+REVIEWS_TXT = $(INPUT_DIR)/hpca2027-reviews.txt
+SUMMARY_FLAGS ?=
+summary-scores: scripts/summary_scores.py src/reviewer_match/review_scores.py src/reviewer_match/hotcrp_log.py
+	@test -f $(REVIEWS) || { echo "ERROR: $(REVIEWS) not found; download the reviews CSV from HotCRP" >&2; exit 1; }
+	@test -f $(REVIEWS_TXT) || { echo "ERROR: $(REVIEWS_TXT) not found; download the reviews (text) from HotCRP" >&2; exit 1; }
+	@test -f $(LOG) || { echo "ERROR: $(LOG) not found; download the action log from HotCRP" >&2; exit 1; }
+	$(RUN) scripts.summary_scores --reviews $(REVIEWS) --reviews-txt $(REVIEWS_TXT) \
+		--leads $(LEADS) --log $(LOG) --data $(DATA) $(EXCLUDE_FLAG) $(SUMMARY_FLAGS)
 
 # The revision bar every tag and lead target shares. REVISION_MIN_REVIEWS+
 # submitted PC reviews: under the bar at "average <= 2.5 and at most one score of

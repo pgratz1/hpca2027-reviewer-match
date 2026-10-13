@@ -39,6 +39,8 @@ reviewers_pinned.txt
 # Drafted emails that name an individual as delinquent to their collaborators.
 timeliness_emails*.txt
 timeliness_apology_emails.txt
+# Per-paper review averages joined to each paper's lead.
+summary_scores_*
 current_assignment*.csv
 assignment-rerun*.csv
 trc_dblp_overrides.csv

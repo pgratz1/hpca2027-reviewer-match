@@ -1609,6 +1609,23 @@ One carry-over from the normal pipeline: the upload opens with
 review on a paper the run excluded — today, the chair's two test reviews on the
 `EXCLUDE_PIDS` paper.
 
+### `scripts/summary_scores.py` — do unsummarised papers score worse?
+
+`make summary-scores` compares the `RevisionAdvance` papers whose discussion
+lead posted an author-visible summary with those that got none, by average
+pre-rebuttal overall merit (TRC reviews left out, as in `revision-cutoffs`),
+and, among the summarised papers, correlates the summary's length in words
+with that average. A summary is any `Comment @A<n>` block in
+`data/inputs/hpca2027-reviews.txt` (HotCRP's "Download reviews (text)"); a
+second split counts only those by the paper's lead (`hpca2027-leads.csv`, the
+log filling papers it hides). Tests are permutation tests (difference in means,
+Pearson, Spearman) plus a Mann-Whitney U, stdlib only. A paper whose text-export
+block shows no review — the downloader's conflicts — is left out rather than
+counted as unsummarised. `SUMMARY_FLAGS=--all-decided` widens the population to
+every paper with `REVISION_MIN_DECIDED` reviews. Writes
+`outputs/reports/summary_scores_papers.csv` (gitignored by name). Offline,
+~25 s, read-only.
+
 ### `scripts/revision_cutoffs.py` — how many papers a revision cutoff would catch
 
 `make revision-cutoffs` is decision support for the revision-eligibility cutoff:

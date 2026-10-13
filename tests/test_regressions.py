@@ -64,6 +64,7 @@ from scripts import build_targeted_rerun_pins
 from scripts import propose_reviewer_swaps
 from scripts import generate_swap_upload
 from scripts import revision_cutoffs
+from scripts import summary_scores
 from scripts import assign_paper_leads
 from scripts import revision_tags
 from scripts import review_quality
@@ -7048,6 +7049,33 @@ class RevisionCutoffsTests(unittest.TestCase):
         self.assertEqual([1.0, 2.0, 2.5], review_scores.parse_thresholds("2.5,1,2,2"))
         with self.assertRaises(ValueError):
             review_scores.parse_thresholds("0.5,2")
+
+
+class SummaryScoresTests(unittest.TestCase):
+    """scripts.summary_scores: author-visible comments from the text export, and ranks."""
+
+    TEXT = (
+        "Submission #1: One\n=====\n\nReview #1A [R1]\n=====\n* Reviewer: A <a@x.org>\n\n"
+        "Comment @1 by B <b@x.org> (Reviewer B)\n---------\nPC only words here\n\n"
+        "Comment @A1 by Reviewer C [C Person <C@X.org>]\n---------\n"
+        "Dear authors, four more words.\n\nSecond line.\n\n"
+        "Comment @2 by D <d@x.org>\n---------\nnot counted\n\n"
+        "* * * * * * *\n\n"
+        "Submission #2: Two\n=====\n\nReview #2A [R1]\n=====\n\n"
+        "Comment @1 by B <b@x.org>\n---------\nPC only\n\n"
+        "Submission #3: Three\n=====\n\nAbstract\n--------\nNo reviews visible.\n"
+    )
+
+    def test_parse_txt_keeps_author_visible_comments_only(self):
+        papers = summary_scores.parse_txt(self.TEXT)
+        self.assertEqual(papers[1], {"reviews": 1, "comments": [("c@x.org", 7)]})
+        self.assertEqual(papers[2], {"reviews": 1, "comments": []})
+        self.assertEqual(papers[3], {"reviews": 0, "comments": []})
+
+    def test_ranks_share_ties_and_spearman_is_monotone(self):
+        self.assertEqual(summary_scores.ranks([3, 1, 3, 2]), [3.5, 1.0, 3.5, 2.0])
+        self.assertAlmostEqual(summary_scores.spearman([1, 2, 3, 4], [10, 20, 25, 99]), 1.0)
+        self.assertAlmostEqual(summary_scores.spearman([1, 2, 3], [3, 2, 1]), -1.0)
 
 
 class PaperLeadTests(unittest.TestCase):

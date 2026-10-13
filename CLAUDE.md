@@ -210,6 +210,13 @@ contains spaces and parentheses — always quote it in shell commands).
   outstanding R1 reviews (`REVISION_FLAGS=--complete-only`). Desk-rejected
   papers are dropped. Writes `outputs/reports/revision_cutoffs.html` and
   `revision_cutoffs_papers.csv`. Offline, instant, read-only.
+- **`make summary-scores`** asks whether the `RevisionAdvance` papers with no
+  author-visible summary comment (`Comment @A…` in `hpca2027-reviews.txt`)
+  score worse than those with one, and whether summary length tracks score
+  (permutation p-values, Mann-Whitney; a lead-authored split too). Papers the
+  text export hides (the downloader's conflicts) are dropped, never counted as
+  unsummarised. Writes `summary_scores_papers.csv`, gitignored by name.
+  Offline, read-only.
 - **`make paper-leads`** gives every paper that advances one discussion lead
   and writes `outputs/assignments/lead_upload.csv`, a HotCRP **delta**
   (`clearlead`, then `lead` rows). A paper advances with fewer than
@@ -406,7 +413,7 @@ contains spaces and parentheses — always quote it in shell commands).
   `scripts/revision_cutoffs.py`, `scripts/assign_paper_leads.py`,
   `scripts/revision_tags.py`, `scripts/timeliness_tags.py`,
   `scripts/timeliness_emails.py`, `scripts/extra_reviewer_candidates.py`,
-  `scripts/review_quality.py`,
+  `scripts/review_quality.py`, `scripts/summary_scores.py`,
   `scripts/main.py`.
 
 ## Architecture (filter-then-rank, then constrained assignment)
