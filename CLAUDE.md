@@ -217,6 +217,13 @@ contains spaces and parentheses — always quote it in shell commands).
   text export hides (the downloader's conflicts) are dropped, never counted as
   unsummarised. Writes `summary_scores_papers.csv`, gitignored by name.
   Offline, read-only.
+- **`make short-reviews`** flags submitted reviews with little or no text:
+  ≤`SHORT_REVIEW_WORDS` (150) author-visible words, 2+ empty/placeholder core
+  fields, or under 0.25× the paper's other reviews' median. Desk-rejected papers are
+  skipped; round-1 rejects are kept (`eligible_pids`' under-review set would
+  drop them). Writes
+  `outputs/reports/short_reviews.csv`, gitignored **by name** (it names
+  reviewers). Offline, instant, read-only.
 - **`make paper-leads`** gives every paper that advances one discussion lead
   and writes `outputs/assignments/lead_upload.csv`, a HotCRP **delta**
   (`clearlead`, then `lead` rows). A paper advances with fewer than
@@ -413,7 +420,7 @@ contains spaces and parentheses — always quote it in shell commands).
   `scripts/revision_cutoffs.py`, `scripts/assign_paper_leads.py`,
   `scripts/revision_tags.py`, `scripts/timeliness_tags.py`,
   `scripts/timeliness_emails.py`, `scripts/extra_reviewer_candidates.py`,
-  `scripts/review_quality.py`, `scripts/summary_scores.py`,
+  `scripts/review_quality.py`, `scripts/summary_scores.py`, `scripts/short_reviews.py`,
   `scripts/main.py`.
 
 ## Architecture (filter-then-rank, then constrained assignment)

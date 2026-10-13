@@ -1626,6 +1626,21 @@ every paper with `REVISION_MIN_DECIDED` reviews. Writes
 `outputs/reports/summary_scores_papers.csv` (gitignored by name). Offline,
 ~25 s, read-only.
 
+### `scripts/short_reviews.py` — submitted reviews with little or no text
+
+`make short-reviews` flags a submitted review when its author-visible text
+(summary, strengths, weaknesses, comments, questions) runs to
+`SHORT_REVIEW_WORDS` (150) words or fewer, when two or more of the four core
+fields are empty or a placeholder ("n/a", "none", "see above", ...), or when it
+is under a quarter of the median length of the same paper's other reviews.
+Reviews on desk-rejected and withdrawn papers are skipped and kept out of each
+paper's median; round-1 rejects are kept, since their authors got the reviews. stdout lists the R1
+reviews, shortest first, and the reviewers with
+two or more; `outputs/reports/short_reviews.csv` (gitignored by name) holds
+every flagged review, TRC included, with per-field word
+counts. `SHORT_REVIEW_FLAGS="--thin-fields 1 --paper-ratio 0"` retunes it.
+Offline, instant, read-only.
+
 ### `scripts/revision_cutoffs.py` — how many papers a revision cutoff would catch
 
 `make revision-cutoffs` is decision support for the revision-eligibility cutoff:

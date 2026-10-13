@@ -24,6 +24,7 @@ from reviewer_match import affiliation_country
 from reviewer_match import coauthor_coi
 from reviewer_match import collaborator_coi
 from scripts import assign_reviewers
+from scripts import short_reviews
 from scripts import assign_area_chairs
 from reviewer_match import area_chairs
 from scripts import build_affiliation_countries
@@ -7982,6 +7983,25 @@ class ReviewQualityTests(unittest.TestCase):
                    mk("1B", "b", "early", 10)]
         self.assertEqual([-60.0], review_quality.within_diffs(reviews, "words"))
 
+
+class ShortReviewTests(unittest.TestCase):
+    """Placeholder fields and log word counts behind `make short-reviews`."""
+
+    def test_thin_fields(self):
+        for text in ("", "  ", "-", "...", "N/A", "None.", "See above.", "Please see comments",
+                     "same as above", "No."):
+            self.assertTrue(short_reviews.thin(text), text)
+        for text in ("Novel idea.", "Nonetheless the evaluation is thin.",
+                     "See Figure 3: the speedup disappears at 64 cores, which undermines it."):
+            self.assertFalse(short_reviews.thin(text), text)
+
+    def test_log_word_counts_keep_latest_save(self):
+        rows = [
+            {"action": "Review 7 edited: Str, 40 words"},
+            {"action": "Review 7 edited, submitted: PreRebOve:2, 120 words"},
+            {"action": "Review 8 assigned: primary, round R1"},
+        ]
+        self.assertEqual({7: 120}, short_reviews.log_word_counts(rows))
 
 if __name__ == "__main__":
     unittest.main()

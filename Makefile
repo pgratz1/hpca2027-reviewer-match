@@ -17,6 +17,7 @@
 #   make baselines        randomized arms: how much of the match is SPECTER2?
 #   make revision-cutoffs share of reviewed papers each revision cutoff would catch
 #   make summary-scores   do papers lacking a lead summary score worse? length vs score
+#   make short-reviews    submitted reviews with little or no text behind their scores
 #   make paper-leads      random, load-balanced leads for papers that advance
 #   make revision-tags    RevisionAdvance / NoRevision tags for decided papers
 #   make timeliness-tags  ~~ontime / ~~onedaylate / ... by authors' own reviews
@@ -216,7 +217,7 @@ ASSIGN_DEPS = scripts/assign_reviewers.py src/reviewer_match/paper_matching.py \
 	complete-papers area-chairs-complete clear-uploads baselines clean clean-fingerprints \
 	log-assignments reviewer-activity rerun targeted-rerun swap-candidates swap-upload fill-slots \
 	revision-cutoffs paper-leads revision-tags advance-rounds timeliness-tags timeliness-emails \
-	timeliness-apologies extra-reviewers review-quality daily check-exports summary-scores
+	timeliness-apologies extra-reviewers review-quality daily check-exports summary-scores short-reviews
 
 all: $(SENIORITY) enrich $(FINGERPRINTS)
 	$(RUN) scripts.build_fingerprints --csv "$(CSV)" --fingerprint-cache $(FINGERPRINTS)
@@ -626,6 +627,19 @@ summary-scores: scripts/summary_scores.py src/reviewer_match/review_scores.py sr
 	@test -f $(LOG) || { echo "ERROR: $(LOG) not found; download the action log from HotCRP" >&2; exit 1; }
 	$(RUN) scripts.summary_scores --reviews $(REVIEWS) --reviews-txt $(REVIEWS_TXT) \
 		--leads $(LEADS) --log $(LOG) --data $(DATA) $(EXCLUDE_FLAG) $(SUMMARY_FLAGS)
+
+# Submitted reviews with little or no text: <= SHORT_REVIEW_WORDS author-visible
+# words, 2+ empty/placeholder core fields, or under a quarter of the paper's
+# other reviews. Desk-rejected papers are skipped; round-1 rejects are kept.
+# Writes outputs/reports/short_reviews.csv, which names reviewers. Offline.
+SHORT_REVIEW_WORDS ?= 150
+SHORT_REVIEW_FLAGS ?=
+short-reviews: scripts/short_reviews.py src/reviewer_match/review_scores.py src/reviewer_match/hotcrp_log.py
+	@for f in $(REVIEWS) $(LOG) $(DATA); do \
+	  test -f $$f || { echo "ERROR: $$f not found; download it from HotCRP" >&2; exit 1; }; \
+	done
+	$(RUN) scripts.short_reviews --reviews $(REVIEWS) --log $(LOG) --data $(DATA) \
+		--short-words $(SHORT_REVIEW_WORDS) $(EXCLUDE_FLAG) $(SHORT_REVIEW_FLAGS)
 
 # The revision bar every tag and lead target shares. REVISION_MIN_REVIEWS+
 # submitted PC reviews: under the bar at "average <= 2.5 and at most one score of

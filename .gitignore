@@ -41,6 +41,8 @@ timeliness_emails*.txt
 timeliness_apology_emails.txt
 # Per-paper review averages joined to each paper's lead.
 summary_scores_*
+# Reviews flagged as thin, by reviewer name.
+short_reviews*.csv
 current_assignment*.csv
 assignment-rerun*.csv
 trc_dblp_overrides.csv
