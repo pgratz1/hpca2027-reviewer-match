@@ -1,5 +1,7 @@
 import argparse
 import contextlib
+import dataclasses
+import datetime
 import csv
 import io
 import json
@@ -72,6 +74,8 @@ from scripts import review_quality
 from scripts import timeliness_emails
 from scripts import timeliness_tags
 from reviewer_match import review_scores
+from reviewer_match import hotcrp_api
+from scripts import discussion_nudges
 
 PCINFO_FIELDS = [
     "given_name", "family_name", "email", "affiliation", "orcid", "country",
@@ -8064,3 +8068,529 @@ class AdvanceReviewRoundsTests(unittest.TestCase):
                             "1,primaryreview,c@x.org,R2,T\n"
                             "2,externalreview,d@x.org,R1,T\n", encoding="utf-8")
             self.assertEqual({1: {"a@x.org", "b@x.org"}}, arr.load_export_reviews(str(path), "R1"))
+
+
+# ---------------------------------------------------------------------------
+# HotCRP API client and discussion nudges
+# ---------------------------------------------------------------------------
+
+class _FakeResponse:
+    def __init__(self, body, status=200):
+        self._body = body
+        self.status_code = status
+        self.headers = {}
+
+    def json(self):
+        if isinstance(self._body, str):
+            raise ValueError("not json")
+        return self._body
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"HTTP {self.status_code}", response=self)
+
+
+class _FakeSession:
+    """Answers GET/POST from a dict keyed on (method, path) and records calls."""
+
+    def __init__(self, answers):
+        self.answers = answers
+        self.calls = []
+
+    def get(self, url, params=None, timeout=None, headers=None):
+        path = url.split("/api/", 1)[1]
+        self.calls.append(("GET", path, dict(params or {}), headers))
+        return _FakeResponse(*self._answer("GET", path, params))
+
+    def request(self, method, url, data=None, params=None, headers=None, timeout=None):
+        path = url.split("/api/", 1)[1]
+        sent = dict(data or {}) or dict(params or {})
+        self.calls.append((method, path, sent, headers))
+        return _FakeResponse(*self._answer(method, path, sent))
+
+    def _answer(self, method, path, params):
+        answer = self.answers[(method, path)]
+        if callable(answer):
+            answer = answer(params)
+        if isinstance(answer, tuple):
+            return answer
+        return answer, 200
+
+
+class HotcrpApiTests(unittest.TestCase):
+    def test_from_env_names_both_missing_variables(self):
+        with self.assertRaises(ValueError) as cm:
+            hotcrp_api.Site.from_env(env={})
+        self.assertIn("HOTCRP_SITE", str(cm.exception))
+        self.assertIn("HOTCRP_TOKEN", str(cm.exception))
+        with self.assertRaises(ValueError) as cm:
+            hotcrp_api.Site.from_env(env={"HOTCRP_SITE": "https://x.hotcrp.com"})
+        self.assertNotIn("HOTCRP_SITE and", str(cm.exception))
+
+    def test_get_sends_bearer_header_and_strips_none_params(self):
+        session = _FakeSession({("GET", "search"): {"ok": True, "ids": [3, 1]}})
+        site = hotcrp_api.Site("https://x.hotcrp.com/", "hct_secret", session=session)
+        self.assertEqual([3, 1], site.search("#tag"))
+        method, path, params, headers = session.calls[0]
+        self.assertEqual("https://x.hotcrp.com", site.base_url)
+        self.assertEqual({"q": "#tag", "t": "s"}, params)
+        self.assertEqual("bearer hct_secret", headers["Authorization"])
+        # Booleans travel as 0/1, None is dropped.
+        session.answers[("GET", "comments")] = {"ok": True, "comments": []}
+        site.comments("1 2", content=False)
+        self.assertEqual({"q": "1 2", "t": "s", "content": 0}, session.calls[1][2])
+
+    def test_ok_false_and_http_errors_raise_with_messages(self):
+        session = _FakeSession({
+            ("GET", "reviews"): {"ok": False, "message_list": [{"status": 2, "message": "<b>Permission</b> error"}]},
+            ("GET", "comments"): ("not json", 500),
+        })
+        site = hotcrp_api.Site("https://x.hotcrp.com", "t", session=session)
+        with self.assertRaises(hotcrp_api.HotcrpError) as cm:
+            site.reviews("1")
+        self.assertIn("Permission error", str(cm.exception))
+        self.assertEqual(1, len(cm.exception.messages))
+        with mock.patch.object(hotcrp_api.time, "sleep"):
+            with self.assertRaises(hotcrp_api.HotcrpError):
+                site.comments("1")
+
+    def test_post_comment_sends_documented_fields(self):
+        session = _FakeSession({("POST", "12/comment"): {"ok": True, "cid": 77, "comment": {"cid": 77}}})
+        site = hotcrp_api.Site("https://x.hotcrp.com", "t", session=session)
+        resp = site.post_comment(12, "hi @A B", tags="nudge", dry_run=True)
+        self.assertEqual(77, resp["cid"])
+        method, path, data, _ = session.calls[0]
+        self.assertEqual(("POST", "12/comment"), (method, path))
+        self.assertEqual({"p": 12, "c": "new", "text": "hi @A B", "visibility": "rev", "topic": "rev",
+                          "tags": "nudge", "notify": 1, "dry_run": 1}, data)
+        # Empty tags are omitted rather than sent as "".
+        site.post_comment(12, "x")
+        self.assertNotIn("tags", session.calls[1][2])
+        self.assertEqual(0, session.calls[1][2]["dry_run"])
+
+    def test_delete_comment_puts_the_id_in_the_query_string(self):
+        seen = {}
+
+        class Session(_FakeSession):
+            def request(self, method, url, data=None, params=None, headers=None, timeout=None):
+                seen.update(method=method, data=data, params=params)
+                return _FakeResponse({"ok": True, "change_list": ["delete"]})
+
+        site = hotcrp_api.Site("https://x.hotcrp.com", "t", session=Session({}))
+        site.delete_comment(1152, 2284)
+        self.assertEqual("DELETE", seen["method"])
+        self.assertIsNone(seen["data"])
+        self.assertEqual({"c": 2284, "notify": 0}, seen["params"])
+
+    def test_snapshot_round_trip_and_offline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = _FakeSession({("GET", "reviews"): {"ok": True, "reviews": [{"rid": 1}]}})
+            site = hotcrp_api.Site("https://x.hotcrp.com", "t", session=session, snapshot_dir=tmp)
+            self.assertEqual([{"rid": 1}], site.reviews("1 2"))
+            files = os.listdir(tmp)
+            self.assertEqual(1, len(files))
+            self.assertTrue(files[0].startswith("reviews-"))
+            offline = hotcrp_api.Site("https://x.hotcrp.com", "t", session=_FakeSession({}),
+                                      snapshot_dir=tmp, offline=True)
+            self.assertEqual([{"rid": 1}], offline.reviews("1 2"))
+            with self.assertRaises(FileNotFoundError):
+                offline.reviews("3")
+            with self.assertRaises(RuntimeError):
+                offline.post_comment(1, "x")
+        with self.assertRaises(ValueError):
+            hotcrp_api.Site("https://x", "t", offline=True)
+
+    def test_pid_query_chunks_sorted_and_deduped(self):
+        self.assertEqual(["1 2 3", "4 5"], list(hotcrp_api.pid_query([5, 3, 1, 2, 4, 1], chunk=3)))
+        self.assertEqual([], list(hotcrp_api.pid_query([])))
+
+
+def _dt(s):
+    return hotcrp_log.parse_date(s)
+
+
+class DiscussionNudgeTests(unittest.TestCase):
+    SINCE = _dt("2026-10-10 00:00:00 -0400")
+
+    def _comment(self, pid, cid, email, created, **kw):
+        fields = dict(pid=pid, cid=cid, author_email=email, author="", visibility="rev", topic="rev",
+                      response="", draft=False, by_author=False, modified_at=0, created_at=_dt(created))
+        fields.update(kw)
+        return discussion_nudges.Comment(**fields)
+
+    def _review(self, pid, rid, email, status="delivered", modified="2026-10-01 00:00:00 -0400",
+                rtype=4, round="R1", name=""):
+        return discussion_nudges.ReviewState(pid=pid, rid=rid, email=email, reviewer=name, round=round,
+                                             rtype=rtype, status=status,
+                                             modified_at=int(_dt(modified).timestamp()))
+
+    def test_comment_creation_comes_from_the_log(self):
+        rows = [
+            {"date": "2026-10-11 09:00:00 -0400", "email": "lead@x.org", "paper": "5", "action": "Comment 40 edited"},
+            {"date": "2026-10-12 09:00:00 -0400", "email": "lead@x.org", "paper": "5", "action": "Comment 40 edited: text"},
+            {"date": "2026-10-12 10:00:00 -0400", "email": "r@x.org", "paper": "5", "action": "Comment 41 submitted"},
+            {"date": "2026-10-12 11:00:00 -0400", "email": "r@x.org", "paper": "5", "action": "Review 9 edited, updated: Wea, 10 words"},
+        ]
+        created = hotcrp_log.comment_created_at(rows)
+        self.assertEqual({40: "2026-10-11 09:00:00 -0400", 41: "2026-10-12 10:00:00 -0400"}, created)
+        self.assertEqual({9: "2026-10-12 11:00:00 -0400"}, hotcrp_log.review_updated_at(rows))
+        objs = [{"pid": 5, "cid": 40, "author_email": "Lead@X.org", "modified_at": int(_dt("2026-10-12 09:00:00 -0400").timestamp())},
+                {"pid": 5, "cid": 99, "author_email": "z@x.org", "modified_at": 1_800_000_000, "draft": True}]
+        parsed = discussion_nudges.parse_comments(objs, created)
+        self.assertEqual(_dt("2026-10-11 09:00:00 -0400"), parsed[0].created_at)
+        self.assertEqual("lead@x.org", parsed[0].author_email)
+        # No log row: last-modified stands in.
+        self.assertEqual(1_800_000_000, int(parsed[1].created_at.timestamp()))
+        self.assertFalse(parsed[1].discussion)
+
+    def test_leads_without_starter(self):
+        leads = {1: "lead1@x.org", 2: "lead2@x.org", 3: "lead3@x.org"}
+        comments = [
+            self._comment(1, 10, "lead1@x.org", "2026-10-11 08:00:00 -0400"),      # starter: fine
+            self._comment(2, 11, "lead2@x.org", "2026-10-09 08:00:00 -0400"),      # before the cutoff
+            self._comment(3, 12, "lead3@x.org", "2026-10-11 08:00:00 -0400", visibility="admin"),  # admin-only
+            self._comment(3, 13, "lead3@x.org", "2026-10-11 09:00:00 -0400", response="Revision"),  # a response
+            self._comment(3, 14, "other@x.org", "2026-10-11 09:00:00 -0400"),      # somebody else
+        ]
+        targets, no_lead = discussion_nudges.leads_without_starter({1, 2, 3, 4}, leads, comments, self.SINCE)
+        self.assertEqual([(2, "lead2@x.org"), (3, "lead3@x.org")], [(t.pid, t.email) for t in targets])
+        self.assertEqual([4], no_lead)
+        self.assertTrue(all(t.kind == discussion_nudges.KIND_LEAD for t in targets))
+
+    def test_reviewers_silent_and_missing(self):
+        reviews = [
+            self._review(1, 1, "a@x.org"),                                             # neither: silent
+            self._review(1, 2, "b@x.org", modified="2026-10-11 00:00:00 -0400"),       # updated review
+            self._review(1, 3, "c@x.org"),                                             # commented (below)
+            self._review(1, 4, "d@x.org", status="draft"),                             # not submitted
+            self._review(1, 5, "e@x.org", rtype=1),                                    # external
+            self._review(1, 6, "f@x.org", round="TRC"),                                # training review
+            self._review(2, 7, "a@x.org"),                                             # out of scope paper
+        ]
+        comments = [self._comment(1, 20, "c@x.org", "2026-10-11 08:00:00 -0400")]
+        silent = discussion_nudges.reviewers_silent({1}, reviews, comments, self.SINCE)
+        self.assertEqual([("a@x.org", "no review update, no comment")], [(t.email, t.note) for t in silent])
+        both = discussion_nudges.reviewers_silent({1}, reviews, comments, self.SINCE, require_both=True)
+        self.assertEqual(["a@x.org", "b@x.org", "c@x.org"], [t.email for t in both])
+        self.assertEqual("no comment", both[1].note)
+        missing = discussion_nudges.reviewers_missing_review({1}, reviews)
+        self.assertEqual([("d@x.org", "review draft")], [(t.email, t.note) for t in missing])
+
+    def test_build_nudges_groups_per_paper_and_renders_mentions(self):
+        targets = [
+            discussion_nudges.Target(1, discussion_nudges.KIND_SILENT, "b@x.org"),
+            discussion_nudges.Target(1, discussion_nudges.KIND_SILENT, "a@x.org"),
+            discussion_nudges.Target(2, discussion_nudges.KIND_LEAD, "lead@x.org"),
+            discussion_nudges.Target(2, discussion_nudges.KIND_SILENT, "z@x.org"),
+        ]
+        names = {"a@x.org": "Ann Author", "b@x.org": "Bob Builder", "lead@x.org": "Lee Lead"}
+        titles = {1: "Paper One", 2: "Paper Two"}
+        nudges, unnamed = discussion_nudges.build_nudges(
+            targets, names, titles, {2: "lead@x.org"}, {}, due="Friday")
+        self.assertEqual([(1, "reviewer_silent"), (2, "lead_starter"), (2, "reviewer_silent")],
+                         [(n.pid, n.kind) for n in nudges])
+        self.assertEqual(["a@x.org", "b@x.org"], nudges[0].mentions)
+        self.assertTrue(nudges[0].text.startswith("@Ann Author, @Bob Builder -- "))
+        self.assertIn(" by Friday", nudges[0].text)
+        self.assertEqual("reviewers_discuss", nudges[0].template)
+        self.assertEqual("leads_starter", nudges[1].template)
+        self.assertIn("@Lee Lead", nudges[1].text)
+        self.assertEqual(["z@x.org"], unnamed)
+        self.assertIn("@z@x.org", nudges[2].text)
+        self.assertEqual("nudge", nudges[0].tags)
+        # --text overrides every template, and {due_clause} is empty without --due.
+        custom, _ = discussion_nudges.build_nudges(targets[:1], names, titles, {}, {}, text="Ping {mentions}{due_clause} re #{pid} {title}")
+        self.assertEqual("Ping @Bob Builder re #1 Paper One", custom[0].text)
+        with self.assertRaises(ValueError):
+            discussion_nudges.build_nudges(targets[:1], names, titles, {}, {}, text="{nope}")
+        preview = discussion_nudges.preview_text(nudges)
+        self.assertIn("===== PAPER 1 =====\nPaper One\n", preview)
+        self.assertIn("Bob Builder <b@x.org>", preview)
+
+    def test_shipped_templates_render(self):
+        for kind, name in discussion_nudges.DEFAULT_TEMPLATES.items():
+            text = discussion_nudges.render(discussion_nudges.load_template(name), mentions="@A", names="A", n=1,
+                                            pid=1, title="T", lead="L", due="", due_clause="")
+            self.assertTrue(text.startswith("@A"), (kind, text))
+        with self.assertRaises(FileNotFoundError):
+            discussion_nudges.load_template("no_such_template")
+
+    def test_ledger_cooldown_and_batch_dedupe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "ledger.csv")
+            self.assertEqual([], discussion_nudges.load_ledger(path))
+            discussion_nudges.append_ledger(path, [
+                {"sent_at": "2026-10-10T09:00:00-04:00", "batch": "b1", "pid": "1", "cid": "5",
+                 "kind": "lead_starter", "email": "L@x.org", "template": "leads_starter"},
+            ])
+            discussion_nudges.append_ledger(path, [
+                {"sent_at": "2026-10-01T09:00:00-04:00", "batch": "b0", "pid": "1", "cid": "4",
+                 "kind": "lead_starter", "email": "old@x.org", "template": "leads_starter"},
+            ])
+            ledger = discussion_nudges.load_ledger(path)
+            self.assertEqual(2, len(ledger))
+            now = datetime.datetime.fromisoformat("2026-10-12T09:00:00-04:00")
+            self.assertEqual({(1, "lead_starter", "l@x.org")}, discussion_nudges.recent_keys(ledger, now, 3))
+            self.assertEqual(set(), discussion_nudges.recent_keys(ledger, now, 0))
+            self.assertEqual({(1, "lead_starter")}, discussion_nudges.sent_in_batch(ledger, "b1"))
+
+    def _batch(self, now, nudges, site="https://x.hotcrp.com"):
+        return {"version": discussion_nudges.BATCH_VERSION, "generated_at": now.isoformat(timespec="seconds"),
+                "site": site, "since": None, "scope": "test",
+                "nudges": [dataclasses.asdict(n) for n in nudges]}
+
+    def _nudge(self, pid, kind, emails):
+        return discussion_nudges.Nudge(pid=pid, kind=kind, template="t", text=f"hi {pid}", visibility="rev",
+                                       topic="rev", tags="nudge", mentions=emails, names=emails, title="T")
+
+    def test_send_dry_runs_everything_then_posts_and_records(self):
+        now = datetime.datetime.fromisoformat("2026-10-12T09:00:00-04:00")
+        posted = []
+
+        def answer(params):
+            if params.get("dry_run"):
+                return {"ok": True, "valid": True, "message_list": []}
+            posted.append(params)
+            return {"ok": True, "cid": 100 + len(posted), "comment": {}}
+
+        session = _FakeSession({("POST", "1/comment"): answer, ("POST", "2/comment"): answer})
+        site = hotcrp_api.Site("https://x.hotcrp.com", "t", session=session)
+        nudges = [self._nudge(1, "lead_starter", ["a@x.org"]), self._nudge(2, "reviewer_silent", ["b@x.org", "c@x.org"])]
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = os.path.join(tmp, "ledger.csv")
+            out = io.StringIO()
+            n, held = discussion_nudges.send_batch(site, self._batch(now, nudges), ledger, now=now, out=out, err=io.StringIO())
+            self.assertEqual((2, 0), (n, held))
+            self.assertEqual(2, len(posted))
+            # Dry runs came first, both of them, before any real post.
+            flags = [c[2]["dry_run"] for c in session.calls]
+            self.assertEqual([1, 1, 0, 0], flags)
+            rows = discussion_nudges.load_ledger(ledger)
+            self.assertEqual([("1", "101", "a@x.org"), ("2", "102", "b@x.org"), ("2", "102", "c@x.org")],
+                             [(r["pid"], r["cid"], r["email"]) for r in rows])
+            self.assertIn("comment 101", out.getvalue())
+            # A rerun of the same batch posts nothing more.
+            n, _ = discussion_nudges.send_batch(site, self._batch(now, nudges), ledger, now=now, out=io.StringIO(), err=io.StringIO())
+            self.assertEqual(0, n)
+            self.assertEqual(2, len(posted))
+            # A new batch re-nudging someone inside the cooldown is refused...
+            later = now + datetime.timedelta(days=1)
+            again = self._batch(later, [self._nudge(1, "lead_starter", ["a@x.org"])])
+            with self.assertRaises(SystemExit):
+                discussion_nudges.send_batch(site, again, ledger, now=later, out=io.StringIO(), err=io.StringIO())
+            self.assertEqual(2, len(posted))
+            # ...unless forced; a different kind on the same person is not a repeat.
+            other = self._batch(later, [self._nudge(1, "reviewer_silent", ["a@x.org"])])
+            self.assertEqual((1, 0), discussion_nudges.send_batch(site, other, ledger, now=later, out=io.StringIO(), err=io.StringIO()))
+            self.assertEqual((1, 0), discussion_nudges.send_batch(site, again, ledger, now=later, force=True, out=io.StringIO(), err=io.StringIO()))
+
+    def test_send_refuses_stale_batches_other_sites_and_dry_run_failures(self):
+        now = datetime.datetime.fromisoformat("2026-10-12T09:00:00-04:00")
+        session = _FakeSession({
+            ("POST", "1/comment"): lambda p: {"ok": True, "valid": True, "message_list": []},
+            ("POST", "2/comment"): lambda p: {"ok": True, "valid": False,
+                                              "message_list": [{"status": 2, "message": "Comment too long"}]},
+        })
+        site = hotcrp_api.Site("https://x.hotcrp.com", "t", session=session)
+        nudges = [self._nudge(1, "lead_starter", ["a@x.org"]), self._nudge(2, "lead_starter", ["b@x.org"])]
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = os.path.join(tmp, "ledger.csv")
+            stale = self._batch(now - datetime.timedelta(hours=7), nudges)
+            with self.assertRaises(SystemExit) as cm:
+                discussion_nudges.send_batch(site, stale, ledger, now=now, out=io.StringIO(), err=io.StringIO())
+            self.assertIn("regenerate", str(cm.exception))
+            with self.assertRaises(SystemExit):
+                discussion_nudges.send_batch(site, self._batch(now, nudges, site="https://other.hotcrp.com"),
+                                             ledger, now=now, out=io.StringIO(), err=io.StringIO())
+            err = io.StringIO()
+            with self.assertRaises(SystemExit) as cm:
+                discussion_nudges.send_batch(site, self._batch(now, nudges), ledger, now=now, out=io.StringIO(), err=err)
+            self.assertIn("nothing posted", str(cm.exception))
+            self.assertIn("Comment too long", err.getvalue())
+            # Only dry runs were made, and the ledger is untouched.
+            self.assertTrue(all(c[2]["dry_run"] == 1 for c in session.calls))
+            self.assertEqual([], discussion_nudges.load_ledger(ledger))
+
+    def test_scope_and_since_parsing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = os.path.join(tmp, "data.json")
+            papers = [
+                {"pid": 1, "status": "submitted", "title": "A paper", "authors": [{"name": "x"}],
+                 "abstract": "One. Two.", "tags": ["RevisionAdvance"], "decision": None},
+                {"pid": 2, "status": "submitted", "title": "B paper", "authors": [{"name": "x"}],
+                 "abstract": "One. Two.", "tags": ["NoRevision"], "decision": None},
+                {"pid": 3, "status": "submitted", "title": "C paper", "authors": [{"name": "x"}],
+                 "abstract": "One. Two.", "tags": ["RevisionAdvance"], "decision": "Accepted"},
+                {"pid": 4, "status": "submitted", "title": "D paper", "authors": [{"name": "x"}],
+                 "abstract": "One. Two.", "tags": ["RevisionAdvance", "desk-reject"], "decision": None},
+                {"pid": 5, "status": "submitted", "title": "E paper", "authors": [{"name": "x"}],
+                 "abstract": "One. Two.", "tags": ["RevisionAdvance"], "decision": None},
+            ]
+            Path(data).write_text(json.dumps(papers), encoding="utf-8")
+            self.assertEqual({1}, discussion_nudges.scope_pids(data, frozenset({5})))
+            self.assertEqual({1, 2}, discussion_nudges.scope_pids(data, frozenset({5}), all_undecided=True))
+        since = discussion_nudges.parse_since("2026-10-10")
+        self.assertEqual((2026, 10, 10, 0, 0), (since.year, since.month, since.day, since.hour, since.minute))
+        self.assertIsNotNone(since.tzinfo)
+        self.assertEqual(_dt("2026-10-10 11:00:00 -0400"), discussion_nudges.parse_since("2026-10-10 11:00:00 -0400"))
+        self.assertEqual({1, 2, 3}, discussion_nudges.parse_pids("1, #2 3"))
+
+    def test_name_index_prefers_the_api_spelling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pcinfo = os.path.join(tmp, "pcinfo.csv")
+            with open(pcinfo, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=PCINFO_FIELDS)
+                w.writeheader()
+                w.writerow({"given_name": "Ann", "family_name": "Author", "email": "a@x.org", "roles": "pc"})
+                w.writerow({"given_name": "Old", "family_name": "Name", "email": "b@x.org", "roles": "pc"})
+            reviews = [self._review(1, 1, "b@x.org", name="New Name"), self._review(1, 2, "c@x.org", name="Cy C")]
+            names, ambiguous = discussion_nudges.name_index(reviews, pcinfo)
+            self.assertEqual({"a@x.org": "Ann Author", "b@x.org": "New Name", "c@x.org": "Cy C"}, names)
+            self.assertEqual(set(), ambiguous)
+            self.assertEqual(({"b@x.org": "New Name", "c@x.org": "Cy C"}, set()),
+                             discussion_nudges.name_index(reviews, os.path.join(tmp, "missing.csv")))
+
+    def test_shared_names_are_mentioned_by_address(self):
+        """HotCRP emits a mention only when the text matches exactly one
+        account; a name two accounts share matches neither. The chairs' own
+        test accounts are the live example."""
+        with tempfile.TemporaryDirectory() as tmp:
+            pcinfo = os.path.join(tmp, "pcinfo.csv")
+            with open(pcinfo, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=PCINFO_FIELDS)
+                w.writeheader()
+                w.writerow({"given_name": "Paul", "family_name": "Gratz", "email": "chair@tamu.edu", "roles": "chair pc"})
+                w.writerow({"given_name": "Paul", "family_name": "Gratz", "email": "p@test.org", "roles": "pc"})
+                w.writerow({"given_name": "Old", "family_name": "Gone", "email": "gone@x.org", "roles": "pc", "disabled": "yes"})
+                w.writerow({"given_name": "Old", "family_name": "Gone", "email": "here@x.org", "roles": "pc"})
+                w.writerow({"given_name": "Ann", "family_name": "Author", "email": "a@x.org", "roles": "pc"})
+            names, ambiguous = discussion_nudges.name_index([], pcinfo)
+            self.assertEqual({"paul gratz"}, ambiguous)  # a disabled account does not make a name ambiguous
+            self.assertEqual(("chair@tamu.edu", "Paul Gratz"), discussion_nudges.mention("chair@tamu.edu", names, ambiguous))
+            self.assertEqual(("Ann Author", "Ann Author"), discussion_nudges.mention("a@x.org", names, ambiguous))
+            self.assertEqual(("here@x.org", "Old Gone"), discussion_nudges.mention("here@x.org", names, {"old gone"}))
+            self.assertEqual(("nobody@x.org", "nobody@x.org"), discussion_nudges.mention("nobody@x.org", names, ambiguous))
+            targets = [discussion_nudges.Target(1, discussion_nudges.KIND_LEAD, "chair@tamu.edu"),
+                       discussion_nudges.Target(1, discussion_nudges.KIND_MISSING, "a@x.org"),
+                       discussion_nudges.Target(2, discussion_nudges.KIND_SILENT, "a@x.org")]
+            nudges, by_address = discussion_nudges.build_nudges(targets, names, {}, {}, {}, text="{mentions}",
+                                                                 ambiguous=ambiguous)
+            self.assertEqual(["chair@tamu.edu"], by_address)
+            self.assertEqual("@chair@tamu.edu", nudges[0].text)
+            self.assertEqual(["Paul Gratz"], nudges[0].names)
+            self.assertEqual("@Ann Author", nudges[1].text)
+            # The missing-review kind goes on the submission thread; the rest on the review thread.
+            self.assertEqual(["rev", "paper", "rev"], [n.topic for n in nudges])
+            forced, _ = discussion_nudges.build_nudges(targets, names, {}, {}, {}, text="x", topic="paper")
+            self.assertEqual(["paper"] * 3, [n.topic for n in forced])
+            self.assertIn("(submission thread, rev)", discussion_nudges.preview_text(nudges[1:2]))
+
+    def test_send_holds_back_unseeable_items_and_counts_resolved_mentions(self):
+        now = datetime.datetime.fromisoformat("2026-10-12T09:00:00-04:00")
+
+        def ok(params):
+            if params.get("dry_run"):
+                return {"ok": True, "valid": True, "message_list": []}
+            return {"ok": True, "cid": 500, "message_list": [
+                {"status": -3, "message": "<0>Comment saved"},
+                {"status": -3, "message": "<5>Mentioned user <span>Ann Author &lt;a@x.org&gt;</span>"}]}
+
+        def unseeable(params):
+            return {"ok": True, "valid": True, "message_list": [
+                {"status": 1, "message": "<0>Some mentioned users cannot see this comment now"},
+                {"status": 1, "message": "<0>Should the comment be on the submission thread instead?"}]}
+
+        session = _FakeSession({("POST", "1/comment"): ok, ("POST", "2/comment"): unseeable})
+        site = hotcrp_api.Site("https://x.hotcrp.com", "t", session=session)
+        nudges = [self._nudge(1, "reviewer_silent", ["a@x.org", "b@x.org"]), self._nudge(2, "reviewer_missing", ["c@x.org"])]
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = os.path.join(tmp, "ledger.csv")
+            err = io.StringIO()
+            posted, held = discussion_nudges.send_batch(site, self._batch(now, nudges), ledger, now=now,
+                                                        out=io.StringIO(), err=err)
+            self.assertEqual((1, 1), (posted, held))
+            self.assertIn("NOT POSTED: 1 nudge(s)", err.getvalue())
+            self.assertIn("#2 reviewer_missing: c@x.org", err.getvalue())
+            # Two mentions sent, HotCRP confirmed one: reported, still recorded.
+            self.assertIn("UNRESOLVED: comment 500 on #1 mentions 2, HotCRP resolved 1", err.getvalue())
+            self.assertEqual(["1", "1"], [r["pid"] for r in discussion_nudges.load_ledger(ledger)])
+            # Paper 2 was never posted for real.
+            self.assertEqual([1], [c[2]["dry_run"] for c in session.calls if c[1] == "2/comment"])
+
+    def test_main_generates_a_batch_from_fake_api_replies(self):
+        """End to end through main(): scope from the export, leads from the
+        download + log, state from the API, outputs on disk."""
+        since_ts = int(_dt("2026-10-10 00:00:00 -0400").timestamp())
+
+        def reviews(params):
+            return {"ok": True, "reviews": [
+                {"pid": 1, "rid": 11, "reviewer_email": "a@x.org", "reviewer": "Ann Author", "round": "R1",
+                 "rtype": 4, "status": "delivered", "modified_at": since_ts - 100},
+                {"pid": 1, "rid": 12, "reviewer_email": "b@x.org", "reviewer": "Bob Builder", "round": "R1",
+                 "rtype": 4, "status": "complete", "modified_at": since_ts + 100},
+                {"pid": 2, "rid": 21, "reviewer_email": "lead@x.org", "reviewer": "Lee Lead", "round": "R1",
+                 "rtype": 4, "status": "delivered", "modified_at": since_ts - 100},
+            ]}
+
+        def comments(params):
+            return {"ok": True, "comments": [
+                {"pid": 1, "cid": 40, "author_email": "lead1@x.org", "visibility": "rev", "modified_at": since_ts + 50},
+                {"pid": 2, "cid": 41, "author_email": "lead@x.org", "visibility": "rev", "modified_at": since_ts + 50},
+            ]}
+
+        session = _FakeSession({("GET", "reviews"): reviews, ("GET", "comments"): comments})
+
+        def from_env(**kw):  # what main() asks for: the snapshot dir and offline flag
+            return hotcrp_api.Site("https://x.hotcrp.com", "t", session=session, **kw)
+
+        site = from_env
+        with tempfile.TemporaryDirectory() as tmp:
+            data = os.path.join(tmp, "data.json")
+            Path(data).write_text(json.dumps([
+                {"pid": p, "status": "submitted", "title": f"Paper {p}", "authors": [{"name": "x"}],
+                 "abstract": "One. Two.", "tags": ["RevisionAdvance"], "decision": None} for p in (1, 2, 3)
+            ]), encoding="utf-8")
+            log = os.path.join(tmp, "log.csv")
+            with open(log, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(hotcrp_log.LOG_HEADER)
+                # Newest first, as HotCRP exports it. Paper 2's lead comment was
+                # created before the cutoff and merely edited after it.
+                w.writerow(["2026-10-11 09:00:00 -0400", "", "lead@x.org", "pc", "", "", "2", "Comment 41 edited: text"])
+                w.writerow(["2026-10-09 09:00:00 -0400", "", "lead@x.org", "pc", "", "", "2", "Comment 41 edited"])
+                w.writerow(["2026-10-01 09:00:00 -0400", "", "chair@x.org", "chair", "lead@x.org", "", "2", "Set lead"])
+            leads = os.path.join(tmp, "leads.csv")
+            Path(leads).write_text("paper,title,given_name,family_name,leademail\n1,Paper 1,L,One,Lead1@x.org\n",
+                                   encoding="utf-8")
+            batch, preview, ledger = (os.path.join(tmp, n) for n in ("nudges.json", "nudges.txt", "ledger.csv"))
+            argv = ["--data", data, "--log", log, "--leads", leads, "--pcinfo", os.path.join(tmp, "none.csv"),
+                    "--snapshot", os.path.join(tmp, "snap"), "--batch", batch, "--preview", preview,
+                    "--ledger", ledger, "--extensions", os.path.join(tmp, "ext.csv"),
+                    "--leads-without-starter", "--reviewers-silent", "--since", "2026-10-10 00:00:00 -0400", "--due", "Friday"]
+            err, out = io.StringIO(), io.StringIO()
+            with mock.patch.object(hotcrp_api.Site, "from_env", side_effect=site), \
+                    contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+                self.assertEqual(0, discussion_nudges.main(argv))
+            written = discussion_nudges.load_batch(batch)
+            kinds = [(n["pid"], n["kind"], n["mentions"]) for n in written["nudges"]]
+            # Paper 1: lead1 posted after the cutoff (no log row -> modified_at),
+            # Ann is silent, Bob updated. Paper 2: the lead's comment predates
+            # the cutoff per the log, so the lead is nudged; the lead is also
+            # its only submitted reviewer and has not updated, so silent too.
+            # Paper 3 came back empty: unseen, reported, not nudged.
+            self.assertEqual([(1, "reviewer_silent", ["a@x.org"]),
+                              (2, "lead_starter", ["lead@x.org"]),
+                              (2, "reviewer_silent", ["lead@x.org"])], kinds)
+            self.assertIn("@Ann Author", written["nudges"][0]["text"])
+            self.assertIn(" by Friday", written["nudges"][0]["text"])
+            self.assertIn("UNSEEN: 1 paper(s)", err.getvalue())
+            self.assertIn("3", err.getvalue())
+            self.assertIn("===== PAPER 1 =====", Path(preview).read_text(encoding="utf-8"))
+            self.assertEqual("3\t2\n", out.getvalue())  # 3 comments, 2 distinct (paper, person) pairs
+            self.assertTrue(os.listdir(os.path.join(tmp, "snap")))
+            # Idempotent: a second run against the snapshot writes the same nudges.
+            first = written["nudges"]
+            with mock.patch.object(hotcrp_api.Site, "from_env", side_effect=site), \
+                    contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                discussion_nudges.main(argv + ["--offline"])
+            self.assertEqual(first, discussion_nudges.load_batch(batch)["nudges"])

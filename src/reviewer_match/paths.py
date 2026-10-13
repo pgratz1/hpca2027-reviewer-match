@@ -20,6 +20,10 @@ ASSIGNMENT_DIR = OUTPUT_DIR / "assignments"
 REPORT_DIR = OUTPUT_DIR / "reports"
 EVALUATION_DIR = OUTPUT_DIR / "evaluations"
 
+# Committed, PII-free message templates (`templates/nudges/*.txt`). Not under
+# `data/`, every subdirectory of which is gitignored.
+TEMPLATE_DIR = PROJECT_ROOT / "templates"
+
 
 def input_path(name: str) -> str:
     return str(INPUT_DIR / name)
@@ -43,3 +47,7 @@ def report_path(name: str) -> str:
 
 def evaluation_path(name: str) -> str:
     return str(EVALUATION_DIR / name)
+
+
+def template_path(name: str) -> str:
+    return str(TEMPLATE_DIR / name)

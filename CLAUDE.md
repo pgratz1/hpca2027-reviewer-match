@@ -397,6 +397,57 @@ contains spaces and parentheses — always quote it in shell commands).
   policy), and never send review text to an external service. Genericness
   needs the GPU.
   `REVIEW_QUALITY_FLAGS=` runs the offline subset.
+- **`make nudges NUDGE_FLAGS="..."` / `make nudges-send`** nudge the people
+  behind on the discussion timeline **through HotCRP's REST API**, with no
+  browser and no mail setup: one reviewer-visible comment per paper that
+  @-mentions them, which HotCRP emails itself. The chair sets the day's
+  condition in `NUDGE_FLAGS` (`--leads-without-starter --since DATE`,
+  `--reviewers-silent --since DATE` [no review update **and** no comment since;
+  `--require-both` for either], `--reviewers-missing-review`, `--due TEXT`,
+  `--text`/`--*-template` for wording from `templates/nudges/`), `make nudges`
+  reads the live state and writes `outputs/assignments/nudges.json` plus a
+  preview `outputs/reports/nudges.txt`, **posting nothing**; `make nudges-send`
+  dry-runs every item, posts, and appends each (paper, person) to
+  `outputs/reports/nudge_ledger.csv`, which the next generate reads for the
+  `--cooldown-days` (3) skip. Scope is `RevisionAdvance` ∩ under review ∩
+  undecided (`--all-undecided`, `--papers`, `--scope-search` override). Needs
+  `HOTCRP_SITE`/`HOTCRP_TOKEN` in `.env` (Account settings → Developer;
+  `make hotcrp-test` checks). **The API acts as the token's owner, so papers
+  they are conflicted with return nothing** — listed as `UNSEEN`, never
+  silently skipped; the same hole the leads download has. Detection reads the
+  API, not the log, because the log never records a comment's visibility and
+  the text export has no dates; comment *creation* dates do come from the log
+  (`hotcrp_log.comment_created_at`: HotCRP logs creation as `Comment N edited`),
+  so an old comment touched up after `--since` is not a new post. A batch
+  older than 6h, or one re-nudging anyone inside the cooldown, is refused
+  (`--force`). **Mentions resolve only when the text after `@` matches exactly
+  one account** (`MentionParser`): a name two accounts share — both chairs'
+  own test accounts, for a start — matches neither, and HotCRP leaves it as
+  plain text with no email and no error. So a person is mentioned `@Given
+  Family` (API spelling, then the user export) only when that name belongs to
+  one enabled account in the export, and `@user@site.edu` otherwise; a real
+  save answers `Mentioned user X` per resolved mention and the send stage
+  counts those (`UNRESOLVED` on a shortfall). **HotCRP emails a mention only
+  to someone who can see the comment**, and the dry run says when they cannot:
+  a reviewer with their own review outstanding cannot see the review thread,
+  an author cannot see a `rev` comment at all, and on test paper 1152 HotCRP
+  hid the review thread even from a completed reviewer — the rule is HotCRP's,
+  so the dry run's answer is what counts. `--reviewers-missing-review` goes on
+  the submission thread (`topic=paper`; `--topic` overrides) and an item the
+  dry run flags is held back and listed, never posted to email nobody (exit
+  1). Verified live 2026-10-12: review-thread nudges to real papers' submitted
+  reviewers and leads pass the dry run; on 1152, whose authors are the TRC
+  chair's accounts, a test aimed at them needs `--visibility au`, and one
+  aimed at a test reviewer needs `--topic paper`.
+  `src/reviewer_match/hotcrp_api.py` is the only HTTP path to HotCRP in
+  the repo: GET responses are snapshotted under `data/cache/hotcrp_api/`
+  (`--offline` replays them), POSTs never are; a DELETE carries its
+  parameters in the query string, since HotCRP ignores a DELETE body. **Test
+  on paper 1152** (the standing test submission) with `--papers 1152
+  --mention-emails <you> --text`, then `--delete-comment 1152:CID` — and note
+  HotCRP never emails the comment's own author, so a self-mention proves
+  posting, not delivery. Batch, preview and ledger are gitignored by
+  name. Not in `make daily`: it needs the network, and the chair picks the days.
 - `make complete-papers` and `make area-chairs-complete` retain the former
   completeness filter in separate `*-complete.txt` artifacts.
 - Library modules (imported, never run): `src/reviewer_match/reviewers.py`, `src/reviewer_match/dblp.py`,
@@ -404,7 +455,8 @@ contains spaces and parentheses — always quote it in shell commands).
   `src/reviewer_match/reserve_reviewers.py`, `src/reviewer_match/roster.py`, `src/reviewer_match/affiliation_country.py`,
   `src/reviewer_match/pc_membership.py`, `src/reviewer_match/coauthor_coi.py`,
   `src/reviewer_match/collaborator_coi.py`, `src/reviewer_match/hotcrp_log.py`,
-  `src/reviewer_match/assignment_io.py`, `src/reviewer_match/review_scores.py`. Runnable
+  `src/reviewer_match/assignment_io.py`, `src/reviewer_match/review_scores.py`,
+  `src/reviewer_match/hotcrp_api.py`. Runnable
   scripts: `scripts/audit_pc_roster.py`, `scripts/find_duplicate_accounts.py`,
   `scripts/audit_coauthor_conflicts.py`, `scripts/audit_collaborator_conflicts.py`,
   `scripts/audit_reserve_identities.py`, `scripts/classify_reviewers.py`, `scripts/build_fingerprints.py`,
@@ -421,7 +473,7 @@ contains spaces and parentheses — always quote it in shell commands).
   `scripts/revision_tags.py`, `scripts/timeliness_tags.py`,
   `scripts/timeliness_emails.py`, `scripts/extra_reviewer_candidates.py`,
   `scripts/review_quality.py`, `scripts/summary_scores.py`, `scripts/short_reviews.py`,
-  `scripts/main.py`.
+  `scripts/discussion_nudges.py`, `scripts/main.py`.
 
 ## Architecture (filter-then-rank, then constrained assignment)
 

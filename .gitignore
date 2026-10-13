@@ -43,6 +43,12 @@ timeliness_apology_emails.txt
 summary_scores_*
 # Reviews flagged as thin, by reviewer name.
 short_reviews*.csv
+# Discussion nudges: the batch and preview name who is behind, the ledger
+# records who was nudged when, and the API snapshot is raw HotCRP state.
+nudges*.json
+nudges*.txt
+nudge_ledger*.csv
+hotcrp_api/
 current_assignment*.csv
 assignment-rerun*.csv
 trc_dblp_overrides.csv

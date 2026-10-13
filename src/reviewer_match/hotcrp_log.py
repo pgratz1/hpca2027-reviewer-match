@@ -61,7 +61,8 @@ ENGAGEMENT_RE = re.compile(
 # distinct from "Review N edited, updated draft: ...", a draft save that does
 # not mean submitted, and from "Review N edited, updated: ...", which is an
 # edit to a review that is *already* submitted (every one of the 1,681 such
-# rows today lands on a submitted review). A draft saved first and submitted
+# rows today lands on a submitted review) -- the signal `UPDATE_RE` below reads
+# as "the reviewer revisited their review". A draft saved first and submitted
 # unchanged logs a bare "Review 17095 submitted", with no colon or word count
 # -- rare (1 in 7,000 today), but missing it read a turned-in review as
 # outstanding and put it in an unassign upload.
@@ -69,6 +70,19 @@ SUBMIT_RE = re.compile(r"^Review (\d+) (?:submitted|edited, submitted)(?::|$)")
 # "Review 15 retracted" / "Review 726 deleted" / "Review 5702 unsubmitted draft:
 # 482 words" (a chair returning it to draft) -- each reverses a submission.
 UNSUBMIT_RE = re.compile(r"^Review (\d+) (?:retracted$|deleted$|unsubmitted\b)")
+
+# "Review 4861 edited, updated: PreRebOve:3, ComAut, 512 words": a change to a
+# review that was already submitted. The field tokens name what changed.
+UPDATE_RE = re.compile(r"^Review (\d+) edited, updated:")
+
+# "Comment 2272 edited: text" / "Comment 2273 submitted" / "Comment 1575 on
+# submission thread edited: visibility". HotCRP logs a comment's *creation* as
+# "edited" too -- there is no "created" verb -- so the first row for a comment
+# id is when it came into being. The log never says what a comment's
+# visibility is (only that it changed), nor who it is addressed to; the API's
+# comment objects carry that, and `scripts/discussion_nudges.py` joins the two
+# on the comment id.
+COMMENT_RE = re.compile(r"^Comment (\d+)\b")
 
 # Discussion-lead changes, exactly as `a_lead.php` logs them.
 SET_LEAD = "Set lead"
@@ -214,6 +228,39 @@ def first_submitted_at(rows: list[dict[str, str]]) -> dict[int, str]:
         if m:
             first.setdefault(int(m.group(1)), row["date"])
     return first
+
+
+def comment_created_at(rows: list[dict[str, str]]) -> dict[int, str]:
+    """{comment id: date of its FIRST log row}, i.e. when the comment was created.
+
+    HotCRP has no "comment created" verb; the first "Comment N edited" (or
+    "submitted") row is the creation. The `email` on that row is the author.
+    Later edits do not move this date, which is the point: a nudge asks
+    whether somebody *posted* after a cutoff, and an old comment touched up
+    yesterday is not a new post. `rows` must be chronological -- see `load_log`.
+    """
+    first: dict[int, str] = {}
+    for row in rows:
+        m = COMMENT_RE.match(row["action"])
+        if m:
+            first.setdefault(int(m.group(1)), row["date"])
+    return first
+
+
+def review_updated_at(rows: list[dict[str, str]]) -> dict[int, str]:
+    """{review id: date of its LAST post-submission edit} (`UPDATE_RE`), if any.
+
+    Complements `first_submitted_at`: that is when the review was turned in,
+    this is the most recent time its author changed it afterwards. A reviewer
+    asked to revisit their review after the authors' response shows up here or
+    nowhere. `rows` must be chronological -- see `load_log`.
+    """
+    last: dict[int, str] = {}
+    for row in rows:
+        m = UPDATE_RE.match(row["action"])
+        if m:
+            last[int(m.group(1))] = row["date"]
+    return last
 
 
 def parse_date(value: str) -> datetime:

@@ -34,6 +34,7 @@ data/cache/               expensive reproducible caches and intermediates
 outputs/assignments/      final and experimental assignments
 outputs/reports/          audits, classifications, and derived rosters
 outputs/evaluations/      blinded-ranking evaluation files
+templates/nudges/         committed, PII-free wording for `make nudges` comments
 archive/                  retired lookup data and historical snapshots
 docs/                     design and codebase documentation
 ```
@@ -2144,6 +2145,123 @@ names.
 - `make review-quality REVIEW_QUALITY_FLAGS=` runs the instant, GPU-free
   subset.
 
+### `scripts/discussion_nudges.py` — nudge leads and reviewers through HotCRP
+
+`make nudges NUDGE_FLAGS="..."` then `make nudges-send`. The chair's question
+changes by the day — "which leads have not posted a starter?", "which reviewers
+have neither updated their scores nor joined the discussion?" — so the
+condition is a set of flags and the tool is the fixed part:
+
+```
+make hotcrp-test                                   # the token works, and whose it is
+make nudges NUDGE_FLAGS="--leads-without-starter --since 2026-10-10 --due 'Thursday, October 15'"
+make nudges NUDGE_FLAGS="--reviewers-silent --since 2026-10-10 --due Friday"
+make nudges NUDGE_FLAGS="--reviewers-missing-review --due 'end of day'"
+make nudges-send                                   # after reading outputs/reports/nudges.txt
+```
+
+**Channel.** HotCRP's REST API (`src/reviewer_match/hotcrp_api.py`), with a
+per-user bearer token from Account settings → Developer, in `.env` as
+`HOTCRP_SITE=https://hpca2027.hotcrp.com` and `HOTCRP_TOKEN=hct_…` (scopes:
+`comment:read comment:write review:read paper:read submeta:read other:read`).
+Each nudge is one comment on the paper, visibility `rev`, tagged `nudge`,
+@-mentioning everyone it is aimed at. HotCRP emails mentioned users and the
+paper's followers itself, so there is no mail configuration, no browser and no
+bulk-mail page — and HotCRP's own log records every message (`Sent mail #N`).
+Direct email and driving the HotCRP mail page with a browser were the
+alternatives; the first needs credentials on this machine, the second a
+logged-in browser session, and neither is logged in HotCRP.
+
+**Generate** (`make nudges`) reads the live state — `GET /reviews` and
+`GET /comments` over the papers in scope, in chunks — and the exports it
+already has for everything else: the paper export for scope and titles, the
+leads download plus the log for leads (`assign_paper_leads.merge_hidden_leads`,
+so a lead the download hides is still found), the log for comment *creation*
+dates (`hotcrp_log.comment_created_at` — HotCRP logs creation as
+`Comment N edited`, and the first row for a comment id is its birth), the user
+export for names. It writes `outputs/assignments/nudges.json` (the batch) and
+`outputs/reports/nudges.txt` (the preview, one block per paper: title, kind,
+who, text) and posts nothing. Why the API for detection: the log never
+records a comment's visibility, and the text export has visibility but no
+dates; only the API has both.
+
+**Scope.** Papers tagged `RevisionAdvance`, still under review, with no
+decision, minus `EXCLUDE_PIDS`. `--all-undecided` drops the tag test,
+`--papers 12,34` names papers, `--scope-search 'Q'` takes a HotCRP search.
+**The API acts as the token's owner**, so papers they are conflicted with
+return nothing at all; every such paper is listed on stderr as `UNSEEN` and
+never nudged. This is the same hole the leads download has, and a co-chair's
+token is the only way around it.
+
+**Conditions**, each a flag, each reporting its count:
+
+- `--leads-without-starter`: the lead has no discussion comment on the paper
+  created on/after `--since`. A discussion comment is not a draft, not a
+  response, not an author's, not admin-only. A paper with no lead is reported.
+- `--reviewers-silent`: a PC reviewer (type ≥ 2, round not TRC) with a
+  submitted review that was last modified before `--since` **and** no
+  discussion comment since. `--require-both` nudges anyone missing either.
+- `--reviewers-missing-review`: PC reviewers whose review is not submitted.
+- `--mention-emails a,b` with `--text`: named people on every paper in scope.
+
+`--cooldown-days` (3) skips anyone the ledger shows nudged for the same kind on
+the same paper that recently; `--exclude-emails FILE` and the `extension` rows
+of `data/curated/review_extensions.csv` excuse people outright.
+
+**Message.** One comment per paper and kind, everyone of that kind mentioned
+together. `templates/nudges/*.txt` hold the wording (`leads_starter`,
+`reviewers_discuss`, `reviewers_missing`; `--lead-template` etc. pick others,
+`--text` replaces them all); placeholders are listed in that directory's
+README.
+
+**Mentions.** HotCRP's `MentionParser` emits a mention only when the text
+after `@` matches exactly one candidate account. A name two accounts share
+matches two and therefore none: the text stays plain, nobody is emailed, and
+nothing is reported — which is how the first live test, `@Paul Gratz` on a
+site where the chair holds two accounts of that name, produced no email. The
+parser also accepts a full address, `@user@site.edu`, which matches one
+account by construction. So someone is mentioned by name (`@Given Family`, as
+the API's `reviewer` field spells it, else the user export) when that name
+belongs to one enabled account in the export, and by address otherwise; the
+preview says which. On a real save HotCRP answers `Mentioned user X` once per
+resolved mention, and the send stage counts those against the mentions it
+sent, printing `UNRESOLVED` on any shortfall. Nobody is ever emailed about
+their own comment, so a self-mention tests posting, not delivery.
+
+**Threads and who can see them.** HotCRP emails a mention only to someone
+who can see the comment, and the dry run answers "Some mentioned users
+cannot see this comment now" when they cannot. A `rev` comment on the
+review thread (`topic=rev`) is invisible to a reviewer whose own review is
+outstanding, invisible to an author at any visibility below `au`, and on the
+test paper HotCRP hid it even from a reviewer with a complete review — the
+rule is HotCRP's, so the dry run's answer is what counts; on real
+RevisionAdvance papers, review-thread nudges to submitted reviewers and
+leads passed it. `--reviewers-missing-review` posts on the submission thread
+(`topic=paper`) by default, `--topic` overrides for every kind, and a
+flagged item is held back and listed (exit 1) rather than posted to email
+nobody.
+
+**Send** (`make nudges-send`) refuses a batch older than `--max-age-hours`
+(6) or one that would re-nudge anyone inside the cooldown (`--force`), dry-runs
+**every** item (`dry_run=1`) and posts nothing if any fails, then posts and
+appends one row per (paper, person) to `outputs/reports/nudge_ledger.csv`
+(`sent_at,batch,pid,cid,kind,email,template`). A nudge whose (batch, paper,
+kind) is already in the ledger is skipped, so re-running a half-finished send
+posts only the rest. `--no-notify` posts without HotCRP's emails, for a test.
+
+**Testing it live.** Paper 1152 is the standing test submission, authored by
+the TRC chair's accounts:
+`make nudges NUDGE_FLAGS="--papers 1152 --mention-emails them@x.edu --cooldown-days 0 --text 'API test: {mentions}'"`,
+`make nudges-send`, ask whether the mention email arrived, then
+`python -m scripts.discussion_nudges --delete-comment 1152:CID`. Mention
+someone other than yourself (see above), and someone who can see the
+comment: the paper's authors need `--visibility au`, and its test reviewers
+`--topic paper`.
+
+GET replies are snapshotted under `data/cache/hotcrp_api/` and `--offline`
+replays them, which is how two runs can be compared with `cmp`. The batch,
+preview, ledger and snapshot are gitignored by name. Not part of `make daily`.
+
 ## Publication exclusions
 
 `data/curated/publication_exclusions.csv` is an optional hand-maintained file with columns
@@ -2226,7 +2344,10 @@ derived COI layers) · `src/reviewer_match/affiliation_country.py` (affiliation 
 country for the same-country cap) · `src/reviewer_match/assignment_io.py` (reading and
 writing both assignment-CSV shapes) · `src/reviewer_match/hotcrp_log.py` (the single
 parse point for the HotCRP action log — it reverses the export's newest-first
-order and case-folds addresses, and nothing else may read that file directly).
+order and case-folds addresses, and nothing else may read that file directly) ·
+`src/reviewer_match/hotcrp_api.py` (the single HTTP path to HotCRP: bearer-token
+GET/POST with retries, snapshots for offline replay, and the five calls the
+nudges need).
 
 ## Data files
 

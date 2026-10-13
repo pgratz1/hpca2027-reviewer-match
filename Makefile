@@ -82,6 +82,9 @@ TRC_PAPER_CAP ?= 1
 # Optional local secrets. Variables are exported for enrichment commands.
 -include .env
 export S2_API_KEY
+# HotCRP API access for `make nudges` (reviewer_match.hotcrp_api): the site
+# URL and a bearer token from Account settings -> Developer. Never printed.
+export HOTCRP_SITE HOTCRP_TOKEN
 
 INPUT_DIR = data/inputs
 CURATED_DIR = data/curated
@@ -217,7 +220,8 @@ ASSIGN_DEPS = scripts/assign_reviewers.py src/reviewer_match/paper_matching.py \
 	complete-papers area-chairs-complete clear-uploads baselines clean clean-fingerprints \
 	log-assignments reviewer-activity rerun targeted-rerun swap-candidates swap-upload fill-slots \
 	revision-cutoffs paper-leads revision-tags advance-rounds timeliness-tags timeliness-emails \
-	timeliness-apologies extra-reviewers review-quality daily check-exports summary-scores short-reviews
+	timeliness-apologies extra-reviewers review-quality daily check-exports summary-scores short-reviews \
+	hotcrp-test nudges nudges-send
 
 all: $(SENIORITY) enrich $(FINGERPRINTS)
 	$(RUN) scripts.build_fingerprints --csv "$(CSV)" --fingerprint-cache $(FINGERPRINTS)
@@ -776,6 +780,39 @@ timeliness-emails: scripts/timeliness_emails.py scripts/timeliness_tags.py
 		--exempt-after $(EXEMPT_AFTER) --extensions "$(EXTENSIONS)" \
 		--announced-deadline "$(ANNOUNCED_DEADLINE)" --signature "$(SIGNATURE)" \
 		$(PC_CHECK) $(EXCLUDE_FLAG)
+
+# Discussion nudges through the HotCRP API: one reviewer-visible comment per
+# paper, @-mentioning the lead who has posted no starter or the reviewers who
+# have neither updated their review nor commented since NUDGE_FLAGS' --since.
+# HotCRP emails the mentioned people itself. Two steps: `make nudges
+# NUDGE_FLAGS="..."` reads the live state and writes the batch + a preview,
+# posting nothing; `make nudges-send` posts that batch (dry run of every item
+# first) and records each pair in the ledger, which the next generate consults
+# for the cooldown. The day's condition lives in NUDGE_FLAGS, e.g.
+#   make nudges NUDGE_FLAGS="--leads-without-starter --since 2026-10-10 --due 'Thursday, October 15'"
+#   make nudges NUDGE_FLAGS="--reviewers-silent --since 2026-10-10 --due Friday"
+# Needs HOTCRP_SITE and HOTCRP_TOKEN in .env (`make hotcrp-test` checks them).
+# The API acts as the token's owner, so their conflicts are UNSEEN (reported).
+NUDGE_FLAGS ?=
+NUDGE_SEND_FLAGS ?=
+NUDGE_BATCH ?= $(ASSIGNMENT_DIR)/nudges.json
+NUDGE_PREVIEW ?= $(REPORT_DIR)/nudges.txt
+NUDGE_LEDGER ?= $(REPORT_DIR)/nudge_ledger.csv
+HOTCRP_SNAPSHOT ?= $(CACHE_DIR)/hotcrp_api
+NUDGE_COMMON = --data $(DATA) --log $(LOG) --leads $(LEADS) --pcinfo $(PCINFO) $(EXCLUDE_FLAG) \
+	--batch $(NUDGE_BATCH) --preview $(NUDGE_PREVIEW) --ledger $(NUDGE_LEDGER) \
+	--snapshot $(HOTCRP_SNAPSHOT)
+hotcrp-test:
+	$(RUN) scripts.discussion_nudges --whoami
+nudges: scripts/discussion_nudges.py
+	@test -n "$(NUDGE_FLAGS)" || { echo 'ERROR: set NUDGE_FLAGS, e.g. make nudges NUDGE_FLAGS="--leads-without-starter --since 2026-10-10 --due Thursday"' >&2; exit 1; }
+	@for f in $(DATA) $(LOG); do \
+	  test -f $$f || { echo "ERROR: $$f not found; download it from HotCRP" >&2; exit 1; }; \
+	done
+	$(RUN) scripts.discussion_nudges $(NUDGE_COMMON) $(NUDGE_FLAGS)
+nudges-send:
+	@test -f $(NUDGE_BATCH) || { echo "ERROR: $(NUDGE_BATCH) not found; run make nudges NUDGE_FLAGS=... first" >&2; exit 1; }
+	$(RUN) scripts.discussion_nudges --send $(NUDGE_BATCH) --ledger $(NUDGE_LEDGER) $(NUDGE_SEND_FLAGS)
 
 # Corrections for papers in an already-sent drafts file (SENT_EMAILS) that are
 # not held today -- the first batch counted reviews on desk-rejected papers as
