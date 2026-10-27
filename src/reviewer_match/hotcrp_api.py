@@ -227,6 +227,19 @@ class Site:
         body = self.get("reviews", q=q, t=t)
         return list(body.get("reviews") or [])
 
+    def papers(self, q: str, fields: str, t: str = "s") -> list[dict]:
+        """One row per paper `q` matches, holding the paper-list columns named
+        in `fields` (`GET /search?f=...&format=json`): what the search page
+        would show, as text. `title` is the title; `tags` a `#`-prefixed,
+        space-separated list (`#~~track_3 #RevisionAdvance`, twiddle tags
+        included for a chair); `decision` the decision name, "Unspecified"
+        when none is set; `lead` the lead's display name, and absent when the
+        paper has none. Every submitted paper answers, the token owner's
+        conflicts included -- it is the reviews and comments that those hide.
+        """
+        body = self.get("search", q=q, t=t, f=fields, format="json")
+        return list(body.get("papers") or [])
+
     def post_comment(
         self, pid: int, text: str, *, visibility: str = "rev", topic: str = "rev",
         tags: str = "", notify: bool = True, dry_run: bool = False,

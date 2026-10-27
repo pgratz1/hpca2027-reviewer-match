@@ -49,6 +49,10 @@ nudges*.json
 nudges*.txt
 nudge_ledger*.csv
 hotcrp_api/
+# Area-chair dashboard pages: reviewer names and scores per paper.
+ac_dashboard/
+# Each area chair's address beside a live link to their track's PDFs.
+ac_dashboard_links*.csv
 current_assignment*.csv
 assignment-rerun*.csv
 trc_dblp_overrides.csv

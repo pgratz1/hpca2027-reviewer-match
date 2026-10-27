@@ -426,8 +426,11 @@ contains spaces and parentheses — always quote it in shell commands).
   plain text with no email and no error. So a person is mentioned `@Given
   Family` (API spelling, then the user export) only when that name belongs to
   one enabled account in the export, and `@user@site.edu` otherwise; a real
-  save answers `Mentioned user X` per resolved mention and the send stage
-  counts those (`UNRESOLVED` on a shortfall). **HotCRP emails a mention only
+  save answers **one** `Mentioned user X` / `Mentioned users X, Y and Z`
+  line naming every resolved mention (verified live 2026-10-18; counting
+  lines instead of names reported 22 false `UNRESOLVED` on the first
+  multi-mention batch) and the send stage counts the names in it
+  (`UNRESOLVED` on a shortfall). **HotCRP emails a mention only
   to someone who can see the comment**, and the dry run says when they cannot:
   a reviewer with their own review outstanding cannot see the review thread,
   an author cannot see a `rev` comment at all, and on test paper 1152 HotCRP
@@ -448,6 +451,65 @@ contains spaces and parentheses — always quote it in shell commands).
   HotCRP never emails the comment's own author, so a self-mention proves
   posting, not delivery. Batch, preview and ledger are gitignored by
   name. Not in `make daily`: it needs the network, and the chair picks the days.
+- **`make ac-dashboard`** writes one status PDF per track, each in a
+  track-named directory (`outputs/reports/ac_dashboard/track_05/track_05_dana-fox.pdf`),
+  for that track's area chair, plus `all/all.pdf` for the PC chairs: every paper tagged `~~track_NN` still
+  under review (submitted, no decision), with each reviewer's original
+  (pre-rebuttal) and current (post-rebuttal) overall merit and the averages,
+  whether the lead has posted since `PHASE_START` (2026-10-21 12:00, when
+  the champion phase opened), how many reviewers have updated or
+  commented since then, how many reviews lack a post-rebuttal score
+  (unsubmitted reviews are assumed not to be coming and are not shown), the
+  revision tag, and attention flags. **Final phase (since 2026-10-22):**
+  - **Live papers:** a `pc-discuss` paper advances only with **more champions
+    than anti-champions**, so no champion or a tie rejects. The vote is the
+    review form's `ChaAntCha` checkboxes (`[1]` champion, `[2]`
+    anti-champion), read into `ReviewState.champion`/`.anti` and counted over
+    submitted PC reviews. A review ticking both counts on neither side and is
+    flagged.
+  - **Settled papers:** `likely-accept`/`online-accept` and
+    `likely-reject`/`online-reject` are settled, and are flagged *reopen?* only
+    on a **contrary** vote: an anti-champion on an accept, a champion on a
+    reject.
+  - **Tag hygiene:** tags pointing two ways, or no phase tag, are flagged.
+  - **Flag scope:** lead/silence/no-votes/anti-only/tied flags apply to
+    `pc-discuss` papers only. A paper with an anti-champion and no champion
+    is `anti-only`, not `no-champion`, so it stands out from the unvoted.
+  - **Grouping:** rows are grouped reopen → discuss → settled accept →
+    settled reject. **Everything live comes from the API** (`dec:none` search
+  for scope; `Site.papers` — `GET /search?f=title tags decision lead&format=json`
+  — for titles, tags, decisions and leads; `/reviews`; `/comments`), so a cron
+  job can regenerate without exports; the chairs come from the user export's
+  `~~track_NN` account tags and comment creation dates from the log when it
+  exists. **Only PDFs are written**: each page is built as HTML and printed through
+  headless Chrome (`--chrome`), and the HTML is never kept; the chair emails
+  the PDFs by hand — nothing is published
+  (the 2026-10-16 artifact pilot was taken down the same day). **`make
+  ac-dashboard-links`** instead gets a Dropbox shared link to each `track_NN/`
+  directory from the local daemon (`dropbox sharelink`; anyone with the link,
+  view-only) into `outputs/reports/ac_dashboard_links.csv`, one row per chair,
+  gitignored by name — sent once, since every rerun refills the same
+  directories (deleting `ac_dashboard/` breaks every link). Unsynced or
+  not-exactly-one-PDF directories are refused; `all*/` never linked; temp
+  files never land in a track directory. A track page
+  holds only its own papers, filtered in Python, and no page carries a
+  reviewer's name (review letters and scores only; activity is summed per
+  paper), an email address or review text (rows are built from named fields,
+  never the API object). **A page never shows a paper its readers are conflicted with**:
+  `all.pdf` omits the union of the PC chairs' conflicts (`chair` role in the
+  export, widened to a chair's other addresses; `--pc-chairs` overrides),
+  `all_<name>.pdf` one chair's own, and a track page its chair's, via one
+  `conf:<address>` search each, with the count on the page. The papers
+  **every** PC chair is conflicted with (the intersection, not the union: a
+  paper one chair is conflicted with is the other's) go to the **conflict chair** (`~~conflict-chair` tag;
+  `--conflict-chair`) as a pinned group atop their own track page, minus any
+  they are conflicted with too. The lead is a display name, resolved to an account via the export
+  and the API's own spellings, comments matched by address or name. A paper the
+  token's owner is conflicted with returns no reviews or comments and is
+  flagged **hidden**, never dropped. Activity definitions are imported from
+  `discussion_nudges.py` so the two cannot disagree. `AC_DASHBOARD_FLAGS=--offline`
+  replays the snapshot; `--generated-at` pins the stamp for a byte-identical
+  rerun. Not in `make daily` (network). `ac_dashboard/` is gitignored by name.
 - `make complete-papers` and `make area-chairs-complete` retain the former
   completeness filter in separate `*-complete.txt` artifacts.
 - Library modules (imported, never run): `src/reviewer_match/reviewers.py`, `src/reviewer_match/dblp.py`,
@@ -473,7 +535,8 @@ contains spaces and parentheses — always quote it in shell commands).
   `scripts/revision_tags.py`, `scripts/timeliness_tags.py`,
   `scripts/timeliness_emails.py`, `scripts/extra_reviewer_candidates.py`,
   `scripts/review_quality.py`, `scripts/summary_scores.py`, `scripts/short_reviews.py`,
-  `scripts/discussion_nudges.py`, `scripts/main.py`.
+  `scripts/discussion_nudges.py`, `scripts/ac_dashboard.py`,
+  `scripts/ac_dashboard_links.py`, `scripts/main.py`.
 
 ## Architecture (filter-then-rank, then constrained assignment)
 

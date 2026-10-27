@@ -78,9 +78,11 @@ address, `@user@site.edu`, which can only match one account. So a person is
 mentioned by name (`@Given Family`, as the API spells it, then the user
 export) when that name belongs to one account in the user export, and by
 address otherwise. Somebody with no known name at all is mentioned by
-address too. On a real save HotCRP answers `Mentioned user X` once per
-resolved mention, and the send stage counts those against what it sent:
-a shortfall is printed as UNRESOLVED.
+address too. On a real save HotCRP answers one `Mentioned user X` or
+`Mentioned users X, Y and Z` line naming every resolved mention (verified
+live 2026-10-18: a comment with two resolved mentions gets the one plural
+line, never two lines), and the send stage counts the names in it against
+what it sent: a shortfall is printed as UNRESOLVED.
 
 **Threads.** HotCRP emails a mention only to someone who can see the
 comment, and the dry run says when that fails ("Some mentioned users cannot
@@ -140,7 +142,23 @@ DEFAULT_TOPIC = "rev"
 PAPER_TOPIC = "paper"
 DEFAULT_TAG = "nudge"
 CANNOT_SEE = "cannot see this comment"
-MENTIONED_RE = re.compile(r"Mentioned user")
+MENTIONED_RE = re.compile(r"Mentioned users? (.+?)\.?$")
+
+
+def mentioned_count(messages: list[str]) -> int:
+    """How many people HotCRP's save reply says it mentioned. One line names
+    them all -- `Mentioned user X` or `Mentioned users X, Y and Z` -- so the
+    count is the names in it, not the lines. A name holding a comma or an
+    " and " would over-count, which only ever makes a false UNRESOLVED
+    less likely, never a false all-clear (it cannot under-count)."""
+    total = 0
+    for text in messages:
+        m = MENTIONED_RE.search(text.strip())
+        if not m:
+            continue
+        names = re.split(r",\s+|\s+and\s+", m.group(1))
+        total += sum(1 for n in names if n.strip())
+    return total
 
 # API review `status` values that mean "turned in" (HotCRP has no `submitted`
 # status: `delivered` is the submitted state, `complete` a delivered review
@@ -148,6 +166,15 @@ MENTIONED_RE = re.compile(r"Mentioned user")
 SUBMITTED_STATUSES = frozenset({"delivered", "complete"})
 # `rtype`: 1 external, 2 PC, 3 secondary, 4 primary, 5 metareview.
 PC_RTYPE_MIN = 2
+# Review-form fields as the API abbreviates them: HotCRP shortens a field's
+# title to the first three letters of its first three words.
+PRE_SCORE_FIELD = "PreRebOve"     # Pre-Rebuttal Overall merit
+POST_SCORE_FIELD = "PosRebRev"    # the post-rebuttal overall merit (R2 only)
+EXPERTISE_FIELD = "RevExp"        # Reviewer expertise
+# The Champion / Anti-champion checkboxes: a list of the ticked options'
+# 1-based values (`[2]` = Anti-champion only).
+CHAMPION_FIELD = "ChaAntCha"
+CHAMPION, ANTI_CHAMPION = 1, 2
 
 KIND_LEAD = "lead_starter"
 KIND_SILENT = "reviewer_silent"
@@ -205,6 +232,18 @@ class ReviewState:
     rtype: int
     status: str
     modified_at: int
+    # The form's two overall-merit scores (`PreRebOve`, the pre-rebuttal one
+    # every review carries, and `PosRebRev`, the post-rebuttal one an R2
+    # review gains once the reviewer fills it), the reviewer's self-rated
+    # expertise and HotCRP's review letter. None/"" when absent; the nudges
+    # never read them, `scripts/ac_dashboard.py` does.
+    pre: int | None = None
+    post: int | None = None
+    expertise: int | None = None
+    ordinal: str = ""
+    # The final-phase vote (`CHAMPION_FIELD`); a review can tick both.
+    champion: bool = False
+    anti: bool = False
 
     @property
     def submitted(self) -> bool:
@@ -269,6 +308,22 @@ def parse_comments(objs: list[dict], created: dict[int, str] | None = None) -> l
     return out
 
 
+def _score(value) -> int | None:
+    """A score field as HotCRP's API sends it (an int, a digit string, or
+    null/absent on a review not yet filled in)."""
+    try:
+        return int(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _choices(value) -> set[int]:
+    """A checkbox field's ticked values: the API sends a list (`[2]`); a
+    bare int, a digit string or null are tolerated too."""
+    items = value if isinstance(value, (list, tuple)) else [value]
+    return {n for n in (_score(v) for v in items) if n is not None}
+
+
 def parse_reviews(objs: list[dict]) -> list[ReviewState]:
     out = []
     for o in objs:
@@ -284,6 +339,12 @@ def parse_reviews(objs: list[dict]) -> list[ReviewState]:
             rtype=int(o.get("rtype") or 0),
             status=str(o.get("status") or ""),
             modified_at=int(o.get("modified_at") or 0),
+            pre=_score(o.get(PRE_SCORE_FIELD)),
+            post=_score(o.get(POST_SCORE_FIELD)),
+            expertise=_score(o.get(EXPERTISE_FIELD)),
+            ordinal=str(o.get("ordinal") or ""),
+            champion=CHAMPION in _choices(o.get(CHAMPION_FIELD)),
+            anti=ANTI_CHAMPION in _choices(o.get(CHAMPION_FIELD)),
         ))
     return out
 
@@ -727,8 +788,7 @@ def send_batch(
         resp = site.post_comment(n.pid, n.text, visibility=n.visibility, topic=n.topic,
                                  tags=n.tags, notify=notify, dry_run=False)
         cid = resp.get("cid") or (resp.get("comment") or {}).get("cid") or ""
-        confirmed = sum(1 for m in resp.get("message_list") or ()
-                        if MENTIONED_RE.search(hotcrp_api.format_message(m)))
+        confirmed = mentioned_count([hotcrp_api.format_message(m) for m in resp.get("message_list") or ()])
         if confirmed < len(n.mentions):
             unresolved += len(n.mentions) - confirmed
             print(f"  UNRESOLVED: comment {cid} on #{n.pid} mentions {len(n.mentions)}, HotCRP resolved "

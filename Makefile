@@ -26,6 +26,9 @@
 #   make timeliness-apologies  corrections for emailed papers no longer held
 #   make extra-reviewers  shortlist finished PC members to ask for one more review
 #   make review-quality   on-time vs late reviews: AI self-report, detail, score bias
+#   make nudges           discussion nudges as HotCRP comments (NUDGE_FLAGS=...)
+#   make ac-dashboard     per-track status pages for the area chairs (HotCRP API)
+#   make ac-dashboard-links  a Dropbox link to each track's dashboard directory
 #   make clean            remove assignment outputs only
 #   make clean-fingerprints  remove embedding caches, never DBLP caches
 
@@ -221,7 +224,7 @@ ASSIGN_DEPS = scripts/assign_reviewers.py src/reviewer_match/paper_matching.py \
 	log-assignments reviewer-activity rerun targeted-rerun swap-candidates swap-upload fill-slots \
 	revision-cutoffs paper-leads revision-tags advance-rounds timeliness-tags timeliness-emails \
 	timeliness-apologies extra-reviewers review-quality daily check-exports summary-scores short-reviews \
-	hotcrp-test nudges nudges-send
+	hotcrp-test nudges nudges-send ac-dashboard ac-dashboard-links
 
 all: $(SENIORITY) enrich $(FINGERPRINTS)
 	$(RUN) scripts.build_fingerprints --csv "$(CSV)" --fingerprint-cache $(FINGERPRINTS)
@@ -813,6 +816,36 @@ nudges: scripts/discussion_nudges.py
 nudges-send:
 	@test -f $(NUDGE_BATCH) || { echo "ERROR: $(NUDGE_BATCH) not found; run make nudges NUDGE_FLAGS=... first" >&2; exit 1; }
 	$(RUN) scripts.discussion_nudges --send $(NUDGE_BATCH) --ledger $(NUDGE_LEDGER) $(NUDGE_SEND_FLAGS)
+
+# Area-chair dashboards through the HotCRP API: one self-contained page per
+# track (REPORT_DIR/ac_dashboard/track_05/track_05_dana-fox.pdf, only that
+# track's papers) plus all/all.pdf for the PC chairs, over every submitted paper
+# without a decision, printed through headless Chrome for emailing. Scores,
+# review status, comments, tags, decisions and leads all come from the API;
+# chairs from PCINFO; comment creation dates from LOG when it exists.
+# Needs HOTCRP_SITE and HOTCRP_TOKEN in .env. AC_DASHBOARD_FLAGS=--offline
+# replays the last run's snapshot; DISCUSSION_START is when the discussion
+# opened, the date activity is counted from.
+DISCUSSION_START ?= 2026-10-10
+# The champion / anti-champion phase: the dashboard's lead and silence flags
+# count activity from here: the phase opened the afternoon of 2026-10-21.
+PHASE_START ?= 2026-10-21 12:00:00 -0400
+AC_DASHBOARD_DIR ?= $(REPORT_DIR)/ac_dashboard
+AC_DASHBOARD_FLAGS ?=
+ac-dashboard: scripts/ac_dashboard.py scripts/discussion_nudges.py src/reviewer_match/hotcrp_api.py
+	@test -n "$(HOTCRP_SITE)" -a -n "$(HOTCRP_TOKEN)" || { echo "ERROR: HOTCRP_SITE and HOTCRP_TOKEN must be set in .env" >&2; exit 1; }
+	@test -f $(PCINFO) || { echo "ERROR: $(PCINFO) not found; download the user export from HotCRP" >&2; exit 1; }
+	$(RUN) scripts.ac_dashboard --since '$(PHASE_START)' --pcinfo $(PCINFO) --log $(LOG) \
+		--out-dir $(AC_DASHBOARD_DIR) --snapshot $(HOTCRP_SNAPSHOT) $(EXCLUDE_FLAG) $(AC_DASHBOARD_FLAGS)
+
+# A Dropbox shared link (the account's default settings, normally anyone with
+# the link, view-only) to every track_NN/ directory make ac-dashboard wrote,
+# one row per chair in REPORT_DIR/ac_dashboard_links.csv, for sending by hand.
+# Asks the local Dropbox daemon; refuses a directory it has not synced yet.
+# The links survive every rerun of ac-dashboard -- not deleting AC_DASHBOARD_DIR.
+ac-dashboard-links: scripts/ac_dashboard_links.py scripts/ac_dashboard.py
+	@test -f $(PCINFO) || { echo "ERROR: $(PCINFO) not found; download the user export from HotCRP" >&2; exit 1; }
+	$(RUN) scripts.ac_dashboard_links --out-dir $(AC_DASHBOARD_DIR) --pcinfo $(PCINFO)
 
 # Corrections for papers in an already-sent drafts file (SENT_EMAILS) that are
 # not held today -- the first batch counted reviews on desk-rejected papers as

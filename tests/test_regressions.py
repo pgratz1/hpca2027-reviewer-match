@@ -76,6 +76,7 @@ from scripts import timeliness_tags
 from reviewer_match import review_scores
 from reviewer_match import hotcrp_api
 from scripts import discussion_nudges
+from scripts import ac_dashboard, ac_dashboard_links
 
 PCINFO_FIELDS = [
     "given_name", "family_name", "email", "affiliation", "orcid", "country",
@@ -8210,6 +8211,18 @@ def _dt(s):
 
 
 class DiscussionNudgeTests(unittest.TestCase):
+    def test_mentioned_count_reads_names_not_lines(self):
+        # HotCRP's save reply names every resolved mention on ONE line
+        # (verified live 2026-10-18); counting lines reported all but one
+        # mention of every multi-mention comment as UNRESOLVED.
+        self.assertEqual(discussion_nudges.mentioned_count(["Comment saved", "Mentioned user Paul2 Gratz"]), 1)
+        self.assertEqual(discussion_nudges.mentioned_count(
+            ["Comment saved", "Notified submission contact X <x@y.z>",
+             "Mentioned users Paul2 Gratz and Paul Gratz",
+             "Mentioned names will be anonymized for some readers."]), 2)
+        self.assertEqual(discussion_nudges.mentioned_count(["Mentioned users Fan Yao, Hafizul Islam Chowdhuryy and Yongqin Wang"]), 3)
+        self.assertEqual(discussion_nudges.mentioned_count(["Comment saved"]), 0)
+
     SINCE = _dt("2026-10-10 00:00:00 -0400")
 
     def _comment(self, pid, cid, email, created, **kw):
@@ -8594,3 +8607,506 @@ class DiscussionNudgeTests(unittest.TestCase):
                     contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
                 discussion_nudges.main(argv + ["--offline"])
             self.assertEqual(first, discussion_nudges.load_batch(batch)["nudges"])
+
+
+class AcDashboardTests(unittest.TestCase):
+    """scripts/ac_dashboard.py: rows, flags, track isolation, replay."""
+
+    SINCE = _dt("2026-10-10 00:00:00 -0400")
+
+    @staticmethod
+    def _ts(s):
+        return int(_dt(s).timestamp())
+
+    def _review(self, pid, rid, email, name, *, status="complete", modified="2026-10-01 00:00:00 -0400",
+                pre=3, post=None, rtype=4, round="R2", ordinal="A", expertise=2, vote=None):
+        return {"pid": pid, "rid": rid, "reviewer_email": email, "reviewer": name, "status": status,
+                "modified_at": self._ts(modified), "PreRebOve": pre, "PosRebRev": post, "RevExp": expertise,
+                "rtype": rtype, "round": round, "ordinal": ordinal, "RebRevCom": "SECRET REVIEW TEXT",
+                "ChaAntCha": vote}
+
+    def _comment(self, pid, cid, email, name, modified, **kw):
+        obj = {"pid": pid, "cid": cid, "author_email": email, "author": name, "visibility": "rev",
+               "topic": "rev", "modified_at": self._ts(modified)}
+        obj.update(kw)
+        return obj
+
+    def _facts(self):
+        return {
+            1: {"title": "Paper One </script>", "tags": "#~~track_0 #RevisionAdvance #~~ontime #pc-discuss", "decision": "Unspecified", "lead": "Lee Lead"},
+            2: {"title": "Paper Two", "tags": "#~~track_1 #online-accept", "decision": "Unspecified", "lead": "Lee Lead"},
+            3: {"title": "Paper Three", "tags": "#~~track_1 #~~track-discussion", "decision": "Unspecified", "lead": ""},
+            4: {"title": "Paper Four", "tags": "#~~track_0 #online-accept #online-reject #NoRevision", "decision": "Unspecified", "lead": "Ann Author <ann@x.org>"},
+        }
+
+    def _state(self):
+        reviews = [
+            self._review(1, 11, "a@x.org", "Ann Author", pre=2, post=2, ordinal="A", modified="2026-10-12 00:00:00 -0400"),
+            self._review(1, 12, "b@x.org", "Bob Builder", pre=3, ordinal="B"),              # silent
+            self._review(1, 13, "c@x.org", "Cy Cee", pre=4, post=5, ordinal="C", modified="2026-10-12 00:00:00 -0400"),
+            self._review(1, 14, "d@x.org", "Di Dee", status="empty", pre=None, ordinal="", modified="2026-10-01 00:00:00 -0400"),
+            self._review(1, 15, "t@x.org", "Tee Trainee", pre=1, round="TRC", rtype=1, ordinal="D"),  # not counted
+            self._review(2, 21, "a@x.org", "Ann Author", pre=3, ordinal="A", modified="2026-10-11 00:00:00 -0400"),
+            self._review(2, 22, "b@x.org", "Bob Builder", pre=3, ordinal="B", modified="2026-10-11 00:00:00 -0400"),
+            self._review(4, 41, "b@x.org", "Bob Builder <b@x.org>", pre=2, ordinal="A", modified="2026-10-11 00:00:00 -0400"),
+        ]
+        comments = [
+            self._comment(1, 101, "lead@x.org", "Lee Lead", "2026-10-11 09:00:00 -0400"),               # the starter
+            self._comment(1, 102, "au@x.org", "The Authors", "2026-10-11 10:00:00 -0400", response="Revision"),
+            self._comment(2, 201, "lead@x.org", "Lee Lead", "2026-10-09 09:00:00 -0400"),               # before the cutoff
+            self._comment(2, 202, "b@x.org", "Bob Builder", "2026-10-12 09:00:00 -0400", visibility="admin"),  # not discussion
+            self._comment(4, 401, "a@x.org", "Ann Author", "2026-10-12 09:00:00 -0400"),
+        ]
+        return reviews, comments
+
+    def _rows(self, pids=frozenset({1, 2, 3, 4})):
+        raw_reviews, raw_comments = self._state()
+        reviews = discussion_nudges.parse_reviews(raw_reviews)
+        comments = discussion_nudges.parse_comments(raw_comments)
+        names = ac_dashboard.name_to_emails(None, reviews, comments)
+        return ac_dashboard.build_rows(set(pids), self._facts(), reviews, comments, self.SINCE, names)
+
+    def test_parse_reviews_carries_the_scores_and_letter(self):
+        parsed = discussion_nudges.parse_reviews([self._review(1, 11, "a@x.org", "Ann", pre="2", post=None, ordinal="B")])[0]
+        self.assertEqual((2, None, 2, "B"), (parsed.pre, parsed.post, parsed.expertise, parsed.ordinal))
+        bare = discussion_nudges.parse_reviews([{"pid": 1, "rid": 2}])[0]
+        self.assertEqual((None, None, None, ""), (bare.pre, bare.post, bare.expertise, bare.ordinal))
+
+    def test_track_chairs_read_the_account_tags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_pcinfo(os.path.join(tmp, "pcinfo.csv"), [
+                pc_account("c0@x.org", "Cy", "Zero", tags="~~area-chairs ~~track_0#3"),
+                pc_account("c0b@x.org", "Co", "Chair", tags="~~area-chairs ~~track_0"),
+                pc_account("c1@x.org", "Di", "One", tags="~~area-chairs ~~track_1"),
+                pc_account("gone@x.org", "Ex", "Chair", tags="~~area-chairs ~~track_2", disabled="yes"),
+                pc_account("pc@x.org", "Pat", "Member", tags="pc-full ~~track-discussion"),
+                pc_account("chair@x.org", "Paul", "Chair", roles="chair pc", tags="~~area-chairs"),
+            ])
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                chairs = ac_dashboard.track_chairs(str(path))
+        self.assertEqual({0: ["Co Chair", "Cy Zero"], 1: ["Di One"]},
+                         {n: [c.name for c in cs] for n, cs in chairs.items()})
+        self.assertIn("Paul Chair holds no ~~track_N tag", err.getvalue())
+        self.assertEqual([3], ac_dashboard.track_numbers("#~~track_3 #TRC-track #~~track-conflicts"))
+        self.assertEqual("Ann Author", ac_dashboard.clean_name("Ann Author &lt;ann@x.org&gt;"))
+        self.assertEqual("Ann Author", ac_dashboard.clean_name("Ann Author <ann@x.org>"))
+        self.assertEqual("Ann Author", ac_dashboard.clean_name("Ann ann@x.org Author"))
+
+    def test_pc_chairs_and_their_other_addresses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_pcinfo(os.path.join(tmp, "pcinfo.csv"), [
+                pc_account("chair@x.org", "Paul", "Chair", roles="chair pc", tags="chairs"),
+                pc_account("paul2@x.org", "Paul", "Chair", roles="pc"),              # his other account
+                pc_account("nael@x.org", "Nael", "Chair", roles="chair pc", tags="chairs"),
+                pc_account("old@x.org", "Old", "Chair", roles="chair pc", disabled="yes"),
+                pc_account("test@x.org", "Test", "Account", roles="pc", tags="~~area-chairs ~~track_0"),
+                pc_account("c1@x.org", "Di", "One", tags="~~area-chairs ~~track_1"),
+                pc_account("c1b@x.org", "Di", "One", roles="pc"),
+            ])
+            self.assertEqual({"chair@x.org": "Paul Chair", "nael@x.org": "Nael Chair", "paul2@x.org": "Paul Chair"},
+                             ac_dashboard.pc_chairs(str(path)))
+            self.assertEqual(["c1@x.org", "c1b@x.org"], ac_dashboard.same_name_accounts(str(path), ["c1@x.org"]))
+            self.assertEqual([], ac_dashboard.conflict_chairs(str(path)))
+            self.assertEqual("nael-abu-ghazaleh", ac_dashboard.slug("Nael Abu-Ghazaleh <n@x.org>"))
+            self.assertEqual(["nobody@x.org"], ac_dashboard.same_name_accounts(str(path), ["nobody@x.org"]))
+
+    def test_rows_scores_activity_and_flags(self):
+        rows = {r.pid: r for r in self._rows()}
+        one = rows[1]
+        self.assertEqual([0], one.tracks)
+        self.assertEqual(("Lee Lead", "lead@x.org"), (one.lead_name, one.lead_email))
+        self.assertEqual(self._ts("2026-10-11 09:00:00 -0400"), one.lead_posted_at)
+        self.assertEqual(self._ts("2026-10-11 10:00:00 -0400"), one.response_at)
+        self.assertEqual(["A", "B", "C"], [r.letter for r in one.reviewers])  # TRC and the unsubmitted review left out
+        self.assertEqual(1, one.not_rescored)
+        self.assertEqual([2, 3, 5], [r.current for r in one.submitted])
+        self.assertAlmostEqual(3.0, one.avg_pre)
+        self.assertAlmostEqual(10 / 3, one.avg_current)
+        self.assertEqual([True, False, True], [r.updated for r in one.submitted])
+        self.assertEqual([True, False, True], [r.since_response for r in one.submitted])
+        self.assertEqual("advance", one.revision)
+        self.assertEqual(("discuss", ["pc-discuss"]), (one.phase, one.phase_tags))
+        self.assertEqual("no-champion", one.projection)
+        self.assertEqual(["no-champion", "split"], one.flags)   # one reviewer silent is not a flag
+        self.assertEqual(1, one.attention)
+
+        two = rows[2]
+        self.assertEqual("settled-accept", two.phase)
+        self.assertIsNone(two.lead_posted_at)                       # the only comment predates the cutoff
+        self.assertEqual([True, True], [r.active for r in two.submitted])
+        self.assertEqual([], two.flags)                             # settled: no lead / silence flags
+        self.assertIsNone(two.response_at)
+        self.assertIsNone(two.submitted[0].since_response)
+
+        three = rows[3]
+        self.assertTrue(three.hidden)
+        self.assertEqual([1], three.tracks)
+        self.assertEqual("untagged", three.phase)
+        self.assertEqual("", three.projection)                       # votes not visible
+        self.assertEqual(["hidden", "untagged"], three.flags)
+
+        four = rows[4]
+        self.assertEqual("Ann Author", four.lead_name)              # address stripped, still resolved
+        self.assertEqual("a@x.org", four.lead_email)
+        self.assertEqual("Bob Builder", four.reviewers[0].name)
+        self.assertEqual(("conflicting", ["online-accept", "online-reject"]), (four.phase, four.phase_tags))
+        self.assertEqual("none", four.revision)
+        self.assertEqual(["conflicting-tags"], four.flags)
+
+    def test_split_gap_and_unresolved_lead_matched_by_name(self):
+        raw_reviews, raw_comments = self._state()
+        reviews = discussion_nudges.parse_reviews(raw_reviews)
+        comments = discussion_nudges.parse_comments(raw_comments)
+        # Two accounts spell the same name: the lead cannot be resolved to one
+        # address, and their comments are matched by name instead.
+        names = ac_dashboard.name_to_emails(None, reviews, comments)
+        names["lee lead"].add("lead2@x.org")
+        rows = {r.pid: r for r in ac_dashboard.build_rows({1}, self._facts(), reviews, comments, self.SINCE, names, split_gap=4)}
+        self.assertEqual("", rows[1].lead_email)
+        self.assertIsNotNone(rows[1].lead_posted_at)
+        self.assertNotIn("split", rows[1].flags)
+        # Every submitted reviewer silent: the flag fires; a paper with no reviews never carries it.
+        silent = [r for r in reviews if r.pid != 1] + [r for r in reviews if r.pid == 1 and r.email == "b@x.org"]
+        rows = {r.pid: r for r in ac_dashboard.build_rows({1, 3}, self._facts(), silent, comments, self.SINCE, names)}
+        self.assertIn("all-reviewers-silent", rows[1].flags)
+        self.assertNotIn("all-reviewers-silent", rows[3].flags)
+
+    def test_choices_parse_every_shape_of_the_vote(self):
+        choices = discussion_nudges._choices
+        self.assertEqual(({1}, {2}, {1, 2}, set(), {2}, {2}, set()),
+                         (choices([1]), choices([2]), choices([1, 2]), choices(None), choices("2"), choices(2), choices([])))
+        parsed = discussion_nudges.parse_reviews([self._review(1, 11, "a@x.org", "Ann", vote=[1, 2]),
+                                                  self._review(1, 12, "b@x.org", "Bob", vote=[2])])
+        self.assertEqual([(True, True), (False, True)], [(r.champion, r.anti) for r in parsed])
+
+    def test_champion_rule_and_phase_tags(self):
+        projected = ac_dashboard.projected
+        self.assertEqual(["no-champion", "outvoted", "advances", "no-champion", "outvoted"],
+                         [projected(0, 0), projected(1, 1), projected(2, 1), projected(0, 1), projected(1, 2)])
+        phase_of = ac_dashboard.phase_of
+        self.assertEqual(("discuss", ["pc-discuss"]), phase_of({"pc-discuss", "revisionadvance"}))
+        self.assertEqual("settled-accept", phase_of({"likely-accept"})[0])
+        self.assertEqual("settled-accept", phase_of({"likely-accept", "online-accept"})[0])
+        self.assertEqual("settled-reject", phase_of({"online-reject"})[0])
+        self.assertEqual("conflicting", phase_of({"pc-discuss", "online-reject"})[0])
+        self.assertEqual(("untagged", []), phase_of({"~~track_3"}))
+
+    def _vote_rows(self, tags, votes, **extra):
+        """One paper (pid 7) tagged `tags`, one submitted PC review per vote."""
+        facts = {7: {"title": "T", "tags": "#~~track_0 " + tags, "decision": "Unspecified", "lead": "Lee Lead"}}
+        raw = [self._review(7, 70 + i, f"r{i}@x.org", f"Rev {i}", ordinal="ABCDEFG"[i], vote=v,
+                            modified="2026-10-12 00:00:00 -0400") for i, v in enumerate(votes)]
+        raw += extra.get("more", [])
+        reviews = discussion_nudges.parse_reviews(raw)
+        names = ac_dashboard.name_to_emails(None, reviews, [])
+        return ac_dashboard.build_rows({7}, facts, reviews, [], self.SINCE, names)[0]
+
+    def test_votes_reopen_and_discussion_flags(self):
+        # In discussion: the rule decides, a tie rejects, both boxes count on neither side.
+        row = self._vote_rows("#pc-discuss", [[1], [1], [2], None])
+        self.assertEqual((2, 1, "advances", ["A", "B"], ["C"]),
+                         (row.champions, row.antis, row.projection, row.letters("champion"), row.letters("anti")))
+        self.assertNotIn("no-champion", row.flags)
+        row = self._vote_rows("#pc-discuss", [[1], [2], [1, 2]])
+        self.assertEqual((1, 1, "outvoted"), (row.champions, row.antis, row.projection))
+        self.assertIn("tied", row.flags)
+        self.assertIn("both-boxes", row.flags)
+        # Unsubmitted and TRC reviews' votes are not counted.
+        row = self._vote_rows("#pc-discuss", [None], more=[
+            self._review(7, 80, "u@x.org", "Un", status="inprogress", vote=[1], ordinal="X"),
+            self._review(7, 81, "t@x.org", "Tee", round="TRC", rtype=1, vote=[1], ordinal="Y")])
+        self.assertEqual((0, "no-champion"), (row.champions, row.projection))
+        self.assertIn("no-champion", row.flags)
+        # An anti-champion and no champion: rejected either way, but its own flag.
+        row = self._vote_rows("#pc-discuss", [[2], None])
+        self.assertEqual((0, 1, "no-champion"), (row.champions, row.antis, row.projection))
+        self.assertIn("anti-only", row.flags)
+        self.assertNotIn("no-champion", row.flags)
+        # Settled papers reopen on a contrary vote only.
+        for tags, votes, reopen in (("#likely-accept", [[2]], True), ("#online-reject", [[1]], True),
+                                    ("#likely-accept", [[1]], False), ("#likely-reject", [[2]], False),
+                                    ("#online-accept", [None], False)):
+            row = self._vote_rows(tags, votes)
+            self.assertEqual(reopen, "reopen" in row.flags, tags)
+            self.assertEqual("reopen" if reopen else row.phase, row.group)
+            self.assertEqual(not reopen and votes != [None], "agreeing-vote" in row.flags, tags)
+            self.assertNotIn("no-champion", row.flags)
+            self.assertNotIn("lead-silent", row.flags)
+
+    def _pages(self, rows, chairs):
+        common = dict(site_url="https://x.hotcrp.com", since=self.SINCE, generated_at="2026-10-16 09:00",
+                      notes=["note"])
+        out = {}
+        for track in (0, 1, None):
+            payload = ac_dashboard.page_payload(rows, chairs, track, **common)
+            name = ac_dashboard.ALL_PAGE if track is None else ac_dashboard.PAGE_NAME.format(track)
+            out[name] = ac_dashboard.render_html(payload, ac_dashboard.page_title(track))
+        return out
+
+    @staticmethod
+    def _payload(html):
+        m = re.search(r'<script id="payload" type="application/json">(.*?)</script>', html, re.S)
+        return json.loads(m.group(1).replace("<\\/", "</"))
+
+    def test_pages_hold_only_their_track_and_no_addresses_or_text(self):
+        rows = self._rows()
+        chairs = {0: [ac_dashboard.TrackChair(0, "Cy Zero", "c0@x.org")], 1: [ac_dashboard.TrackChair(1, "Di One", "c1@x.org")]}
+        pages = self._pages(rows, chairs)
+        self.assertEqual({"track_00.html", "track_01.html", "all.html"}, set(pages))
+        # A reader's conflicts are left off and counted, never shown.
+        common = dict(site_url="https://x.hotcrp.com", since=self.SINCE, generated_at="2026-10-16 09:00",
+                      notes=[])
+        trimmed = ac_dashboard.page_payload(rows, chairs, None, conflicted={1, 3, 99}, **common)
+        self.assertEqual(([2, 4], 2), ([p["pid"] for p in trimmed["papers"]], trimmed["omitted"]))
+        trimmed = ac_dashboard.page_payload(rows, chairs, 1, conflicted={1, 3}, **common)
+        self.assertEqual(([2], 1), ([p["pid"] for p in trimmed["papers"]], trimmed["omitted"]))
+        # The conflict chair's group: added papers come first, once, minus her own conflicts.
+        grouped = ac_dashboard.page_payload(rows, chairs, 1, conflicted={3}, extra={1, 3, 2}, **common)
+        self.assertEqual([(1, "extra"), (2, "extra")], [(p["pid"], p["group"]) for p in grouped["papers"]])
+        self.assertEqual((2, 1), (grouped["extraCount"], grouped["omitted"]))
+        alone = ac_dashboard.page_payload(rows, {}, -1, extra={4}, **common)
+        self.assertEqual(([4], [], "HPCA 2027 Conflict Chair"), ([p["pid"] for p in alone["papers"]], alone["tracks"], ac_dashboard.page_title(-1)))
+        p0, p1, pall = (self._payload(pages[n]) for n in ("track_00.html", "track_01.html", "all.html"))
+        self.assertEqual([1, 4], [p["pid"] for p in p0["papers"]])
+        self.assertEqual([2, 3], [p["pid"] for p in p1["papers"]])
+        self.assertEqual([1, 2, 3, 4], [p["pid"] for p in pall["papers"]])
+        self.assertEqual([{"n": 0, "chairs": ["Cy Zero"], "papers": 2}, {"n": 1, "chairs": ["Di One"], "papers": 2}], pall["tracks"])
+        self.assertEqual(0, p0["track"])
+        self.assertIsNone(pall["track"])
+        for name in ("Bob Builder", "Cy Cee", "Di Dee"):   # reviewers appear as letters only (Ann is also a lead)
+            self.assertNotIn(name, pages["all.html"], name)
+        self.assertEqual({"letter", "pre", "post", "current", "rescored", "changed", "vote"}, set(p0["papers"][0]["reviewers"][0]))
+        self.assertIn("Lee Lead", pages["track_00.html"])                 # the lead is named
+        self.assertEqual("https://x.hotcrp.com/paper/1", p0["papers"][0]["url"])
+        for name, html in pages.items():
+            self.assertNotRegex(html, r"[\w.+-]+@[\w-]+\.[a-z]{2,}", name)
+            self.assertNotIn("SECRET", html, name)
+            self.assertNotIn("RebRevCom", html, name)
+            self.assertNotIn("Paper One </script>", html, name)     # escaped, never raw
+        self.assertIn("Paper One <\\/script>", pages["all.html"])
+        self.assertTrue(pages["track_00.html"].startswith("<title>HPCA 2027 Track 0</title>"))
+        self.assertTrue(pages["all.html"].startswith("<title>HPCA 2027 All Tracks</title>"))
+        self.assertEqual("Paper One </script>", p0["papers"][0]["title"])
+
+    def test_links_one_row_per_chair_only_synced_single_pdf_directories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pcinfo = write_pcinfo(os.path.join(tmp, "pcinfo.csv"), [
+                pc_account("a@x.org", "Ann", "A", tags="~~area-chairs ~~track_0"),
+                pc_account("b@x.org", "Bo", "B", tags="~~area-chairs ~~track_0"),
+                pc_account("c@x.org", "Cy", "C", tags="~~area-chairs ~~track_1 ~~conflict-chair"),
+                pc_account("d@x.org", "Di", "D", tags="~~area-chairs ~~track_3"),
+            ])
+            out = os.path.join(tmp, "dash")
+            for folder, pdf in (("track_00", "track_00_ann-a-bo-b.pdf"), ("track_01", "track_01_cy-c.pdf"),
+                                ("track_02", "track_02.pdf"), ("all", "all.pdf"), ("all_paul-x", "all_paul-x.pdf")):
+                os.makedirs(os.path.join(out, folder))
+                with open(os.path.join(out, folder, pdf), "w") as f:
+                    f.write("pdf")
+            # A stand-in Dropbox CLI: every path synced unless named in $UNSYNCED;
+            # the link is the folder's name, or $BADLINK.
+            dbx = os.path.join(tmp, "dropbox")
+            with open(dbx, "w") as f:
+                f.write('#!/bin/sh\ncase $1 in\n'
+                        'filestatus) if [ "$(basename "$2")" = "$UNSYNCED" ]; then echo "$2: syncing"; else echo "$2: up to date"; fi;;\n'
+                        'sharelink) echo "${BADLINK:-https://www.dropbox.com/scl/fo/$(basename "$2")?dl=0}";;\n'
+                        'esac\n')
+            os.chmod(dbx, 0o755)
+            csv_out = os.path.join(tmp, "links.csv")
+            argv = ["--out-dir", out, "--pcinfo", str(pcinfo), "--out", csv_out, "--dropbox", dbx]
+            with contextlib.redirect_stderr(io.StringIO()) as err, contextlib.redirect_stdout(io.StringIO()) as so:
+                self.assertEqual(0, ac_dashboard_links.main(argv))
+            rows = list(csv.DictReader(open(csv_out, encoding="utf-8")))
+            self.assertEqual([("0", "Ann A", "a@x.org", "track_00"), ("0", "Bo B", "b@x.org", "track_00"),
+                              ("1", "Cy C", "c@x.org", "track_01"), ("2", "", "", "track_02")],
+                             [(r["track"], r["chair"], r["email"], r["folder"]) for r in rows])
+            self.assertEqual("https://www.dropbox.com/scl/fo/track_01?dl=0", rows[2]["link"])
+            self.assertEqual("track_01_cy-c.pdf", rows[2]["pdf"])
+            self.assertEqual(4, len(so.getvalue().splitlines()))
+            self.assertIn("track 2 has no chair", err.getvalue())
+            self.assertIn("track 3 has a chair but no directory", err.getvalue())
+            first = open(csv_out, "rb").read()
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                ac_dashboard_links.main(argv)
+            self.assertEqual(first, open(csv_out, "rb").read())     # idempotent
+            # A conflict-chair directory is linked for the conflict chair.
+            os.makedirs(os.path.join(out, "conflict_chair"))
+            with open(os.path.join(out, "conflict_chair", "conflict_chair.pdf"), "w") as f:
+                f.write("pdf")
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                ac_dashboard_links.main(argv)
+            rows = list(csv.DictReader(open(csv_out, encoding="utf-8")))
+            self.assertEqual(("conflict", "Cy C", "conflict_chair"), (rows[-1]["track"], rows[-1]["chair"], rows[-1]["folder"]))
+            # Refused: an unsynced directory, a non-link answer, two PDFs in one directory.
+            for env in ({"UNSYNCED": "track_01"}, {"BADLINK": "Error: not signed in"}):
+                with mock.patch.dict(os.environ, env), contextlib.redirect_stderr(io.StringIO()), \
+                        self.assertRaises(SystemExit):
+                    ac_dashboard_links.main(argv)
+            with open(os.path.join(out, "track_00", "track_00_old.pdf"), "w") as f:
+                f.write("pdf")
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                ac_dashboard_links.main(argv)
+
+    def test_conflict_chair_gets_the_intersection_of_the_pc_chairs_conflicts(self):
+        each = {"Paul": ["p1@x.org", "p2@x.org"], "Nael": ["n@x.org"]}
+        conflicts = {"p1@x.org": {1, 2}, "p2@x.org": {3}, "n@x.org": {2, 3, 4}}
+        # Paper 3 counts for Paul through his second address; 1 and 4 stay with the other chair.
+        self.assertEqual({2, 3}, ac_dashboard.all_chairs_conflicted(each, conflicts))
+        self.assertEqual({1, 2, 3}, ac_dashboard.all_chairs_conflicted({"Paul": ["p1@x.org", "p2@x.org"]}, conflicts))
+        self.assertEqual(set(), ac_dashboard.all_chairs_conflicted({}, conflicts))
+
+    @staticmethod
+    def _fake_chrome(tmp):
+        """A stand-in Chrome that "prints" by copying the print document to the
+        --print-to-pdf target, so the PDFs carry the payload and are reproducible."""
+        chrome = os.path.join(tmp, "chrome")
+        with open(chrome, "w") as f:
+            f.write("#!/bin/sh\nfor a in \"$@\"; do case $a in --print-to-pdf=*) out=\"${a#--print-to-pdf=}\";; "
+                    "file://*) src=\"${a#file://}\";; esac; done\ncat \"$src\" > \"$out\"\n")
+        os.chmod(chrome, 0o755)
+        return chrome
+
+    def test_pdf_names_wrapper_and_printing(self):
+        chairs = {5: [ac_dashboard.TrackChair(5, "Dana Fox", "d@x.org")],
+                  0: [ac_dashboard.TrackChair(0, "A B", "a@x.org"), ac_dashboard.TrackChair(0, "C D", "c@x.org")]}
+        self.assertEqual("track_05_dana-fox.pdf", ac_dashboard.pdf_name("track_05.html", chairs))
+        self.assertEqual("track_00_a-b-c-d.pdf", ac_dashboard.pdf_name("track_00.html", chairs))
+        self.assertEqual("track_07.pdf", ac_dashboard.pdf_name("track_07.html", chairs))
+        self.assertEqual("all_paul-gratz.pdf", ac_dashboard.pdf_name("all_paul-gratz.html", chairs))
+        doc = ac_dashboard.print_document("<title>T</title><main></main>")
+        self.assertTrue(doc.startswith("<!doctype html>"))
+        self.assertIn('data-theme="light" data-print="1"', doc)
+        self.assertIn("size: A4 landscape", doc)
+        self.assertIn("size: A4 portrait", ac_dashboard.print_document("x", "portrait"))
+        self.assertIn("<title>T</title><main></main></body></html>", doc)
+        with tempfile.TemporaryDirectory() as tmp:
+            # A stand-in Chrome: writes the --print-to-pdf target and records its arguments.
+            chrome = os.path.join(tmp, "chrome")
+            with open(chrome, "w") as f:
+                f.write("#!/bin/sh\nfor a in \"$@\"; do case $a in --print-to-pdf=*) echo pdf > \"${a#--print-to-pdf=}\";; esac; done\n"
+                        "echo \"$@\" >> \"" + os.path.join(tmp, "calls") + "\"\n"
+                        # What a viewer of the shared track directory sees mid-print.
+                        "ls -A \"" + os.path.join(tmp, "out", "track_05") + "\" >> \"" + os.path.join(tmp, "seen") + "\"\n")
+            os.chmod(chrome, 0o755)
+            out = os.path.join(tmp, "out")
+            os.makedirs(os.path.join(out, "track_09"))
+            os.makedirs(os.path.join(out, "track_05"))
+            os.makedirs(os.path.join(out, "notes"))
+            for name in ("track_09/track_09_old.pdf", "track_05/track_05_renamed.pdf", "track_05.html",
+                         "all.pdf", "notes/keep.pdf", "keep.txt"):
+                with open(os.path.join(out, name), "w") as f:
+                    f.write("stale")
+            pages = {"track_05.html": "<title>T</title>", "all.html": "<title>A</title>"}
+            names = {p: ac_dashboard.pdf_name(p, chairs) for p in pages}
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                written = ac_dashboard.write_pdfs(out, pages, names, chrome)
+            self.assertEqual(["track_05/track_05_dana-fox.pdf", "all/all.pdf"], written)
+            # Stale page directories, a renamed chair's PDF, the old flat files and
+            # temp files are gone; nothing the dashboard did not write is touched.
+            self.assertEqual({"track_05", "all", "notes", "keep.txt"}, set(os.listdir(out)))
+            self.assertEqual(["track_05_dana-fox.pdf"], os.listdir(os.path.join(out, "track_05")))
+            self.assertEqual(["all.pdf"], os.listdir(os.path.join(out, "all")))
+            self.assertIn("removed stale track_09/", err.getvalue())
+            self.assertIn("removed stale track_05/track_05_renamed.pdf", err.getvalue())
+            self.assertIn("removed stale track_05.html", err.getvalue())
+            calls = open(os.path.join(tmp, "calls")).read()
+            # Temp files are made in out/, never in a (shared) track directory.
+            with open(os.path.join(tmp, "seen")) as f:
+                seen = set(f.read().split())
+            self.assertTrue(seen and seen <= {"track_05_renamed.pdf", "track_05_dana-fox.pdf"}, seen)
+            self.assertIn("--headless=new", calls)
+            self.assertIn("--no-pdf-header-footer", calls)
+            # A subset run keeps what it did not regenerate.
+            os.makedirs(os.path.join(out, "track_09"))
+            with open(os.path.join(out, "track_09", "track_09_old.pdf"), "w") as f:
+                f.write("stale")
+            ac_dashboard.write_pdfs(out, {"all.html": "x"}, names, chrome, sweep=False)
+            self.assertIn("track_09_old.pdf", os.listdir(os.path.join(out, "track_09")))
+            with self.assertRaises(SystemExit):
+                ac_dashboard.write_pdfs(out, pages, names, os.path.join(tmp, "no-such-chrome"))
+
+    def test_main_end_to_end_then_offline_replay_is_byte_identical(self):
+        raw_reviews, raw_comments = self._state()
+        facts = self._facts()
+
+        conflicts = {"conf:chair@x.org": [1, 5], "conf:paul2@x.org": [], "conf:c0@x.org": [], "conf:c1@x.org": [2, 7]}
+
+        def search(params):
+            if params.get("format") == "json":
+                pids = [int(p) for p in params["q"].split()]
+                return {"ok": True, "ids": pids, "papers": [{"pid": pid, **facts[pid]} for pid in pids]}
+            if params["q"].startswith("conf:"):
+                return {"ok": True, "ids": conflicts[params["q"]]}
+            return {"ok": True, "ids": [1, 2, 3, 4, 5]}
+
+        answers = {
+            ("GET", "search"): search,
+            ("GET", "reviews"): {"ok": True, "reviews": raw_reviews},
+            ("GET", "comments"): {"ok": True, "comments": raw_comments},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            pcinfo = write_pcinfo(os.path.join(tmp, "pcinfo.csv"), [
+                pc_account("c0@x.org", "Cy", "Zero", tags="~~area-chairs ~~track_0"),
+                pc_account("c1@x.org", "Di", "One", tags="~~area-chairs ~~track_1 ~~conflict-chair"),
+                pc_account("lead@x.org", "Lee", "Lead"),
+                pc_account("chair@x.org", "Paul", "Chair", roles="chair pc", tags="chairs"),
+                pc_account("paul2@x.org", "Paul", "Chair", roles="pc"),
+            ])
+            snap, out1, out2 = (os.path.join(tmp, d) for d in ("snap", "out1", "out2"))
+            os.makedirs(out1)
+            with open(os.path.join(out1, "track_09.html"), "w") as f:
+                f.write("stale")
+            argv = ["--since", "2026-10-10", "--pcinfo", str(pcinfo), "--log", os.path.join(tmp, "no-log.csv"),
+                    "--snapshot", snap, "--exclude-pids", "5", "--generated-at", "2026-10-16 09:00",
+                    "--chrome", self._fake_chrome(tmp)]
+            def page(name):   # the print document the stand-in Chrome copied into the PDF
+                return open(os.path.join(out1, name), encoding="utf-8").read()
+            env = {"HOTCRP_SITE": "https://x.hotcrp.com", "HOTCRP_TOKEN": "t"}
+            session = _FakeSession(answers)
+            with mock.patch.dict(os.environ, env), mock.patch.object(hotcrp_api.requests, "Session", lambda: session), \
+                    contextlib.redirect_stderr(io.StringIO()) as err, contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(0, ac_dashboard.main(argv + ["--out-dir", out1]))
+            self.assertEqual("4\t4\t1\t3\n", out.getvalue())   # 4 pages; papers 1, 3 and 4 carry an act flag
+            self.assertEqual({"track_00", "track_01", "all", "all_paul-chair"}, set(os.listdir(out1)))   # PDFs only
+            self.assertEqual(["track_00_cy-zero.pdf"], os.listdir(os.path.join(out1, "track_00")))
+            self.assertIn("removed stale track_09.html", err.getvalue())
+            self.assertIn("HIDDEN: 1 paper(s)", err.getvalue())
+            self.assertIn("comment creation dates fall back", err.getvalue())
+            # One search for the scope, one field search per chunk, reviews, comments,
+            # then one conflict search per reader address (sorted, deduplicated).
+            self.assertEqual(["search", "search", "reviews", "comments"] + ["search"] * 4, [c[1] for c in session.calls])
+            self.assertEqual({"q": "1 2 3 4", "t": "s", "f": ac_dashboard.PAPER_FIELDS, "format": "json"}, session.calls[1][2])
+            self.assertEqual(sorted(conflicts), [c[2]["q"] for c in session.calls[4:]])
+            self.assertIn("conflict chair c1@x.org: 1 of the 1 paper(s) every PC chair is conflicted with added to track_01.html",
+                          err.getvalue())
+            self.assertIn("PC chair chair@x.org: 1 conflicted paper(s) left off all.html", err.getvalue())
+            self.assertIn("track 1's chair is conflicted with 1 paper(s) in the track, left off its page: 2", err.getvalue())
+            pall = self._payload(page("all/all.pdf"))
+            self.assertEqual(["Cy Zero"], pall["tracks"][0]["chairs"])
+            self.assertEqual(([2, 3, 4], 1), ([p["pid"] for p in pall["papers"]], pall["omitted"]))
+            self.assertEqual(["conflicting-tags"], pall["papers"][2]["flags"])
+            # all.html omits paper 1 (the chair's conflict), so its first row is paper 2.
+            self.assertEqual((2, 2, 2, []),
+                             (pall["papers"][0]["pid"], pall["papers"][0]["submitted"], pall["papers"][0]["notRescored"],
+                              pall["papers"][0]["flags"]))
+            self.assertNotIn("outstanding", page("all/all.pdf"))
+            # The conflict chair's page carries the PC chairs' conflicted paper 1 on
+            # top of her own track (paper 2, her own conflict, still left off).
+            p1 = self._payload(page("track_01/track_01_di-one.pdf"))
+            self.assertEqual(([1, 3], 1, 1), ([p["pid"] for p in p1["papers"]], p1["omitted"], p1["extraCount"]))
+            self.assertEqual(["extra", ""], [p["group"] for p in p1["papers"]])
+            # One chair's own page omits only that chair's conflicts and names the reader.
+            pp = self._payload(page("all_paul-chair/all_paul-chair.pdf"))
+            self.assertEqual(([2, 3, 4], 1, "Paul Chair"), ([p["pid"] for p in pp["papers"]], pp["omitted"], pp["reader"]))
+            self.assertIn("<title>HPCA 2027 All Tracks (Paul Chair)</title>", page("all_paul-chair/all_paul-chair.pdf"))
+            p0 = self._payload(page("track_00/track_00_cy-zero.pdf"))
+            self.assertEqual(([1, 4], 0), ([p["pid"] for p in p0["papers"]], p0["omitted"]))
+
+            offline = _FakeSession({})
+            with mock.patch.dict(os.environ, env), mock.patch.object(hotcrp_api.requests, "Session", lambda: offline), \
+                    contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(0, ac_dashboard.main(argv + ["--out-dir", out2, "--offline"]))
+            self.assertEqual([], offline.calls)
+            for name in os.listdir(out1):
+                for pdf in os.listdir(os.path.join(out1, name)):
+                    with open(os.path.join(out1, name, pdf), "rb") as a, open(os.path.join(out2, name, pdf), "rb") as b:
+                        self.assertEqual(a.read(), b.read(), pdf)

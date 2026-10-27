@@ -2223,9 +2223,12 @@ parser also accepts a full address, `@user@site.edu`, which matches one
 account by construction. So someone is mentioned by name (`@Given Family`, as
 the API's `reviewer` field spells it, else the user export) when that name
 belongs to one enabled account in the export, and by address otherwise; the
-preview says which. On a real save HotCRP answers `Mentioned user X` once per
-resolved mention, and the send stage counts those against the mentions it
-sent, printing `UNRESOLVED` on any shortfall. Nobody is ever emailed about
+preview says which. On a real save HotCRP answers with one line naming every
+resolved mention -- `Mentioned user X`, or `Mentioned users X, Y and Z` for
+several -- and the send stage counts the names in that line against the
+mentions it sent, printing `UNRESOLVED` on any shortfall. (Until 2026-10-18 it
+counted lines, so every multi-mention comment reported all but one mention
+unresolved; the people had been mentioned and emailed.) Nobody is ever emailed about
 their own comment, so a self-mention tests posting, not delivery.
 
 **Threads and who can see them.** HotCRP emails a mention only to someone
@@ -2329,6 +2332,179 @@ Anything the four layers cannot place stays **unresolved** and is reported, neve
 assumed. That is why `scripts/assign_reviewers.py` prints reviewer and paper coverage
 whenever a region cap is on: an unplaced reviewer can never consume a cap.
 
+### `scripts/ac_dashboard.py` — per-track status pages for the area chairs
+
+`make ac-dashboard`. One PDF per track, each in a directory named after the
+track — `outputs/reports/ac_dashboard/track_05/track_05_dana-fox.pdf` —
+listing every paper tagged `~~track_NN` that is still under review (submitted,
+no decision), and `all/all.pdf` with every track for the PC chairs. Each page
+is built as HTML and printed through headless Chrome; only the PDF is kept,
+and it is what each area chair is emailed. A track
+page holds only its own papers, so no chair sees another track's reviewers
+or scores. Rerun it on whatever cadence suits (a cron job works: it needs no
+exports).
+
+Since the repository lives in Dropbox, the PDFs need not be emailed at all:
+`make ac-dashboard-links` asks the local Dropbox daemon (`dropbox sharelink`)
+for a shared link to each `track_NN/` directory and writes
+`outputs/reports/ac_dashboard_links.csv` (`track,chair,email,folder,pdf,link`,
+one row per chair, gitignored by name) for the chair to send once. Each rerun
+of `make ac-dashboard` then refills the same directories, so the links show the
+fresh PDF with nothing re-sent — deleting `ac_dashboard/` breaks them all. The
+links take the account's default settings, normally anyone with the link,
+view-only; a page carries paper titles, IDs and scores, never reviewer names,
+addresses or review text. A directory Dropbox has not yet synced, or one not
+holding exactly one PDF, is refused. `all*/` are the PC chairs' own pages and
+are never linked; `conflict_chair/`, when it exists, is linked for the
+conflict chair. Temp files are printed in `ac_dashboard/` itself, never inside
+a shared track directory.
+
+```
+make ac-dashboard                                   # every track + all/all.pdf
+make ac-dashboard PHASE_START=2026-10-22            # count activity from a later date
+make ac-dashboard AC_DASHBOARD_FLAGS=--offline      # replay the last run's snapshot
+make ac-dashboard AC_DASHBOARD_FLAGS="--orientation portrait"
+make ac-dashboard AC_DASHBOARD_FLAGS="--tracks 5,7 --out-dir /tmp/x"
+make ac-dashboard-links                             # once synced: a link per track directory
+```
+
+**The final phase: champions and anti-champions.** The papers still to
+settle are tagged `pc-discuss` (`--discuss-tag`). One advances only with **more
+champions than anti-champions**: with no champion it is rejected, and a tie
+rejects too. A vote is the review form's Champion / Anti-champion checkboxes,
+which the API sends as `ChaAntCha` (`[1]` champion, `[2]` anti-champion),
+counted over submitted PC reviews only; a review ticking both counts on neither
+side and is flagged. Papers tagged `likely-accept` / `online-accept` or
+`likely-reject` / `online-reject` (`--likely-accept-tag`, `--accept-tag`, …)
+are **settled**. They are listed only so that a **contrary** vote is noticed:
+an anti-champion on a settled accept, or a champion on a settled reject, marks
+the paper *reopen?* and moves it to the top. An agreeing vote is shown, not
+flagged. Tags pointing two ways (`pc-discuss` with `online-reject`) or no phase
+tag at all are flagged for the chair to fix.
+
+Papers are grouped: reopen? / tags to fix, then in discussion, then settled
+accept, then settled reject. A Phase selector filters to one group.
+
+**Per paper**, one row:
+- the title, linked to the HotCRP paper page;
+- one chip per PC review, showing the original pre-rebuttal overall merit, or
+  `original→current` once the reviewer has entered the post-rebuttal score,
+  with ▲/▼ marking a champion or anti-champion vote (a review never submitted
+  is assumed not to be coming and is not shown);
+- the averages;
+- **Champions:** ▲ champions · ▼ anti-champions, with the review letters
+  beneath;
+- **Outcome:** for a paper in discussion, what the rule gives today
+  (*advances*; *reject: anti-champion only*, *reject: tied* or *reject:
+  outvoted* once an anti-champion equals or outnumbers the champions; *likely
+  reject: no champion yet* while nobody has voted); for a settled paper, its tag or *reopen?*; the tags held and the
+  revision tag beneath;
+- the discussion lead, and whether they have posted since `PHASE_START`;
+- how many submitted reviewers have updated their review or commented since
+  then;
+- the last activity date;
+- the attention flags.
+
+Reviewers appear only as review letters with their scores and votes; activity
+is summed per paper, never listed per reviewer. Columns sort; a "needs
+attention only" switch, the phase selector and a find box filter; `all.html`
+adds a track selector.
+
+**Flags.** These count as needing attention and tint the row:
+- *hidden*;
+- *contrary vote on a settled paper* (reopen?);
+- *conflicting phase tags*;
+- *no phase tag*;
+- *a review ticks both*;
+- on papers in discussion only: *anti-champion, no champion*, *no votes
+  yet*, *tied*, *no lead*, *lead
+  silent* (no discussion comment by the lead since `PHASE_START`), and *all
+  reviewers silent* (no submitted reviewer has updated their review or
+  commented since then; a single silent reviewer shows in the Reviewers active
+  column instead).
+
+*Vote agrees with the settled outcome* and *scores split* (current scores
+`--split-gap` (2) or more apart) are information and do not count.
+
+Early in the phase *no votes yet* fires on nearly every `pc-discuss` paper.
+That is the rule's verdict until someone champions it. A paper with an
+anti-champion and no champion gets its own flag, pill and tile, and sorts
+above the papers with no votes.
+
+A discussion comment is the nudges' definition: not a draft, not a response,
+not an author's, not admin-only. A reviewer is *active* under the nudges'
+`--reviewers-silent` rule. Both are imported from
+`scripts/discussion_nudges.py`, so the two tools cannot disagree about who is
+behind. TRC reviews are left out, as everywhere else here.
+
+`PHASE_START` is when activity is counted from: the champion phase opened
+the afternoon of 2026-10-21 (`2026-10-21 12:00:00 -0400`), so *lead silent*
+measures this phase. A date or a log-style timestamp both work.
+
+**Sources.** Everything live comes from the API (`src/reviewer_match/hotcrp_api.py`,
+`HOTCRP_SITE`/`HOTCRP_TOKEN` in `.env`): the scope from a search (`dec:none`,
+`--scope-search` overrides), titles, tags, decisions and leads from the
+search's field columns (`Site.papers`, `GET /search?f=title tags decision
+lead&format=json`), scores and review status from `GET /reviews`, discussion
+activity from `GET /comments`, each reader's conflicts from a `conf:` search.
+About 35 GETs per run; every one is snapshotted under
+`data/cache/hotcrp_api/`, and `--offline` replays them, so a rerun with
+`--generated-at` pinned is byte-identical (the reviews and comments snapshots
+are the ones `make nudges` writes for the same papers). Two things still come
+from files: the chairs, from the `~~track_NN` tags on area-chair accounts in
+the user export (`PCINFO`, stamped "chairs as of" its date on the page — it
+changes rarely), and comment *creation* dates from the action log
+(`hotcrp_log.comment_created_at`) when it exists; without it a comment is dated
+by its last edit, which over-counts an old comment touched up recently, and the
+page says so. A lead comes back as a display name, not an address: it is
+resolved to an account through the user export and the API's own author
+spellings, and the lead's comments are matched by address or, when two
+accounts share the name, by name.
+
+**Conflicts.** A page never shows a paper its readers are conflicted with.
+`all.html` is read by the PC chairs together — every enabled account whose
+roles include `chair`, widened to any other enabled account under the same
+name, since a chair's second address carries declared conflicts too
+(`--pc-chairs` overrides the list) — so it omits the union of their
+conflicts; `all_<name>.html`, one per chair, omits only that chair's own; and
+each track page omits its chair's. One `conf:<address>` search per reader
+says which papers; the page says how many it left off. The area-chair
+assignment was made under hard COIs, so a track page should omit nothing, and
+the run reports any that does rather than assuming it.
+
+**The conflict chair** (the account tagged `~~conflict-chair`;
+`--conflict-chair` overrides, `none` for nobody) handles the papers **every** PC
+chair is conflicted with — the intersection, not the union, since a paper only
+one chair is conflicted with is handled by the other (a chair counts as
+conflicted through any of their addresses). Those papers are added to the top
+of the conflict chair's own track page as a labelled group, "Conflicted with
+every PC chair",
+pinned above the track's papers under any sort — or written to
+`conflict_chair.html` when the conflict chair chairs no track — minus any the
+conflict chair is conflicted with too, which the run counts: such a paper then
+appears on no page but its own track's.
+
+**The API acts as the token's owner**, so a paper they are conflicted with
+returns no reviews and no comments. Such a paper still appears, with its title
+and track, flagged *hidden*, never dropped — its scores and activity are
+unknown to this account, not absent. (0 today: the chair's account sees
+every paper.)
+
+**PDFs.** `--pdf` wraps each page in a print document (light theme, A4
+landscape, or `--orientation portrait`, the controls hidden) and has headless
+Chrome (`--chrome`, default `google-chrome`) run the page's own script and
+print it, so the PDF is the page as a chair would see it. Both orientations
+fit every column; landscape gives each cell more room. The HTML stays as the source. Nothing is published
+anywhere: the PDFs are emailed by hand, one per chair. (The pages were
+briefly published as claude.ai artifacts on 2026-10-16 and taken down the
+same day in favour of PDFs.)
+
+**What the pages carry.** Review letters and scores, the lead's name, dates;
+never a reviewer's name, an email address or review text, because every row
+is built field by field from named API values, not from the API object. They are still confidential
+— the output directory is gitignored by name — and an unlisted link is only
+as private as the people it is sent to.
+
 ## Support modules (not standalone scripts)
 
 `src/reviewer_match/reviewers.py` (acceptance-CSV parsing, duplicate-submission collapsing,
@@ -2346,8 +2522,8 @@ writing both assignment-CSV shapes) · `src/reviewer_match/hotcrp_log.py` (the s
 parse point for the HotCRP action log — it reverses the export's newest-first
 order and case-folds addresses, and nothing else may read that file directly) ·
 `src/reviewer_match/hotcrp_api.py` (the single HTTP path to HotCRP: bearer-token
-GET/POST with retries, snapshots for offline replay, and the five calls the
-nudges need).
+GET/POST with retries, snapshots for offline replay, and the six calls the
+nudges and the area-chair dashboard need).
 
 ## Data files
 
