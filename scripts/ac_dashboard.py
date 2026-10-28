@@ -395,6 +395,74 @@ def all_chairs_conflicted(each_chair: dict[str, list[str]], conflicts: dict[str,
     return set.intersection(*per_chair) if per_chair else set()
 
 
+@dataclass
+class Readers:
+    """Who reads each page and which papers each page must leave off. Keys:
+    a track number, None for all.html, -1 for conflict_chair.html."""
+    readers: dict
+    each_chair: dict[str, list[str]]     # PC chair name -> every address under it
+    chair_emails: list[str]
+    conflict_chair: list[str]
+    conflict_track: int | None
+    conflicts: dict[str, set[int]]
+    pc_conflicted: set[int]              # papers every PC chair is conflicted with
+
+    def conflicted(self, key) -> set[int]:
+        return set().union(*(self.conflicts[e] for e in self.readers.get(key, [])))
+
+    def own(self, name: str) -> set[int]:
+        return set().union(*(self.conflicts[e] for e in self.each_chair[name]))
+
+    def extra(self, key) -> set[int]:
+        """The conflict chair's charge, on their own page only."""
+        home = self.conflict_track if self.conflict_track is not None else -1
+        return self.pc_conflicted if self.conflict_chair and key == home else set()
+
+
+def page_readers(site: hotcrp_api.Site, pcinfo_path: str, chairs: dict[int, list[TrackChair]], pids: set[int],
+                 pc_chairs_arg: str = "", conflict_chair_arg: str = "", all_page: str = ALL_PAGE) -> Readers:
+    """Every page's readers and their conflicts (one `conf:` search each),
+    reporting the PC chairs' and the conflict chair's counts on stderr."""
+    if pc_chairs_arg:
+        chair_emails = same_name_accounts(pcinfo_path, sorted(parse_emails_list(pc_chairs_arg)))
+    else:
+        chair_emails = sorted(pc_chairs(pcinfo_path))
+    # Each chair by name, with every address under it: their own page's readers.
+    index = pc_membership.load_pc_accounts(pcinfo_path).by_email
+    each_chair: dict[str, list[str]] = defaultdict(list)
+    for email in chair_emails:
+        each_chair[clean_name(index[email].name) if email in index else email].append(email)
+    if not chair_emails:
+        print(f"WARNING: no PC chair account found; {all_page} omits nothing", file=sys.stderr)
+    readers: dict = {None: chair_emails}
+    for n, cs in chairs.items():
+        readers[n] = same_name_accounts(pcinfo_path, [c.email for c in cs])
+    if conflict_chair_arg.lower() == "none":
+        conflict_chair = []
+    elif conflict_chair_arg:
+        conflict_chair = same_name_accounts(pcinfo_path, sorted(parse_emails_list(conflict_chair_arg)))
+    else:
+        conflict_chair = same_name_accounts(pcinfo_path, conflict_chairs(pcinfo_path))
+    # The conflict chair's page: their own track's, or a page of its own.
+    conflict_track = next((n for n, who in readers.items() if n is not None and set(who) & set(conflict_chair)), None)
+    if conflict_chair and conflict_track is None:
+        readers[-1] = conflict_chair
+    conflicts = conflicts_of(site, [e for who in readers.values() for e in who], pids)
+    for email in chair_emails:
+        print(f"PC chair {email}: {len(conflicts[email])} conflicted paper(s) left off {all_page}", file=sys.stderr)
+    pc_conflicted = all_chairs_conflicted(each_chair, conflicts)
+    if conflict_chair:
+        own = set().union(*(conflicts[e] for e in conflict_chair)) & pc_conflicted
+        where = PAGE_NAME.format(conflict_track) if conflict_track is not None else CONFLICT_PAGE
+        print(f"conflict chair {', '.join(conflict_chair)}: {len(pc_conflicted - own)} of the "
+              f"{len(pc_conflicted)} paper(s) every PC chair is conflicted with added to {where}"
+              + (f" ({len(own)} they are conflicted with too, left off)" if own else ""), file=sys.stderr)
+    elif pc_conflicted:
+        print(f"WARNING: no conflict chair (tag ~~{CONFLICT_CHAIR_TAG}); the {len(pc_conflicted)} paper(s) "
+              f"every PC chair is conflicted with appear on no page but their tracks'", file=sys.stderr)
+    return Readers(readers, dict(each_chair), chair_emails, conflict_chair, conflict_track, conflicts, pc_conflicted)
+
+
 def name_to_emails(pcinfo_path: str | None, reviews: list[ReviewState], comments: list[Comment]) -> dict[str, set[str]]:
     """{folded display name: addresses seen under it}, from the user export
     and the API's own spellings. A name under two addresses is ambiguous."""
@@ -843,43 +911,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"API: {len(reviews)} reviews, {len(comments)} comments", file=sys.stderr)
 
     # Who reads each page, and what they must not see.
-    if args.pc_chairs:
-        chair_emails = same_name_accounts(args.pcinfo, sorted(parse_emails_list(args.pc_chairs)))
-    else:
-        chair_emails = sorted(pc_chairs(args.pcinfo))
-    # Each chair by name, with every address under it: their own page's readers.
-    index = pc_membership.load_pc_accounts(args.pcinfo).by_email
-    each_chair: dict[str, list[str]] = defaultdict(list)
-    for email in chair_emails:
-        each_chair[clean_name(index[email].name) if email in index else email].append(email)
-    if not chair_emails:
-        print("WARNING: no PC chair account found; all.html omits nothing", file=sys.stderr)
-    readers = {None: chair_emails}
-    for n, cs in chairs.items():
-        readers[n] = same_name_accounts(args.pcinfo, [c.email for c in cs])
-    if args.conflict_chair.lower() == "none":
-        conflict_chair = []
-    elif args.conflict_chair:
-        conflict_chair = same_name_accounts(args.pcinfo, sorted(parse_emails_list(args.conflict_chair)))
-    else:
-        conflict_chair = same_name_accounts(args.pcinfo, conflict_chairs(args.pcinfo))
-    # The conflict chair's page: their own track's, or a page of its own.
-    conflict_track = next((n for n, who in readers.items() if n is not None and set(who) & set(conflict_chair)), None)
-    if conflict_chair and conflict_track is None:
-        readers[-1] = conflict_chair
-    conflicts = conflicts_of(site, [e for who in readers.values() for e in who], pids)
-    for email in chair_emails:
-        print(f"PC chair {email}: {len(conflicts[email])} conflicted paper(s) left off {ALL_PAGE}", file=sys.stderr)
-    pc_conflicted = all_chairs_conflicted(each_chair, conflicts)
-    if conflict_chair:
-        own = set().union(*(conflicts[e] for e in conflict_chair)) & pc_conflicted
-        where = PAGE_NAME.format(conflict_track) if conflict_track is not None else CONFLICT_PAGE
-        print(f"conflict chair {', '.join(conflict_chair)}: {len(pc_conflicted - own)} of the "
-              f"{len(pc_conflicted)} paper(s) every PC chair is conflicted with added to {where}"
-              + (f" ({len(own)} they are conflicted with too, left off)" if own else ""), file=sys.stderr)
-    elif pc_conflicted:
-        print(f"WARNING: no conflict chair (tag ~~{CONFLICT_CHAIR_TAG}); the {len(pc_conflicted)} paper(s) "
-              f"every PC chair is conflicted with appear on no page but their tracks'", file=sys.stderr)
+    rd = page_readers(site, args.pcinfo, chairs, pids, args.pc_chairs, args.conflict_chair)
+    readers, each_chair, conflicts = rd.readers, rd.each_chair, rd.conflicts
     for n in sorted(k for k in readers if k is not None):
         in_track = {r.pid for r in rows if n in r.tracks}
         hit = set().union(*(conflicts[e] for e in readers[n])) & in_track
@@ -925,11 +958,7 @@ def main(argv: list[str] | None = None) -> int:
     pages = {}
     common = dict(site_url=site_url, since=since, generated_at=generated_at, notes=notes,
                   phase_tags=phase_tags)
-    def conflicted(key) -> set[int]:
-        return set().union(*(conflicts[e] for e in readers.get(key, [])))
-
-    def extra(key) -> set[int]:
-        return pc_conflicted if conflict_chair and key == (conflict_track if conflict_track is not None else -1) else set()
+    conflicted, extra = rd.conflicted, rd.extra
 
     for n in tracks:
         if only_tracks and n not in only_tracks:

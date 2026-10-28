@@ -76,7 +76,7 @@ from scripts import timeliness_tags
 from reviewer_match import review_scores
 from reviewer_match import hotcrp_api
 from scripts import discussion_nudges
-from scripts import ac_dashboard, ac_dashboard_links
+from scripts import ac_accept_report, ac_dashboard, ac_dashboard_links
 
 PCINFO_FIELDS = [
     "given_name", "family_name", "email", "affiliation", "orcid", "country",
@@ -9110,3 +9110,84 @@ class AcDashboardTests(unittest.TestCase):
                 for pdf in os.listdir(os.path.join(out1, name)):
                     with open(os.path.join(out1, name, pdf), "rb") as a, open(os.path.join(out2, name, pdf), "rb") as b:
                         self.assertEqual(a.read(), b.read(), pdf)
+
+
+class AcAcceptReportTests(unittest.TestCase):
+    """The three accept categories from tags, merit and votes."""
+
+    def _paper(self, tags, scores, votes=""):
+        reviews = []
+        for i, s in enumerate(scores):
+            pre, post = s if isinstance(s, tuple) else (s, None)
+            v = votes[i] if i < len(votes) else " "
+            reviews.append(discussion_nudges.ReviewState(
+                pid=1, rid=i, email=f"r{i}@x.org", reviewer="", round="R2", rtype=4, status="complete",
+                modified_at=0, pre=pre, post=post, ordinal=chr(65 + i),
+                champion=v in "cb", anti=v in "ab"))
+        p = ac_accept_report.Paper(pid=1, title="T", tracks=[3], tags=set(tags.split()), reviews=reviews)
+        ac_accept_report.classify(p)
+        return p
+
+    def test_online_and_likely_accept_are_category_one(self):
+        self.assertEqual(("1", "A"), (lambda p: (p.category, p.accept_set))(self._paper("~~accept online-accept", [1, 1])))
+        self.assertEqual(("1", "B"), (lambda p: (p.category, p.accept_set))(self._paper("~~accept likely-accept", [])))
+        # both tags: online wins
+        self.assertEqual("A", self._paper("online-accept likely-accept", [3]).accept_set)
+
+    def test_discuss_resolutions(self):
+        self.assertEqual(["consensus", "+3 accept to reject"], self._paper("pc-discuss", [3, 3, 4]).reasons)
+        self.assertEqual("2", self._paper("pc-discuss", [3, 3, 3, 2]).category)          # +2
+        p = self._paper("pc-discuss", [4, 2, 1, 2, 4], votes="c    ")                     # outscored, champion
+        self.assertEqual(("2", ["1 champion to 0 anti"]), (p.category, p.reasons))
+        # a review ticking both boxes counts on neither side
+        self.assertEqual("3", self._paper("pc-discuss", [4, 2, 3, 2], votes="b").category)
+
+    def test_borderline_needs_more_potential_champions(self):
+        self.assertEqual("3", self._paper("pc-discuss", [4, 2, 2, 3]).category)            # equal, 1 vs 0
+        self.assertEqual("3", self._paper("pc-discuss", [3, 2, 4, 2, 4]).category)         # +1, 2 vs 0
+        self.assertEqual("check", self._paper("pc-discuss", [4, 1, 2, 3]).category)       # 1 vs 1
+        self.assertEqual("check", self._paper("pc-discuss", [3, 2, 2, 2]).category)       # -2
+        # post-rebuttal score wins over pre-rebuttal
+        self.assertEqual("2", self._paper("pc-discuss", [(2, 3), (2, 3), 3, 2]).category)
+
+    def test_untagged_and_hidden_go_to_check(self):
+        self.assertEqual("check", self._paper("~~accept", [4, 4]).category)
+        self.assertEqual(["reviews hidden from the chairs' account"], self._paper("pc-discuss", []).reasons)
+
+    def test_pdf_name_keeps_the_chair(self):
+        chairs = {5: [ac_dashboard.TrackChair(5, "Dana Fox", "d@x.org")]}
+        self.assertEqual("track_05_accepts_dana-fox.pdf", ac_accept_report.pdf_name("track_05.html", chairs))
+        self.assertEqual("all_accepts.pdf", ac_accept_report.pdf_name("all.html", chairs))
+
+    def test_render_fills_the_category_two_total_and_names_no_reviewer(self):
+        p = self._paper("pc-discuss", [3, 3, 4])
+        p.reviews[0] = dataclasses.replace(p.reviews[0], reviewer="Secret Name")
+        page = ac_accept_report.render_page("T", "s", [p], collections.Counter({"2": 14}), "https://h", [])
+        self.assertIn("A total of 14 papers", page)
+        self.assertNotIn("Secret Name", page)
+        self.assertNotIn("@x.org", page)
+
+    def test_rejected_papers_are_listed_by_phase_tag(self):
+        p = ac_accept_report.Paper(pid=2, title="R", tracks=[3], tags={"likely-reject"}, rejected=True, accepted=False)
+        ac_accept_report.classify(p)
+        self.assertEqual(("rejected", ["likely-reject"]), (p.category, p.reasons))
+        both = ac_accept_report.Paper(pid=3, title="B", tracks=[3], tags={"online-accept"}, rejected=True, accepted=True)
+        ac_accept_report.classify(both)
+        self.assertEqual("check", both.category)
+        papers = ac_accept_report.build_papers({1, 2}, {1: {"title": "A", "tags": "#online-accept #~~track_3"},
+                                                       2: {"title": "R", "tags": "#pc-discuss #~~track_3"}},
+                                               [], ac_accept_report.Rules(), rejected={2}, accepted={1})
+        self.assertEqual(["1", "rejected"], [p.category for p in papers])
+        page = ac_accept_report.render_page("T", "s", papers, collections.Counter(), "https://h", [])
+        self.assertLess(page.index("Online accept"), page.index("Rejected papers"))
+
+    def test_untagged_undecided_paper_awaits_reviews(self):
+        reviews = [discussion_nudges.ReviewState(pid=4, rid=i, email=f"r{i}@x.org", reviewer="", round="R2",
+                                                 rtype=4, status=st, modified_at=0, pre=3, ordinal=chr(65 + i))
+                   for i, st in enumerate(["complete", "complete", "inprogress", "accepted"])]
+        papers = ac_accept_report.build_papers({4}, {4: {"title": "P", "tags": "#pc-discuss #~~track_13"}}, reviews,
+                                               ac_accept_report.Rules(), rejected=set(), accepted=set())
+        self.assertEqual(("pending", ["2 reviews outstanding"]), (papers[0].category, papers[0].reasons))
+        page = ac_accept_report.render_page("T", "s", papers, collections.Counter(), "https://h", [], "Due Friday.")
+        self.assertIn("Awaiting additional reviews", page)
+        self.assertIn("Due Friday.", page)

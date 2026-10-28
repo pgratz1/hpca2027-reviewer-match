@@ -510,6 +510,27 @@ contains spaces and parentheses — always quote it in shell commands).
   `discussion_nudges.py` so the two cannot disagree. `AC_DASHBOARD_FLAGS=--offline`
   replays the snapshot; `--generated-at` pins the stamp for a byte-identical
   rerun. Not in `make daily` (network). `ac_dashboard/` is gitignored by name.
+- **`make ac-accepts`** (`scripts/ac_accept_report.py`) replaced the dashboard
+  on 2026-10-27, after its cron job was cancelled: one PDF per track listing the
+  `~~accept` papers by category, written into the **same `track_NN/`
+  directories** so the Dropbox links already sent show it
+  (`track_05_accepts_<chair>.pdf`). Category 1 is `online-accept` (set A) or
+  `likely-accept` (set B). Category 2 is `pc-discuss` resolved to accept by
+  consensus (no reject review), +2 accept to reject, or more champions than
+  anti-champions. Category 3 is `pc-discuss` and borderline (equal or +1),
+  with more potential champions (merit 4–5) than potential antis (merit 1);
+  these are tentative accepts. An accept review is current merit 3–5
+  (post-rebuttal where given, else pre-rebuttal). Anything that fits no
+  category is listed under **Check**, never placed silently. After the
+  accepts: **Awaiting additional reviews** (an undecided paper with neither
+  tag, whose outstanding PC reviews are counted; `--pending-note` sets the
+  due-date text), then every `~~reject` paper with the phase tag it was
+  decided under. The displaced
+  dashboard PDF is **moved** to `ac_dashboard/archive/<date>/`, never deleted,
+  so each shared directory keeps exactly one PDF. Readers and conflicts come
+  from `ac_dashboard.page_readers`, shared with the dashboard, so the two
+  cannot omit different papers. **Rerunning `make ac-dashboard` would delete
+  these PDFs** (its writer clears other PDFs in a page directory).
 - `make complete-papers` and `make area-chairs-complete` retain the former
   completeness filter in separate `*-complete.txt` artifacts.
 - Library modules (imported, never run): `src/reviewer_match/reviewers.py`, `src/reviewer_match/dblp.py`,
@@ -536,7 +557,7 @@ contains spaces and parentheses — always quote it in shell commands).
   `scripts/timeliness_emails.py`, `scripts/extra_reviewer_candidates.py`,
   `scripts/review_quality.py`, `scripts/summary_scores.py`, `scripts/short_reviews.py`,
   `scripts/discussion_nudges.py`, `scripts/ac_dashboard.py`,
-  `scripts/ac_dashboard_links.py`, `scripts/main.py`.
+  `scripts/ac_dashboard_links.py`, `scripts/ac_accept_report.py`, `scripts/main.py`.
 
 ## Architecture (filter-then-rank, then constrained assignment)
 

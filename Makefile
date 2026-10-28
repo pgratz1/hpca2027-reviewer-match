@@ -29,6 +29,7 @@
 #   make nudges           discussion nudges as HotCRP comments (NUDGE_FLAGS=...)
 #   make ac-dashboard     per-track status pages for the area chairs (HotCRP API)
 #   make ac-dashboard-links  a Dropbox link to each track's dashboard directory
+#   make ac-accepts       each track's ~~accept papers by category, into the same directories
 #   make clean            remove assignment outputs only
 #   make clean-fingerprints  remove embedding caches, never DBLP caches
 
@@ -224,7 +225,7 @@ ASSIGN_DEPS = scripts/assign_reviewers.py src/reviewer_match/paper_matching.py \
 	log-assignments reviewer-activity rerun targeted-rerun swap-candidates swap-upload fill-slots \
 	revision-cutoffs paper-leads revision-tags advance-rounds timeliness-tags timeliness-emails \
 	timeliness-apologies extra-reviewers review-quality daily check-exports summary-scores short-reviews \
-	hotcrp-test nudges nudges-send ac-dashboard ac-dashboard-links
+	hotcrp-test nudges nudges-send ac-dashboard ac-dashboard-links ac-accepts
 
 all: $(SENIORITY) enrich $(FINGERPRINTS)
 	$(RUN) scripts.build_fingerprints --csv "$(CSV)" --fingerprint-cache $(FINGERPRINTS)
@@ -837,6 +838,19 @@ ac-dashboard: scripts/ac_dashboard.py scripts/discussion_nudges.py src/reviewer_
 	@test -f $(PCINFO) || { echo "ERROR: $(PCINFO) not found; download the user export from HotCRP" >&2; exit 1; }
 	$(RUN) scripts.ac_dashboard --since '$(PHASE_START)' --pcinfo $(PCINFO) --log $(LOG) \
 		--out-dir $(AC_DASHBOARD_DIR) --snapshot $(HOTCRP_SNAPSHOT) $(EXCLUDE_FLAG) $(AC_DASHBOARD_FLAGS)
+
+# Each track's ~~accept papers by category (1: online/likely-accept; 2:
+# pc-discuss resolved to accept; 3: pc-discuss, borderline, tentative), one PDF
+# per track into the ac-dashboard directories, so the links already sent show
+# it. Any other PDF there -- the dashboard -- is moved to AC_DASHBOARD_DIR/
+# archive/<date>/, never deleted. Rerunning ac-dashboard afterwards would
+# replace these. Needs HOTCRP_SITE and HOTCRP_TOKEN in .env.
+AC_ACCEPTS_FLAGS ?=
+ac-accepts: scripts/ac_accept_report.py scripts/ac_dashboard.py src/reviewer_match/hotcrp_api.py
+	@test -n "$(HOTCRP_SITE)" -a -n "$(HOTCRP_TOKEN)" || { echo "ERROR: HOTCRP_SITE and HOTCRP_TOKEN must be set in .env" >&2; exit 1; }
+	@test -f $(PCINFO) || { echo "ERROR: $(PCINFO) not found; download the user export from HotCRP" >&2; exit 1; }
+	$(RUN) scripts.ac_accept_report --pcinfo $(PCINFO) --out-dir $(AC_DASHBOARD_DIR) \
+		--snapshot $(HOTCRP_SNAPSHOT) $(EXCLUDE_FLAG) $(AC_ACCEPTS_FLAGS)
 
 # A Dropbox shared link (the account's default settings, normally anyone with
 # the link, view-only) to every track_NN/ directory make ac-dashboard wrote,
